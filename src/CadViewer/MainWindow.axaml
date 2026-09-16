@@ -1,0 +1,33 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:c="clr-namespace:CadViewer.Controls"
+        x:Class="CadViewer.MainWindow"
+        Title="Avalonia 2D DWG 查看器"
+        Width="1280" Height="800"
+        WindowStartupLocation="CenterScreen">
+
+  <DockPanel>
+    <!-- 工具栏 -->
+    <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="6" Margin="8,8,8,4">
+      <Button x:Name="BtnOpen" Content="打开…" Click="OnOpenClick" />
+      <Button x:Name="BtnFit" Content="适应窗口" Click="OnFitClick" />
+      <Button x:Name="BtnZoomIn" Content="放大" Click="OnZoomInClick" />
+      <Button x:Name="BtnZoomOut" Content="缩小" Click="OnZoomOutClick" />
+      <TextBlock x:Name="StatusText" VerticalAlignment="Center" Margin="16,0,0,0"
+                 Opacity="0.75" TextTrimming="CharacterEllipsis" MaxWidth="600" />
+    </StackPanel>
+
+    <!-- 图层面板 -->
+    <Border DockPanel.Dock="Right" Width="210" BorderBrush="#DDDDDD" BorderThickness="1,0,0,0">
+      <DockPanel>
+        <TextBlock DockPanel.Dock="Top" Text="图层" FontWeight="Medium" Margin="10,10,0,4" />
+        <ScrollViewer>
+          <ItemsControl x:Name="LayerList" Margin="10,0,10,10" />
+        </ScrollViewer>
+      </DockPanel>
+    </Border>
+
+    <!-- CAD 视图 -->
+    <c:CadViewControl x:Name="View" />
+  </DockPanel>
+</Window>
