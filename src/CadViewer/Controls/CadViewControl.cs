@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
@@ -14,38 +16,380 @@ namespace CadViewer.Controls;
 /// 渲染：Render → context.Custom → ICustomDrawOperation → 借用 Avalonia 自带的
 /// SkiaSharp GPU 上下文（ISkiaSharpApiLeaseFeature）直接绘制，零互操作层。
 /// 交互：滚轮缩放（光标锚点）、拖拽平移、双击适应窗口。
+///
+/// 大图性能策略（借鉴 ReadCAD 的 Gpu*Buffer 批次 + MinEntityPixelSize LOD）：
+///   1. 批次路径：大图由 GeometryBaker 预先把几何按 (尺寸档, 图层, 颜色) 合并成少量
+///      SKPath，可见比例高时只绘制批次（DrawPath 次数从 13.6 万降到百级）。
+///   2. 逐实体路径：可见比例低时仍走 R 树剔除 + 逐实体绘制（此时可见实体少，更快）。
+///   3. 两条路都施加同一套 LOD 与配色规则，切换时画面一致。
 /// </summary>
 public class CadViewControl : Control
 {
-    private static readonly SKTypeface TextTypeface =
-        SKTypeface.FromFamilyName("Microsoft YaHei") ?? SKTypeface.Default;
+    /// <summary>
+    /// 文本字体。必须与 <see cref="TextMetrics"/> 度量用的是同一个，
+    /// 否则包围盒与实际墨迹会不一致（历史缺陷：粗估宽把整图范围撑大 34%）。
+    /// </summary>
+    private static readonly SKTypeface TextTypeface = TextMetrics.SharedTypeface;
+
+    /// <summary>无隐藏图层时的共享空集合，避免每帧分配。</summary>
+    private static readonly HashSet<string> NoHiddenLayers = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 文本像素高度下限（ReadCAD 的 MinTextPixelSize 取 5）：低于此值不绘制。
+    /// 文字在 5px 以下不可读，绘制它只会白白消耗时间。
+    /// </summary>
+    public const float DefaultMinTextPixelSize = 5f;
+
+    /// <summary>
+    /// 几何实体像素尺寸下限（对应 ReadCAD 的 MinEntityPixelSize）。
+    ///
+    /// 实测（5.36MB / 135876 实体图纸，12 帧中位绘制耗时）：
+    ///   阈值 0.0（关闭） → 1x 27.2ms / 2x 29.6ms
+    ///   阈值 1.0        → 1x  5.6ms / 2x 14.6ms
+    ///   阈值 1.5        → 1x  4.8ms / 2x  5.4ms   ← 取此值
+    ///   阈值 3.0        → 1x  2.4ms / 2x  5.0ms
+    /// 之所以不是 1.0：世界尺寸档按 4 倍递增，"256–1024 单位"这一档在 2x 缩放下的
+    /// 最大像素尺寸是 1.19px，阈值 1.0 时整档必须保留（19 万个点），1.5 才能整档跳过。
+    ///
+    /// 被剔除的都是屏幕尺寸不足 1.5px 的几何，肉眼不可见。
+    /// 若图纸极密（填充图案）且希望保留更多细节，可调到 1.0；
+    /// 想进一步提速可随 ReadCAD 调到 3.0，代价是屏幕上 1~3px 的细碎构件不再绘制。
+    /// </summary>
+    public float MinEntityPixelSize { get; set; } = 1.5f;
+
+    /// <summary>
+    /// 批次回放成本 ≈ 多少个逐实体绘制（实测标定）。
+    /// 两条路都要遍历同样的几何，差异在调用次数与 SKPaint 状态抖动，
+    /// 因此当"可见实体数 &gt; 批次数 × 该比值"时才切到批次路径。
+    /// </summary>
+    private const int BucketVsEntityCostRatio = 200;
+
+    /// <summary>按像素尺寸缓存的字体（渲染线程使用；尺寸随缩放连续变化，故量化到整数像素）。</summary>
+    private static readonly ConcurrentDictionary<int, SKFont> FontCache = new();
 
     private DisplayList? _display;
     private bool _pendingFit;
     private Point? _panStart;
     private SKPoint _panOffsetStart;
 
+    // ---------- 选择（步骤 B：点选 / 高亮 / zoom-to） ----------
+    // 渲染线程读 _selectedSnapshot，UI 线程写入：替换引用而非原地改列表（不可变快照原则）。
+    private IReadOnlyList<CadEntity> _selectedSnapshot = Array.Empty<CadEntity>();
+
+    /// <summary>
+    /// 叠加高亮层（世界坐标临时几何）。与选中集合同一套交付方式：整个引用替换，
+    /// 渲染线程只读快照，不做部分更新。
+    /// </summary>
+    private OverlayLayer? _overlaySnapshot;
+    private Point? _clickStart;   // 左键按下位置：释放时位移极小视为点选，否则是平移
+    private SKPoint _clickOffsetStart;
+
+    /// <summary>选中集合变化（含清空）。UI 线程触发。</summary>
+    public event EventHandler? SelectionChanged;
+
+    /// <summary>当前选中实体（不可变快照）。</summary>
+    public IReadOnlyList<CadEntity> SelectedEntities => _selectedSnapshot;
+
+    /// <summary>单点拾取（屏幕坐标）：容差内最近的实体；无命中返回 null。</summary>
+    public CadEntity? HitTest(SKPoint screenPoint, float tolerancePx = 5f)
+    {
+        if (_display is null) return null;
+        var world = Viewport.ScreenToWorld(screenPoint);
+        float tolWorld = tolerancePx / MathF.Max(Viewport.Zoom, 1e-6f);
+        var rect = SKRect.Create(world.X - tolWorld, world.Y - tolWorld, tolWorld * 2, tolWorld * 2);
+
+        var candidates = _display.Index.Query(rect);
+        CadEntity? best = null;
+        double bestDist = double.MaxValue;
+        foreach (var e in candidates)
+        {
+            if (_hidden.Count > 0 && _hidden.Contains(e.Layer)) continue;
+            if (!e.Bounds.IntersectsWith(rect)) continue;
+            double d = DistanceToEntity(e, world);
+            if (d < bestDist)
+            {
+                bestDist = d;
+                best = e;
+            }
+        }
+        return bestDist <= tolWorld ? best : null;
+    }
+
+    /// <summary>实体距离（世界单位）：填充/闭合路径包含 = 0，否则取包围盒最近边距离。</summary>
+    private static double DistanceToEntity(CadEntity e, SKPoint world)
+    {
+        // 精确命中：填充路径包含点（SOLID/HATCH）；描边路径的 Contains 只对闭合区域可靠，
+        // 对开放路径用包围盒兜底，避免细长实体（线）在包围盒内任意点都被判"命中"。
+        if (e.FillPath is { } fp && fp.Contains(world.X, world.Y)) return 0;
+        var b = e.Bounds;
+        float dx = MathF.Max(MathF.Max(b.Left - world.X, world.X - b.Right), 0);
+        float dy = MathF.Max(MathF.Max(b.Top - world.Y, world.Y - b.Bottom), 0);
+        return MathF.Sqrt(dx * dx + dy * dy);
+    }
+
+    /// <summary>替换选中集合并重绘（供外部面板/程序化驱动）。</summary>
+    public void SetSelection(IEnumerable<CadEntity> entities)
+    {
+        _selectedSnapshot = entities.ToArray();
+        SelectionChanged?.Invoke(this, EventArgs.Empty);
+        InvalidateVisual();
+    }
+
+    /// <summary>清空选中集合并重绘。</summary>
+    public void ClearSelection()
+    {
+        if (_selectedSnapshot.Count == 0) return;
+        _selectedSnapshot = Array.Empty<CadEntity>();
+        SelectionChanged?.Invoke(this, EventArgs.Empty);
+        InvalidateVisual();
+    }
+
+    /// <summary>单选切换（点击命中调用）。</summary>
+    private void SelectAt(Point p)
+    {
+        var hit = HitTest(new SKPoint((float)p.X, (float)p.Y));
+        if (hit is null)
+        {
+            ClearSelection();
+            return;
+        }
+        var current = _selectedSnapshot;
+        // 最小实现：单击命中 = 单选（重复点击已选实体保持选中）
+        if (current.Count == 1 && ReferenceEquals(current[0], hit)) return;
+        _selectedSnapshot = new[] { hit };
+        SelectionChanged?.Invoke(this, EventArgs.Empty);
+        InvalidateVisual();
+    }
+
+    /// <summary>
+    /// 缩放到世界矩形（padding &gt; 1 时留白）。对应 WPF/Teigha 的 Zoom(Extents3d, scale)。
+    /// </summary>
+    public void ZoomTo(SKRect worldRect, float padding = 1.2f)
+    {
+        float padX = worldRect.Width * (padding - 1f) / 2f;
+        float padY = worldRect.Height * (padding - 1f) / 2f;
+        var inflated = new SKRect(
+            worldRect.Left - padX, worldRect.Top - padY,
+            worldRect.Right + padX, worldRect.Bottom + padY);
+        Viewport.Fit(inflated, (float)Bounds.Width, (float)Bounds.Height);
+        InvalidateVisual();
+    }
+
+    /// <summary>缩放到实体集合包围盒（对应 WPF 版 Zoom(ObjectId[])）。</summary>
+    public void ZoomTo(IEnumerable<CadEntity> entities, float padding = 1.2f)
+    {
+        bool any = false;
+        float l = float.MaxValue, t = float.MaxValue, r = float.MinValue, btm = float.MinValue;
+        foreach (var e in entities)
+        {
+            any = true;
+            l = MathF.Min(l, e.Bounds.Left); t = MathF.Min(t, e.Bounds.Top);
+            r = MathF.Max(r, e.Bounds.Right); btm = MathF.Max(btm, e.Bounds.Bottom);
+        }
+        if (any) ZoomTo(SKRect.Create(l, t, r - l, btm - t), padding);
+    }
+
+    /// <summary>按 ACadSharp 句柄定位（标注面板点击跳转用）；命中返回 true。</summary>
+    public bool ZoomTo(ulong handle, float padding = 2.5f)
+    {
+        if (_display is null || handle == 0) return false;
+        if (!_display.HandleBounds.TryGetValue(handle, out var rect)) return false;
+        ZoomTo(rect, padding);
+        return true;
+    }
+
+    /// <summary>按句柄集合设置选中高亮（标注面板联动用）；返回实际命中的实体数。</summary>
+    public int SetSelectionByHandles(IEnumerable<ulong> handles)
+    {
+        if (_display is null) return 0;
+        var set = new HashSet<ulong>(handles);
+        var hits = new List<CadEntity>();
+        foreach (var e in _display.Entities)
+        {
+            if (e.Handle != 0 && set.Contains(e.Handle)) hits.Add(e);
+        }
+        SetSelection(hits);
+        return hits.Count;
+    }
+
+    // ---------- 叠加高亮（临时几何） ----------
+    // 用途：高亮"比一个 CadEntity 更细"的目标 —— 多段线的某一段、填充的某个环、
+    // 块引用内的某个子实体。这类几何在 DisplayList 里没有独立身份，SetSelection
+    // 表达不了；对应 WPF/Teigha 侧的 TransientManager。
+
+    /// <summary>当前叠加层的图元数（诊断用）。</summary>
+    public int OverlayShapeCount => _overlaySnapshot?.Shapes.Count ?? 0;
+
+    /// <summary>
+    /// 替换叠加高亮层；传 null 等同于清除。
+    ///
+    /// <b>所有权语义</b>（与 <see cref="SetDisplay"/> 一致）：传入的
+    /// <see cref="OverlayLayer"/> 由本控件接管（调用方不要再自行 Release），
+    /// 下次替换、换图或控件销毁时归还。旧层的原生几何要等绘制操作放手后
+    /// 才会真正释放，所以绘制中换层是安全的。
+    /// </summary>
+    public void SetOverlay(OverlayLayer? layer)
+    {
+        var old = _overlaySnapshot;
+        if (ReferenceEquals(old, layer)) return;
+        _overlaySnapshot = layer;
+        if (old is not null) old.Release();
+        InvalidateVisual();
+    }
+
+    /// <summary>清除叠加高亮层。</summary>
+    public void ClearOverlay()
+    {
+        if (_overlaySnapshot is null) return;
+        _overlaySnapshot.Release();
+        _overlaySnapshot = null;
+        InvalidateVisual();
+    }
+
+    /// <summary>
+    /// 缩放到叠加层几何的包围盒（选中目标后"跳到它"用）。
+    /// 层为空或几何为空返回 false（视口不动）。
+    /// </summary>
+    public bool ZoomToOverlay(float padding = 1.6f)
+    {
+        var shapes = _overlaySnapshot?.Shapes;
+        if (shapes is null || shapes.Count == 0) return false;
+
+        float l = float.MaxValue, t = float.MaxValue, r = float.MinValue, b = float.MinValue;
+        bool any = false;
+        foreach (var s in shapes)
+        {
+            if (s?.Path is null) continue;
+            // 用 TightBounds 而非 Bounds：曲线/贝塞尔的控制点会让 Bounds 明显偏大，
+            // 高亮一个圆弧却缩放到很远的空处就是这个原因。
+            var box = s.Path.TightBounds;
+            if (box.Width <= 0 && box.Height <= 0 && box.Left == 0 && box.Top == 0) continue;
+            any = true;
+            l = MathF.Min(l, box.Left); t = MathF.Min(t, box.Top);
+            r = MathF.Max(r, box.Right); b = MathF.Max(b, box.Bottom);
+        }
+        if (!any) return false;
+        ZoomTo(SKRect.Create(l, t, r - l, b - t), padding);
+        return true;
+    }
+
+    private long _lastDrawTicks;
+    private long _drawTicksTotal;
+    private long _drawCount;
+
+    /// <summary>
+    /// 最近一次绘制操作（Custom draw op）自身的耗时，毫秒 —— 不含 Avalonia 合成与
+    /// 位图拷贝等固定开销，用于性能诊断与回归对比（对应 ReadCAD 的 PerformanceMonitorService）。
+    /// 由渲染线程写入、UI 线程读取，用 Interlocked 保证可见性。
+    /// </summary>
+    public double LastDrawMs => Volatile.Read(ref _lastDrawTicks) * 1000.0 / Stopwatch.Frequency;
+
+    /// <summary>绘制操作累计平均耗时（毫秒）；采样数为 0 时返回 0。</summary>
+    public double AverageDrawMs
+    {
+        get
+        {
+            long n = Volatile.Read(ref _drawCount);
+            return n == 0 ? 0 : Volatile.Read(ref _drawTicksTotal) * 1000.0 / Stopwatch.Frequency / n;
+        }
+    }
+
+    /// <summary>已执行的绘制操作次数。</summary>
+    public long DrawCount => Volatile.Read(ref _drawCount);
+
+    /// <summary>清零绘制统计（供基准测试分段测量）。</summary>
+    public void ResetDrawStats()
+    {
+        Interlocked.Exchange(ref _lastDrawTicks, 0);
+        Interlocked.Exchange(ref _drawTicksTotal, 0);
+        Interlocked.Exchange(ref _drawCount, 0);
+    }
+
+    private readonly HashSet<string> _hidden = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>_hidden 的不可变快照，仅在可见性变化时重建；渲染线程直接读它。</summary>
+    private HashSet<string> _hiddenSnapshot = NoHiddenLayers;
+
     public ViewportState Viewport { get; } = new();
-    public HashSet<string> HiddenLayers { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>文本绘制的最小像素高度，低于此值跳过。</summary>
+    public float MinTextPixelSize { get; set; } = DefaultMinTextPixelSize;
 
     public CadViewControl()
     {
         Focusable = true;
         ClipToBounds = true;
+        // Control 没有 OnDoubleTapped 虚方法，必须在构造函数订阅事件。
+        DoubleTapped += OnDoubleTappedHandler;
     }
 
+    /// <summary>
+    /// 替换显示的图纸数据。
+    ///
+    /// <b>所有权语义</b>：传入的 <see cref="DisplayList"/> 由本控件接管（不必自行释放），
+    /// 下次替换或控件销毁时归还。传入前若还持有旧实例，请先自行 Release。
+    /// 这里对旧实例做 Release 而不是直接抛弃 —— 绘制操作可能仍持有一份引用，
+    /// 计数归零时才会真正释放原生几何（见 <see cref="DisplayList"/> 的说明）。
+    /// </summary>
     public void SetDisplay(DisplayList? display)
     {
+        var old = _display;
         _display = display;
-        HiddenLayers.Clear();
+
+        // 初始可见性：图层被关闭/冻结的，打开时即隐藏
+        _hidden.Clear();
+        if (display is not null)
+            foreach (var name in display.InitiallyHiddenLayers)
+                _hidden.Add(name);
+        _hiddenSnapshot = _hidden.Count == 0
+            ? NoHiddenLayers
+            : new HashSet<string>(_hidden, StringComparer.OrdinalIgnoreCase);
+
+        // 换图后旧实体的选择无意义：清空（不再触发 SelectionChanged，调用方自己感知换图）
+        _selectedSnapshot = Array.Empty<CadEntity>();
+
+        // 叠加高亮同样按图存在：其几何是上一张图的世界坐标，留着只会画到错误的位置
+        ClearOverlay();
+
         _pendingFit = display is not null;
+
+        // 同一实例重复 SetDisplay 时不能释放（否则会把正在使用的数据释放掉）
+        if (!ReferenceEquals(old, display)) old?.Release();
+
         InvalidateVisual();
     }
 
-    public void FitToContent()
+    // ---------- 图层可见性 ----------
+    // 用方法而非公开可变集合：绘制操作在渲染线程执行，必须拿到不可变快照。
+
+    public bool IsLayerHidden(string layer) => _hidden.Contains(layer);
+
+    public void SetLayerHidden(string layer, bool hidden)
+    {
+        bool changed = hidden ? _hidden.Add(layer) : _hidden.Remove(layer);
+        if (!changed) return;
+        _hiddenSnapshot = _hidden.Count == 0
+            ? NoHiddenLayers
+            : new HashSet<string>(_hidden, StringComparer.OrdinalIgnoreCase);
+        InvalidateVisual();
+    }
+
+    // ---------- 视口 ----------
+
+    /// <summary>
+    /// 只更新视口，**不**请求重绘。
+    /// 切勿在此调用 InvalidateVisual：本方法会被 Render 调用，而在渲染过程中使 Visual
+    /// 失效会抛 InvalidOperationException（"Visual was invalidated during the render pass"）。
+    /// </summary>
+    private void UpdateFit()
     {
         if (_display is null) return;
         Viewport.Fit(_display.Extents, (float)Bounds.Width, (float)Bounds.Height);
+    }
+
+    /// <summary>适应窗口（菜单 / 按钮 / 双击调用，会请求重绘）。</summary>
+    public void FitToContent()
+    {
+        UpdateFit();
         InvalidateVisual();
     }
 
@@ -74,6 +418,12 @@ public class CadViewControl : Control
         {
             _panStart = pt.Position;
             _panOffsetStart = Viewport.Offset;
+            // 左键额外记录点击候选：释放时位移极小 = 点选，否则是平移
+            if (pt.Properties.IsLeftButtonPressed)
+            {
+                _clickStart = pt.Position;
+                _clickOffsetStart = Viewport.Offset;
+            }
             e.Pointer.Capture(this);
             e.Handled = true;
         }
@@ -96,6 +446,15 @@ public class CadViewControl : Control
 
     protected override void OnPointerReleased(PointerReleasedEventArgs e)
     {
+        // 左键位移极小（≤4px）视为点选而非平移结束
+        if (_clickStart is { } cs)
+        {
+            var p = e.GetCurrentPoint(this).Position;
+            var dx = p.X - cs.X; var dy = p.Y - cs.Y;
+            if (dx * dx + dy * dy <= 16 && Viewport.Offset == _clickOffsetStart)
+                SelectAt(p);
+            _clickStart = null;
+        }
         _panStart = null;
         e.Pointer.Capture(null);
         base.OnPointerReleased(e);
@@ -111,10 +470,13 @@ public class CadViewControl : Control
 
     public override void Render(DrawingContext context)
     {
+        // 首次显示：在绘制前完成"适应窗口"。
+        // 这里只能改视口，不能 InvalidateVisual（见 UpdateFit 注释）；同一趟渲染
+        // 紧接着读取 Viewport，所以首帧就是已适应的画面，不会闪一下未适应的状态。
         if (_pendingFit && Bounds.Width > 1 && Bounds.Height > 1)
         {
             _pendingFit = false;
-            FitToContent();
+            UpdateFit();
         }
 
         if (_display is null)
@@ -128,32 +490,73 @@ public class CadViewControl : Control
         }
 
         context.Custom(new CadDrawOperation(
-            new Rect(Bounds.Size), _display, Viewport.Zoom, Viewport.Offset, HiddenLayers));
+            this, new Rect(Bounds.Size), _display, Viewport.Zoom, Viewport.Offset,
+            _hiddenSnapshot, MinTextPixelSize, MinEntityPixelSize, _overlaySnapshot));
     }
 
     private sealed class CadDrawOperation : ICustomDrawOperation
     {
+        private readonly CadViewControl _owner;
         private readonly Rect _bounds;
         private readonly DisplayList _list;
         private readonly float _zoom;
         private readonly SKPoint _offset;
         private readonly HashSet<string> _hidden;
+        private readonly float _minTextPx;
+        private readonly float _minEntityPx;
+        private readonly OverlayLayer? _overlay;
 
-        public CadDrawOperation(Rect bounds, DisplayList list, float zoom, SKPoint offset, HashSet<string> hidden)
+        public CadDrawOperation(CadViewControl owner, Rect bounds, DisplayList list, float zoom, SKPoint offset,
+                                HashSet<string> hidden, float minTextPx, float minEntityPx,
+                                OverlayLayer? overlay)
         {
+            _owner = owner;
             _bounds = bounds;
             _list = list;
             _zoom = zoom;
             _offset = offset;
             _hidden = hidden;
+            _minTextPx = minTextPx;
+            _minEntityPx = minEntityPx;
+            _overlay = overlay;
+            // 绘制操作的生命周期由 Avalonia 管理，而 UI 线程随时可能 SetDisplay 换图。
+            // 持有一份引用（在 Dispose 中归还），保证绘制期间几何不会被提前释放。
+            list.AddRef();
+            overlay?.AddRef();
         }
 
         public Rect Bounds => _bounds;
         public bool HitTest(Point p) => _bounds.Contains(p);
         public bool Equals(ICustomDrawOperation? other) => false;
-        public void Dispose() { }
+
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                _list.Release();
+                _overlay?.Release();
+            }
+        }
 
         public void Render(ImmediateDrawingContext context)
+        {
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                RenderCore(context);
+            }
+            finally
+            {
+                long dt = System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+                Interlocked.Exchange(ref _owner._lastDrawTicks, dt);
+                Interlocked.Add(ref _owner._drawTicksTotal, dt);
+                Interlocked.Increment(ref _owner._drawCount);
+            }
+        }
+
+        private void RenderCore(ImmediateDrawingContext context)
         {
             var leaseFeature = context.TryGetFeature(typeof(ISkiaSharpApiLeaseFeature)) as ISkiaSharpApiLeaseFeature;
             if (leaseFeature is null) return; // 软件渲染环境：P0 暂不绘制
@@ -163,54 +566,243 @@ public class CadViewControl : Control
             float w = (float)_bounds.Width, h = (float)_bounds.Height;
 
             canvas.Save();
-            canvas.Clear(SKColors.White);
+            // 先裁剪再清屏：Clear 会无视裁剪区，若在 ClipRect 之前调用会刷到控件外部。
             canvas.ClipRect(SKRect.Create(0, 0, w, h));
+            canvas.Clear(SKColors.White);
 
             var worldToScreen = new SKMatrix(_zoom, 0, _offset.X, 0, -_zoom, _offset.Y, 0, 0, 1);
-
-            // 世界空间几何
             var worldRect = ScreenRectToWorld(w, h);
-            var visible = _list.Index.Query(worldRect);
             float hairline = 1f / MathF.Max(_zoom, 1e-6f);
 
+            // 每帧只分配 3 个 paint（而非每实体一个）。
+            // 注意：这里刻意保持 IsAntialias = true —— 实测关闭批次抗锯齿会让这一档
+            // 从 43.9ms 恶化到 179.2ms（Skia 走不到细线快速路径），故不采用
+            // ReadCAD 的 EnableBulkLineAntialias=false 设置。
             using var stroke = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Stroke };
             using var fill = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Fill };
-            var texts = new List<TextDraw>();
-            var textColors = new List<uint>();
+            using var textPaint = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Fill };
 
-            canvas.Save();
-            canvas.Concat(worldToScreen);
-            foreach (var ent in visible)
+            var baked = _list.Baked;
+            if (baked is not null && ShouldUseBaked(baked, worldRect))
             {
-                if (_hidden.Contains(ent.Layer)) continue;
-                uint color = ent.ColorArgb;
-                if ((color & 0x00FFFFFF) == 0x00FFFFFF) color = 0xFF000000u; // 白 → 黑（白底）
+                // ---- 批次路径：DrawPath 次数 = 批次数，且按 LOD 整档跳过亚像素几何 ----
+                canvas.Save();
+                canvas.Concat(worldToScreen);
+                DrawBuckets(canvas, stroke, fill, baked, worldRect, hairline);
+                DrawLooseEntities(canvas, stroke, baked.WideStrokeEntities, worldRect, worldToScreen, hairline);
+                canvas.Restore();
+                DrawTexts(canvas, textPaint, baked.TextEntities, worldRect);
+            }
+            else
+            {
+                // ---- 逐实体路径：R树剔除后逐条绘制 ----
+                var visible = _list.Index.Query(worldRect);
+                canvas.Save();
+                canvas.Concat(worldToScreen);
+                DrawStrokeEntities(canvas, stroke, fill, visible, hairline);
+                canvas.Restore();
+                DrawTexts(canvas, textPaint, visible, worldRect);
+            }
 
-                if (ent.Path is not null)
+            // ---- 选中高亮 pass：叠加在最上层，不走 LOD（选中了就要看得见）----
+            var selected = _owner._selectedSnapshot;
+            if (selected.Count > 0)
+            {
+                using var hlStroke = new SKPaint
                 {
-                    stroke.Color = new SKColor(color);
-                    stroke.StrokeWidth = ent.LineWidth > 0 ? ent.LineWidth : hairline;
-                    canvas.DrawPath(ent.Path, stroke);
+                    IsAntialias = true,
+                    Style = SKPaintStyle.Stroke,
+                    Color = SKColors.OrangeRed,
+                    StrokeWidth = hairline * 2,
+                };
+                using var hlFill = new SKPaint
+                {
+                    IsAntialias = true,
+                    Style = SKPaintStyle.Fill,
+                    Color = new SKColor(255, 69, 0, 96), // 半透明橙红，实心填充也看得见轮廓
+                };
+                canvas.Save();
+                canvas.Concat(worldToScreen);
+                foreach (var e in selected)
+                {
+                    // 渲染线程只读不可变快照 _hiddenSnapshot（与主绘制 pass 同一规则）
+                    if (_owner._hiddenSnapshot.Count > 0 && _owner._hiddenSnapshot.Contains(e.Layer)) continue;
+                    if (e.FillPath is { } fp) canvas.DrawPath(fp, hlFill);
+                    if (e.Path is { } pth) canvas.DrawPath(pth, hlStroke);
                 }
-                if (ent.FillPath is not null)
+                canvas.Restore();
+            }
+
+            // ---- 叠加高亮 pass：临时几何（多段线单段 / 填充环 / 块内子实体）----
+            // 画在选中高亮之上：叠加层表达的是"当前操作目标"，通常比选中集合更精确，
+            // 被选中集盖住就看不见了。与选中高亮一样不走 LOD —— 高亮就得看得见。
+            var overlay = _overlay;
+            if (overlay is { Shapes.Count: > 0 })
+            {
+                using var ovStroke = new SKPaint
                 {
-                    fill.Color = new SKColor(color);
-                    canvas.DrawPath(ent.FillPath, fill);
+                    IsAntialias = true,
+                    Style = SKPaintStyle.Stroke,
+                };
+                using var ovFill = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Fill };
+
+                // 虚线段长按世界单位给（hairline 的倍数）→ 屏幕观感不随缩放变化。
+                SKPathEffect? dash = null;
+                try
+                {
+                    canvas.Save();
+                    canvas.Concat(worldToScreen);
+                    foreach (var shape in overlay.Shapes)
+                    {
+                        if (shape?.Path is null) continue;
+                        var color = new SKColor(shape.ColorArgb);
+                        float sw = shape.StrokeWidthWorld > 0 ? shape.StrokeWidthWorld : hairline * 2;
+
+                        if (shape.Dashed && dash is null)
+                            dash = SKPathEffect.CreateDash(new[] { hairline * 12, hairline * 8 }, 0);
+                        ovStroke.PathEffect = shape.Dashed ? dash : null;
+                        ovStroke.Color = color;
+                        ovStroke.StrokeWidth = sw;
+
+                        if (shape.Fill)
+                        {
+                            ovFill.Color = color.WithAlpha(shape.FillAlpha);
+                            canvas.DrawPath(shape.Path, ovFill);
+                        }
+                        canvas.DrawPath(shape.Path, ovStroke);
+                    }
+                    canvas.Restore();
                 }
-                if (ent.Text is not null)
+                finally
                 {
-                    texts.Add(ent.Text);
-                    textColors.Add(color);
+                    // ovStroke 仍持有该 effect 的原生引用，此处只是归还本方法的引用，不会悬空。
+                    ovStroke.PathEffect = null;
+                    dash?.Dispose();
                 }
             }
-            canvas.Restore();
-
-            // 文本（屏幕空间绘制，清晰度不随缩放损失）
-            for (int i = 0; i < texts.Count; i++)
-                DrawText(canvas, texts[i], textColors[i]);
 
             canvas.Restore();
         }
+
+        /// <summary>
+        /// 是否走批次路径。
+        /// 用"视口面积 / 图纸范围面积"估算可见实体数，避免为了做决策而先跑一次
+        /// 会返回十几万条目的 R树查询（那本身就是笔可观开销）。
+        /// 密度不均时该估算会有偏差，但两条路输出一致，选错只影响速度不影响正确性。
+        /// </summary>
+        private bool ShouldUseBaked(BakedGeometry baked, SKRect worldRect)
+        {
+            var ext = _list.Extents;
+            double totalArea = (double)ext.Width * ext.Height;
+            double viewArea = (double)worldRect.Width * worldRect.Height;
+            double ratio = totalArea > 0 ? Math.Min(1.0, viewArea / totalArea) : 1.0;
+            double estimatedVisible = _list.Entities.Count * ratio;
+            return estimatedVisible > baked.BucketCount * (double)BucketVsEntityCostRatio;
+        }
+
+        private void DrawBuckets(SKCanvas canvas, SKPaint stroke, SKPaint fill,
+                                 BakedGeometry baked, SKRect worldRect, float hairline)
+        {
+            stroke.StrokeWidth = hairline;
+            uint current = 0;
+            bool hasColor = false;
+
+            foreach (var cls in baked.Classes)
+            {
+                // LOD：整档的最大屏幕尺寸都低于阈值 → 该档全是亚像素几何，整档跳过。
+                // 因为比较的是"档的上界"，所以永远不会剔掉屏幕上看得见的实体。
+                if (cls.MaxPixelSize(_zoom) < _minEntityPx) continue;
+
+                foreach (var b in cls.Buckets)
+                {
+                    if (_hidden.Contains(b.Layer)) continue;
+                    // 整批剔除：批次包围盒不与视口相交则整批跳过
+                    if (!b.Bounds.IntersectsWith(worldRect)) continue;
+
+                    if (!hasColor || b.ColorArgb != current)
+                    {
+                        current = b.ColorArgb;
+                        hasColor = true;
+                        var c = new SKColor(ResolveColor(current));
+                        stroke.Color = c;
+                        fill.Color = c;
+                    }
+
+                    if (b.StrokePath is not null) canvas.DrawPath(b.StrokePath, stroke);
+                    if (b.FillPath is not null) canvas.DrawPath(b.FillPath, fill);
+                }
+            }
+        }
+
+        private void DrawStrokeEntities(SKCanvas canvas, SKPaint stroke, SKPaint fill,
+                                        IList<CadEntity> visible, float hairline)
+        {
+            stroke.StrokeWidth = hairline;
+            foreach (var ent in visible)
+            {
+                if (_hidden.Contains(ent.Layer)) continue;
+                if (ent.Path is not null)
+                {
+                    if (!PassesEntityLod(ent.Bounds)) continue;
+                    stroke.Color = new SKColor(ResolveColor(ent.ColorArgb));
+                    if (ent.LineWidth > 0) stroke.StrokeWidth = ent.LineWidth;
+                    canvas.DrawPath(ent.Path, stroke);
+                    if (ent.LineWidth > 0) stroke.StrokeWidth = hairline;
+                }
+                if (ent.FillPath is not null)
+                {
+                    if (!PassesEntityLod(ent.Bounds)) continue;
+                    fill.Color = new SKColor(ResolveColor(ent.ColorArgb));
+                    canvas.DrawPath(ent.FillPath, fill);
+                }
+            }
+        }
+
+        /// <summary>批次路径下的有线宽实体（数量远小于几何实体，逐条绘制并做同样的 LOD）。</summary>
+        private void DrawLooseEntities(SKCanvas canvas, SKPaint stroke,
+                                       IReadOnlyList<CadEntity> wide,
+                                       SKRect worldRect, in SKMatrix worldToScreen, float hairline)
+        {
+            if (wide.Count == 0) return;
+            canvas.Save();
+            canvas.Concat(worldToScreen);
+            stroke.StrokeWidth = hairline;
+            foreach (var ent in wide)
+            {
+                if (_hidden.Contains(ent.Layer)) continue;
+                if (ent.Path is null) continue;
+                if (!PassesEntityLod(ent.Bounds)) continue;
+                if (!ent.Bounds.IntersectsWith(worldRect)) continue;
+                stroke.Color = new SKColor(ResolveColor(ent.ColorArgb));
+                stroke.StrokeWidth = ent.LineWidth > 0 ? ent.LineWidth : hairline;
+                canvas.DrawPath(ent.Path, stroke);
+            }
+            canvas.Restore();
+        }
+
+        private void DrawTexts(SKCanvas canvas, SKPaint paint, IEnumerable<CadEntity> entities, SKRect worldRect)
+        {
+            foreach (var ent in entities)
+            {
+                if (ent.Text is null || _hidden.Contains(ent.Layer)) continue;
+                if (!ent.Bounds.IntersectsWith(worldRect)) continue;
+                DrawText(canvas, paint, ent.Text, ResolveColor(ent.ColorArgb));
+            }
+        }
+
+        /// <summary>
+        /// 实体级 LOD：包围盒最长边的屏幕尺寸不足阈值即视为不可见。
+        /// 与批次路径的整档跳过是同一套判据，保证两条路画面一致。
+        /// </summary>
+        private bool PassesEntityLod(SKRect bounds)
+        {
+            if (_minEntityPx <= 0f) return true;
+            return MathF.Max(bounds.Width, bounds.Height) * _zoom >= _minEntityPx;
+        }
+
+        /// <summary>白 → 黑（白底）。批次路径与逐实体路径必须用同一套规则，否则两条路观感不一致。</summary>
+        private static uint ResolveColor(uint color)
+            => (color & 0x00FFFFFF) == 0x00FFFFFF ? 0xFF000000u : color;
 
         private SKRect ScreenRectToWorld(float w, float h)
         {
@@ -221,18 +813,40 @@ public class CadViewControl : Control
                 MathF.Abs(p1.X - p0.X), MathF.Abs(p1.Y - p0.Y));
         }
 
-        private void DrawText(SKCanvas canvas, TextDraw td, uint color)
+        /// <summary>
+        /// 文本：屏幕空间绘制，按像素高度做 LOD（ReadCAD 的 MinTextPixelSize 思路），
+        /// 字体按整数像素尺寸缓存复用（原实现每字都 new SKFont + new SKPaint，后者还从不释放）。
+        /// 多行文本（MTEXT 的 \P 已转成 \n）逐行绘制 —— Skia 的 DrawText 不处理换行符，
+        /// 换行符会被当缺字画成方框。
+        /// </summary>
+        private void DrawText(SKCanvas canvas, SKPaint paint, TextDraw td, uint color)
         {
             float px = td.Height * _zoom;
-            if (px < 1.2f) return; // 过小降级
+            if (px < _minTextPx) return;
+
+            int key = (int)MathF.Round(Math.Min(px, 512f));
+            if (key < 1) return;
+            var font = FontCache.GetOrAdd(key, k => new SKFont(TextTypeface, k));
+
+            paint.Color = new SKColor(color);
             float sx = td.Position.X * _zoom + _offset.X;
             float sy = -td.Position.Y * _zoom + _offset.Y;
-            var paint = new SKPaint { IsAntialias = true, Color = new SKColor(color), Style = SKPaintStyle.Fill };
-            using var font = new SKFont(TextTypeface, px);
             canvas.Save();
             canvas.Translate(sx, sy);
             canvas.RotateDegrees(td.RotationRadians * 180f / MathF.PI);
-            canvas.DrawText(td.Text, 0, 0, font, paint);
+
+            if (td.Text.IndexOf('\n') < 0)
+            {
+                canvas.DrawText(td.Text, 0, 0, font, paint);
+            }
+            else
+            {
+                // 行距与 TextMetrics 的度量口径一致（同一字体的 Spacing）
+                float spacing = font.Spacing > 0 ? font.Spacing : px * 1.2f;
+                var lines = td.Text.Split('\n');
+                for (int i = 0; i < lines.Length; i++)
+                    canvas.DrawText(lines[i], 0, i * spacing, font, paint);
+            }
             canvas.Restore();
         }
     }

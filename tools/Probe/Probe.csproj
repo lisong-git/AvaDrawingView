@@ -8,6 +8,11 @@
   <ItemGroup>
     <PackageReference Include="ACadSharp" Version="3.4.9" />
     <PackageReference Include="NetTopologySuite" Version="2.6.0" />
-    <PackageReference Include="SkiaSharp" Version="3.119.1" />
+    <!-- 须与 CadViewer.Core / Avalonia.Skia 12.1.2 的 3.119.4 一致，否则 NU1605 包降级报错 -->
+    <PackageReference Include="SkiaSharp" Version="3.119.4" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- OwnHandle 验证要跑真转换器（CadDocumentLoader / GeometryConverter） -->
+    <ProjectReference Include="..\..\src\CadViewer.Core\CadViewer.Core.csproj" />
   </ItemGroup>
 </Project>

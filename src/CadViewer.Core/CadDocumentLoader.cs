@@ -20,24 +20,46 @@ public static class CadDocumentLoader
         progress?.Report("转换几何…");
         ct.ThrowIfCancellationRequested();
         var converter = new GeometryConverter();
-        var entities = converter.Convert(doc);
+        var entities = converter.Convert(doc, ct);
 
         progress?.Report("构建空间索引…");
         ct.ThrowIfCancellationRequested();
-        var index = SpatialIndex.Build(entities);
+        var index = SpatialIndex.Build(entities, ct);
+
+        progress?.Report("烘焙绘制批次…");
+        ct.ThrowIfCancellationRequested();
+        var baked = GeometryBaker.Bake(entities, ct);
 
         var extents = ComputeExtents(entities);
-        progress?.Report($"完成：{entities.Count} 个实体，跳过 {converter.Skipped}");
+        progress?.Report(baked is null
+            ? $"完成：{entities.Count} 个实体，跳过 {converter.Skipped}"
+            : $"完成：{entities.Count} 个实体，跳过 {converter.Skipped}，"
+              + $"合并为 {baked.BucketCount} 个绘制批次（{baked.BakeMs:F0} ms）");
+
+        var handleBounds = new Dictionary<ulong, SKRect>();
+        foreach (var ent in entities)
+        {
+            if (ent.Handle != 0 && !handleBounds.ContainsKey(ent.Handle))
+                handleBounds.Add(ent.Handle, ent.Bounds);
+        }
 
         return new DisplayList
         {
             Entities = entities,
             Index = index,
             LayerNames = converter.LayerNames,
+            HandleBounds = handleBounds,
             Extents = extents,
+            Baked = baked,
+            InitiallyHiddenLayers = converter.InitiallyHiddenLayers,
         };
     }
 
+    /// <summary>
+    /// 读取 DWG/DXF。
+    /// 注意：ACadSharp 的 <c>Read()</c> 不接受 CancellationToken，解析阶段**无法中断**
+    /// （大图约 4 秒），取消只能在解析结束后的各阶段生效。
+    /// </summary>
     private static ACadSharp.CadDocument ReadDocument(string path, CancellationToken ct)
     {
         var ext = Path.GetExtension(path).ToLowerInvariant();

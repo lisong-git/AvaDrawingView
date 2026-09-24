@@ -5,5 +5,8 @@
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/SmokeTest/SmokeTest.csproj" />
+    <Project Path="tools/UiSmokeTest/UiSmokeTest.csproj" />
+    <Project Path="tools/PerfProbe/PerfProbe.csproj" />
+    <Project Path="tools/SampleGen/SampleGen.csproj" />
   </Folder>
 </Solution>

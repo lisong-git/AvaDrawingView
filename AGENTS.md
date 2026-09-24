@@ -4,20 +4,26 @@
 
 ## 技术栈
 
-- .NET 8 (`net8.0`) + Avalonia 11.3 + SkiaSharp 3.x
+- .NET 8 (`net8.0`) + **Avalonia 12.1.2** + SkiaSharp 3.119.4（2026-09-16 由 Avalonia 11.3 升级）
 - ACadSharp 3.4.9（DWG/DXF 解析）
 - NetTopologySuite（STRtree 空间索引，视口裁剪）
 - 渲染核心：`Control.Render` → `ICustomDrawOperation` → `ISkiaSharpApiLeaseFeature.Lease()` 直接借 Avalonia 的 Skia GPU 上下文，**零互操作层**
-- 显示数据为不可变快照，原子替换，渲染线程无锁
+- 显示数据为不可变快照，原子替换，渲染线程无锁；原生几何（`SKPath`）由 `DisplayList` 引用计数释放
+  （`AddRef`/`Release`，见「显示保真与资源释放」第 4 节），**GC 管不到原生内存**
 
 ## 项目结构
 
 ```
-src/CadViewer.Core/   核心库：解析、几何转换、空间索引、视口
+src/CadViewer.Core/   核心库：解析、几何转换、空间索引、视口、文本度量、烘焙批次
 src/CadViewer/        Avalonia 应用：CadViewControl 渲染控件 + 主窗口
-tools/SmokeTest/      冒烟测试（解析→转换→索引全链路）
+tools/SmokeTest/      冒烟测试（解析→转换→索引全链路，不经过渲染管线，52 项精确断言）
+tools/UiSmokeTest/    UI 冒烟测试（无头 Avalonia 真实跑渲染管线，拦截"渲染期非法操作"类缺陷，21 项断言含像素级校验）
+tools/PerfProbe/      性能基准（加载分段耗时 / 内存 / 逐缩放帧耗时 / LOD 扫描 / 墨迹覆盖率 / 泄漏验证）
+tools/SampleGen/      生成 samples/sample_features.dxf（覆盖全部实体类型与边界情况）
 tools/Probe/          ACadSharp API 反射探针（摸 API 用，可删）
+tools/regress.ps1     一键回归：Debug/Release 构建 + 核心冒烟 + UI 冒烟，汇总到 .regress.log
 samples/              样例 DXF
+docs/                 分析报告等技术文档
 ```
 
 ## 构建与运行
@@ -25,8 +31,257 @@ samples/              样例 DXF
 ```bash
 dotnet build Avalonia2dDWG.slnx        # 注意是 .slnx，不是 .sln
 dotnet run --project src/CadViewer     # 启动 GUI
-dotnet run --project tools/SmokeTest   # 冒烟测试（不要加 --nologo，会被当应用参数）
+dotnet run --project tools/SmokeTest   # 核心链路冒烟（不要加 --nologo，会被当应用参数）
+dotnet run --project tools/UiSmokeTest # UI 渲染冒烟（无头，不弹窗口）
+dotnet run --project tools/PerfProbe -- "D:\path\to.dwg"   # 性能基准（--load-only 只测加载，--repeat 8 验泄漏）
+dotnet run --project tools/SampleGen   # 重新生成 samples/sample_features.dxf
 ```
+
+**改完代码先跑一键回归**（省掉手敲上面四条，且构建失败会 fail-fast）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\regress.ps1   # 明细写仓库根 .regress.log
+```
+
+两项冒烟测试都会把结果**同时**写 Console 和一份 UTF-8 日志文件
+（`CADVIEWER_SMOKE_LOG` / `CADVIEWER_UISMOKE_LOG` 指定路径，默认落 `%TEMP%`）。
+Windows 下必须读日志文件：PowerShell 重定向原生命令 stdout 用的是 ANSI 码页，
+dotnet 的 UTF-8 中文会整体变乱码（`[Console]::OutputEncoding` 在 PS 5.1 非交互重定向下不生效）。
+
+**改渲染相关代码后必须跑 `UiSmokeTest`**：`SmokeTest` 只走 解析→转换→索引，完全不进
+Avalonia 的渲染管线，所以像"渲染期调用 InvalidateVisual"这类缺陷它 100% 漏掉（2026-09-16 实际漏过一次）。
+`UiSmokeTest` 用 `Avalonia.Headless` + `UseHeadlessDrawing=false` + `UseSkia()` 真实跑一遍
+`SetDisplay → 布局 → 渲染`，并用 `CaptureRenderedFrame()` 逐帧驱动。
+
+**改渲染性能相关代码后必须跑 `PerfProbe` 并与下表基线对比**（详见「大图性能」一节）。
+
+## 大图性能架构（借鉴 ReadCAD，2026-09-16 实测落地）
+
+参考对象：`C:\Program Files (x86)\ReadCAD`（未混淆，PDB 可提取类型名；
+`AIConfig\config\render_settings.json` 是它的真实渲染配置，极具参考价值）。
+其思路 = `Cached*` 实体预计算 → 按图元类型打包 `Gpu*Buffer` 大缓冲 → 每帧视口过滤 + LOD + 提交缓冲。
+
+我们的 Skia 等价物（零互操作栈）：
+
+1. **几何烘焙合并**（`CadViewer.Core/BakedGeometry.cs`，Skia 版 GpuBuffer）
+   加载线程把实体按 **(世界尺寸档, 图层, 颜色)** 合并成少量 SKPath。
+   实测 5.36MB 图纸（85,515 个可显示实体）→ **214 个批次**（压缩 399 倍），烘焙仅 38–46ms。
+   每帧 DrawPath 次数从 8.5 万降到批次数级，且同色批次连续绘制不再抖动 SKPaint 状态。
+   有线宽（8,210 个）与文本（9,999 个）实体不合并，走逐实体 + LOD 路径。
+2. **双路渲染**（`CadViewControl`）
+   可见比例高（缩小/全图）→ 批次路径；可见比例低（放大）→ R树剔除 + 逐实体路径。
+   用"视口面积/图纸面积"估算可见数做切换，避免为决策先跑一次十几万条目的 R树查询。
+   **两条路必须施加同一套 LOD 与配色规则**，否则切换瞬间画面会跳变。
+3. **尺寸分档 LOD**（对应 ReadCAD 的 `MinEntityPixelSize`）
+   档界按 4 倍递增（1/4/16/…/1M），渲染时"整档最大像素尺寸 < 阈值"则整档跳过。
+   因为比较的是档上界，**永远不会剔掉屏幕上可见的实体**，最坏只是多留一档。
+4. **文本 LOD + 字体缓存**（`MinTextPixelSize=5`；SKFont 按整数像素缓存复用，
+   修掉了原实现每字 new SKPaint 且不释放的泄漏）。
+5. **性能自观测**：`CadViewControl.LastDrawMs / AverageDrawMs / DrawCount`
+   （对应 ReadCAD 的 PerformanceMonitorService），由绘制操作用 Interlocked 写入。
+
+### 实测基线（5.36MB / 1600x900 无头，12 帧中位）
+
+| 缩放 | 可见实体 | 优化前墙钟 | 优化后墙钟 | 绘制耗时 | 优化前 FPS | 优化后 FPS |
+|---|---|---|---|---|---|---|
+| 1x（全图） | 85,515 | 137.5ms¹ | **15.7ms** | **4.5ms** | 7.3¹ | **63.6** |
+| 2x | 72,550 | 117.1ms¹ | 18.8ms | 5.4ms | 8.5¹ | 53.1 |
+| 4x | 9,019 | 21.5ms | 20.1ms | 5.8ms | 46.5 | 49.9 |
+| 平移 | — | 17.7ms | 16.8ms | — | 56.4 | 59.6 |
+
+¹ "优化前"那组数在**未做可见性过滤**的 135,876 实体上测得，与"优化后 85,515"不同源，只看量级。
+优化后按 AutoCAD 语义正确跳过隐藏实体（7,836 个源实体）与冻结/关闭图层（`DOTE` 层色号 1，
+之前被错误显示成红色图块），所以可见实体数从 13.6 万降到 8.6 万——**这是修对了，不是掉图元**。
+
+无头捕获本身有 **~11ms 固定开销**（16x 时 0 个实体可见、绘制仅 0.4ms，墙钟仍 12.5ms），
+所以 4x 及更深的墙钟列已被固定开销主导，只有"绘制耗时"能反映代码变化。
+真实 GUI 下 FPS 高于表中数值。**看"绘制耗时"列对比渲染代码，看"墙钟"对比体感。**
+
+> 拆一下贡献：LOD 关闭（但烘焙 + 过滤已生效）时 1x 为 17.1ms / 35.4 FPS，
+> 打开 LOD 1.5 后降到 4.7ms / 62.1 FPS。即"可见性过滤 + 烘焙合并"贡献大头，
+> LOD 再补最后一截；没有过滤，光靠 LOD 也到不了这个数。
+
+### 性能调参（实测依据）
+
+- `MinEntityPixelSize` 默认 **1.5**。LOD 扫描（12 帧中位绘制耗时 + 墨迹覆盖率）：
+  | 阈值 | 1x 绘制 | 2x 绘制 | 1x 墨迹覆盖 | 2x 墨迹覆盖 |
+  |---|---|---|---|---|
+  | 0（关） | 17.1ms | 18.0ms | 2.07% | 3.54% |
+  | 1.0 | 4.2ms | 9.4ms | 2.03% | 3.52% |
+  | **1.5** | **4.7ms** | **4.5ms** | **2.03%** | **3.40%** |
+  | 3.0（ReadCAD 值） | 2.9ms | 4.1ms | 1.80% | 3.40% |
+  取 1.5 而非 1.0 的原因：尺寸档按 4 倍递增，"256–1024 单位"档在 2x 下最大像素尺寸
+  1.19px，阈值 1.0 必须整档保留（19 万点），1.5 才能整档跳过。
+  1.5 与 1.0 在 **1x 下墨迹覆盖率完全相同（2.03%）**，仅比关闭 LOD 少 0.04 个百分点。
+  阈值 3.0 会再省 0.9ms，但 1x 墨迹掉到 1.80%（肉眼开始能看出缺失），不取。
+- **不要照搬 ReadCAD 的 `EnableBulkLineAntialias=false`**：在 Skia 栈下实测
+  **反向优化**（1x 从 43.9ms 恶化到 179.2ms，Skia 走不到细线快速路径）。
+  借鉴别人配置必须逐项实测，不能默认成立。
+- 烘焙阈值 `GeometryBaker.DefaultMinEntityCount = 20000`：低于此逐实体已达标（~20ms），
+  不烘焙省一份内存。内存代价实测：工作集 477 → 542MB（+65MB，强制 GC 后托管堆仅 25MB）。
+- **泄漏验证**（`PerfProbe --repeat 8`，同一 5.36MB 图纸连开 8 次）：
+  工作集 594 → 642 → 645 → 662 → 657 → 664 → 638 → 652 MB（**平台期，不线性增长**），
+  托管堆恒为 47.8MB，`DisplayList.DisposedCount` 每轮 +1（0→7）。
+  若未释放，8 次应累加约 8×550MB。这条是"引用计数释放真的生效"的量化证据。
+- 测量方法论（教训）：无预热/不隔离 GC 的帧测量，同一配置两次能差 25%——
+  必须预热 3 帧 + `GC.Collect` + ≥12 帧 + 中位数；对比配置看"绘制耗时"而非墙钟。
+
+## 显示保真与资源释放（2026-09-16 修复；断言数实测 2026-09-23：52 项核心 + 21 项 UI）
+
+### 1. `Arc.Sweep` 在 ACadSharp 3.4.9 里是**负值**（最隐蔽的真缺陷）
+`Arc.Sweep` 返回的是 `startAngle - endAngle`（正常逆时针弧为负），原实现写
+`if (sweep <= 0) sweep = 2π;`，于是**每一段弧都被画成整圆**。样例里的四分之一圆
+`(0,60)–(15,75)` 被画成整圆，肉眼很难发现（大面积弧重叠时更像"图纸本来是圆的"）。
+固定做法是自己算扫角，并规避 Skia 在 ±360° 时 `ArcTo` 什么都不画的坑：
+```csharp
+private static double ArcSweep(double startAngle, double endAngle)
+{
+    double sweep = endAngle - startAngle;
+    while (sweep <= 0) sweep += 2 * Math.PI;   // 归一到 (0, 2π]
+    return sweep;
+}
+
+private static void AddArcTo(SKPath path, SKRect oval, double startRad, double sweepRad)
+{
+    double sweepDeg = sweepRad * 180.0 / Math.PI;
+    if (sweepDeg >= 360.0 - 1e-6) sweepDeg = 359.999;    // 恰好 360° 时 ArcTo 不画
+    else if (sweepDeg <= -360.0 + 1e-6) sweepDeg = -359.999;
+    path.ArcTo(oval, (float)(startRad * 180.0 / Math.PI), (float)sweepDeg, false);
+}
+```
+
+### 2. 文本包围盒必须走真实字体度量（`TextMetrics`）
+原实现用 `raw.Length * height * 0.7` 估宽度，样例里 15 字符 × 字号 6 估出 halfW≈63
+（真实渲染宽约 49），把 `Extents` 左边界从 0 虚增到 **-53** → 开图后 `Fit()` 画面偏小偏左。
+现统一走 `CadViewer.Core/TextMetrics.cs`：
+- 插入点语义 = **基线左端**，与 `canvas.DrawText(text, 0, 0, font, paint)` 一致；
+- `MeasureLocalBounds(text, height)` → `ToWorldBounds(local, origin, rotationRad)`；
+- 度量与渲染**共用同一个 `TextMetrics.SharedTypeface`**，否则"量出来的框"和"画出来的字"对不上；
+- `SKTypeface` / `SKFont` 按整数像素高度缓存复用，字体度量返回 0 时做兜底钳制。
+
+> `Extents` 现在与屏幕墨迹一致，这条约束由冒烟测试锁住：`范围左边界 == 0`（不是 -53）、
+> `文本宽度 49.1`（不是 126）。
+
+### 3. 按 AutoCAD 语义决定"画什么"
+| 情况 | 处理 | 依据 |
+|---|---|---|
+| `Entity.IsInvisible`（DXF 组码 60） | 转换阶段直接跳过 | 实体自身不可见 |
+| 图层 `!Layer.IsOn`（关闭） | 仍转换，但进 `InitiallyHiddenLayers` | 用户可在图层面板手动打开 |
+| 图层 `LayerFlags.Frozen`（冻结） | 同上 | 同上 |
+| 块内 `Color.IsByBlock` | 继承外层 INSERT 的**解析后颜色** | 原实现当白色 → 白底上直接消失 |
+| `Hatch.IsSolid` | 走 `AddFill` 填充，而非描边边界 | 实心填充原来被画成空心轮廓 |
+| `Insert` 的 `RowCount/ColumnCount` > 1 | 展开为 MINSERT 阵列 | 见下 |
+
+**MINSERT 语义**：行间距沿 **+Y**、列间距沿 **+X** 递进（AutoCAD 约定，容易搞反）。
+`Insert.IsMultiple` 是**只读属性**（由行列数派生，不能赋值，赋值编译不过）。
+实例数上限 `MaxMInsertInstances = 10_000`，防止畸形图纸炸内存。
+
+**幽灵图层**：ACadSharp 会注入一个无实体引用的占位图层（样例里叫 `unnamed0`，handle=5，flags=None），
+`doc.Layers` 因此比声明数多。过滤条件是**双重**的：名字以 `unnamed` 开头 **且** 零实体引用，
+只按名字过滤会误删用户真名叫 `unnamed_xxx` 的图层。
+
+### 4. `DisplayList` 引用计数释放（原生内存不能指望 GC）
+`SKPath` 是原生内存，GC 完全看不见；引入几何烘焙后原生几何又翻了一份，不释放会随开图线性增长。
+现在 `DisplayList : IDisposable` 用引用计数：
+- `CadDocumentLoader.Load()` 返回时计数 = 1；
+- `CadDrawOperation` 构造时 `AddRef()`、`Dispose()` 时 `Release()`（Avalonia 会在绘制操作销毁时调用）；
+- `CadViewControl.SetDisplay()` 换图时 `Release()` 旧实例；`ReferenceEquals` 相同实例不重复释放；
+- 计数归零才 `DisposeCore()`：释放全部实体的 `Path`/`FillPath` + `BakedGeometry`；
+- `DisplayList.Empty` 是共享单例（`IsSharedInstance`），`AddRef/Release` 对它空操作；
+- `DisplayList.DisposedCount` 是静态计数，专供测试断言"确实释放了"。
+
+**`BakedGeometry.Dispose()` 只释放合并后的 `StrokePath`/`FillPath`**，不要释放
+WideStroke/Text 实体——那些是 `DisplayList.Entities` 里的同一批对象引用，由 `DisplayList` 统一释放，
+重复释放会二次释放原生句柄。
+
+### 5. 取消令牌真的生效
+`Convert` / `SpatialIndex.Build` / `GeometryBaker.Bake` 都收 `CancellationToken ct = default`，
+按 1024（转换）或 4096（烘焙）条实体周期检查一次 `ct.ThrowIfCancellationRequested()`。
+注意 `DwgReader.Read()` **不接收** CancellationToken（解析阶段无法中断）。
+
+### 6. 块内实体身份：`CadEntity.OwnHandle`
+扁平模型空间里，块引用展开出的每个子实体各自是一个 `CadEntity`，但 `Handle` 被
+`handleOverride` 覆盖成**最外层** INSERT 的句柄（这样点选块内任一图元都能定位到块引用整体）。
+代价是"块内哪个子实体"没了身份。
+
+`CadEntity.OwnHandle` 补齐这一层：填实体的**自身**句柄（块定义层），不做继承。
+- 顶层实体 `OwnHandle == Handle`；块内子实体 `OwnHandle != Handle`；
+- 同一个子实体被插入多次 → 多个 `CadEntity`，**`OwnHandle` 相同而 `Handle` 不同**；
+  要区分"哪一个插入"就用 `(Handle, OwnHandle)` 组合；
+- 尺寸标注的匿名块也是下放句柄的（`AddDimensionBlock` 传 `handleOverride`），
+  所以它的块内几何归属到 **Dimension 实体的句柄**上，同样适用本规则；
+- `0` = 未填（旧数据）。**不要**用 `OwnHandle` 替代 `Handle` 做定位：
+  `DisplayList.HandleBounds` 只收 `Handle`。
+
+回归防线：SmokeTest 有 6 条断言（全部实体已填 / 块内 14 条 / 非块内 15 条 /
+2 个外层句柄 / 2 个自身句柄 / 每个外层句柄下可见全部子实体）；
+`tools/Probe` 结尾还有一段「OwnHandle 验证」，用**独立遍历块表**的方式
+逐条证实 `(外层句柄 → 目标块 → 自身句柄)` 的可达性（实测 70881 实体 / 68669 条块内实体全通过）。
+
+### 7. 叠加高亮通道：`CadViewControl.SetOverlay`
+`SetSelection` 只能选中**整个 `CadEntity`**。但标注场景的目标可以更细 ——
+多段线的某一段、填充的某个环、块引用内的某个子实体 —— 这些在 `DisplayList`
+里没有独立身份（一条 `LwPolyline` 就是一个 `CadEntity`），因此需要一条
+"任意几何的临时高亮"通路，对应 WPF/Teigha 侧的 `TransientManager`。
+
+用法（几何给**世界坐标**，控件套用当前 world→screen 变换）：
+```csharp
+var layer = new OverlayLayer { Shapes = new[] { OverlayShape.Box(worldRect, colorArgb: 0xFFFF00FF) } };
+view.SetOverlay(layer);      // 所有权转移给控件，之后不要自行 Release
+view.ZoomToOverlay();        // 缩放到叠加几何（用 TightBounds，圆弧不会被控制点撑大）
+view.ClearOverlay();
+```
+- `OverlayShape`：`Path`（SKPath，世界坐标）+ `Fill`/`FillAlpha`/`ColorArgb`/
+  `StrokeWidthWorld`（`<= 0` = 屏幕 2 像素发丝线）/ `Dashed`（惯例用于表达"只能整体定位"的降级目标）。
+- **不走 LOD**：叠加表达的是"当前操作目标"，被 LOD 剔掉等于功能失效。
+  它画在选中高亮**之上**（目标通常比选中集合更精确）。
+- **引用计数与 `DisplayList` 同款**：UI 线程换层的那一刻渲染线程可能仍在用旧几何,
+  立刻 Dispose 就是释放后使用。`CadDrawOperation` 构造时 `AddRef`、`Dispose` 时 `Release`。
+- **`SetDisplay` 会自动清空叠加层**：它的几何是上一张图的世界坐标，留着会画到错误位置。
+- 回归防线：UiSmokeTest 有 10 条断言，**像素级**（`CaptureRenderedFrame` 里数洋红像素）——
+  画面上确有叠加层、LOD 全剔除后仍在、清除后归零、换图后自动清空且原生几何已归还。
+  `CADVIEWER_UISMOKE_PNG=<路径>` 可导出该帧 PNG 供人工核对观感。
+
+### 8. 多段线凸度归属：42 组码管「本顶点 → 下一顶点」（2026-09-23 修正）
+
+**结论**：DXF 组码 42 挂在顶点上，语义是该顶点到**下一顶点**那一段的凸度；
+闭合折线的**最后顶点**管收尾段（末顶点 → 首顶点）。
+
+**原实现错在哪**：每段的凸度取成了**终点顶点**的 `Bulge`，等于整体错位一段 ——
+① 首顶点的凸度**被完全丢弃**；② 闭合折线收尾段的凸度被挪到上一段去（收尾段原本只会
+被 `Close()` 画成直线）。`LwPolyline` / `Polyline2D` / 填充的折线边界三处都是这个写法。
+
+**为什么长期没被发现**：`sample_features.dxf` 里那条样例折线只有 v0 带 `bulge=1`，
+原实现把半圆**整个丢掉**画成纯三角形；而当时的黄金断言是"中心 + 尺寸窗口"
+（`HasEntity(list, 10, 160, 19, 21)`），**恰好容得下三角形**，所以两条都"通过"。这正是
+"断言只覆盖到能通过的那一档"的典型。
+
+**定标方法（可复用）**：ASCII DXF 的组码可直读 —— 文件自己就声明了凸度挂在哪，
+于是一条只有 v0 带 bulge 的折线构成一个**无需争议的判据**：
+正确渲染应下探到 y=140（半圆），错误渲染停在 y=150（纯三角形）。
+三方比对（`LabelProbe --bulge`）：画布几何 / 按规范重建 / **ACadSharp 自己的
+`GetBoundingBox`**（另一份独立凸度实现，站规范这边）。
+
+**实测规模与结果**（`9---陶板节点 (1).dwg`）：含凸度多段线 604 条 →
+与 `GetBoundingBox` 吻合：规范解释 **585** ／ 旧约定 161，只有规范吻合 **440** 条。
+修正后 585 / 585（旧约定分支自然也对齐，因为实现只剩一份）。
+扭曲幅度可直观看到：`0x84` 规范是 `(-275,0)-(275,30)`，旧实现给 `(-280,-113)-(280,143)`。
+
+**回归防线**：SmokeTest 现在按**句柄定位 + 精确包围盒**钉死半圆
+（`0x4E` 应为 `(0,140)-(20,170)`），不再用宽容的"中心 + 尺寸窗口"。
+
+### 9. `Region` 在画布上不渲染是"没数据"，不是"不想画"（2026-09-23 探明）
+
+`GeometryConverter.ConvertEntity` 的 switch 不处理 `Region`，走 `default` 跳过 →
+面域在画布上**根本不存在**。原以为补个渲染即可，实测是数据源头就空的：
+
+- 结构上有得取：`Region.Wires` 元素类型是 `ModelerGeometry+Wire`，带 `Points`、
+  `XAxis/YAxis/ZAxis/Translation/Scale`；`Silhouettes` 也带 `Wires`。
+- 但实测（`LabelProbe --region`，`9---陶板节点 (1).dwg`）39 个面域：
+  **有 `Wires` 的 0 个、Wire 总数 0、`Silhouettes` 0、`ProprietaryData` 长度 0**。
+  另一张 `02-设计说明.dwg` 面域数本就是 0。
+- 即 **ACadSharp 3.4.9 的读取器根本没有把 ACIS 专有数据读进来**（字段在，永远是空）。
+  故面域只能维持"整体定位 + 虚线框降级"，**不是当前优先级能解决的问题**。
 
 ## 已知踩坑（重要）
 
@@ -36,23 +291,86 @@ dotnet run --project tools/SmokeTest   # 冒烟测试（不要加 --nologo，会
 - `Arc` **继承自** `Circle`（Circle 的 case 必须放在 Arc 后面）
 - `Color` 是**结构体**（非引用类型），`IsByLayer`/`IsByBlock`/`Index` 直接访问
 - `CadDocument` 不是 IDisposable；`DwgReader.Read()` 不接收 CancellationToken
-- `Insert` 缩放属性是 `XScale/YScale/ZScale`
+- **`Arc.Sweep` 返回 `startAngle - endAngle`（正常逆时针弧是负值）**，直接拿它当扫角会把
+  每段弧画成整圆；`StartAngle/EndAngle` 本身已经是**弧度**。见「显示保真」第 1 节
+- `Hatch.IsSolid` 才是实心填充；`Hatch.BoundaryPath.Arc` 的 `StartAngle/EndAngle` 带
+  `DxfReferenceType.IsAngle` 标注（读取时已角度→弧度），代码里再 `×180/π` 换回角度是**对的**
+- `Insert` 缩放属性是 `XScale/YScale/ZScale`；阵列参数是 `RowCount/ColumnCount/RowSpacing/ColumnSpacing`
+  （**行沿 +Y、列沿 +X**），而 `Insert.IsMultiple` 是**只读**派生属性，赋值直接 CS0200
+- `Entity.IsInvisible`（DXF 组码 60）；图层可见性看 `Layer.IsOn` 与 `Layer.Flags.HasFlag(LayerFlags.Frozen)`
+- 图层颜色查 `Layer.Color.Index`，但**颜色表里可能没有该图层**（要兜底默认色）
 - `BlockRecord` 在 `Tables` 命名空间
+- 写 DXF 用 `new DxfWriter(filename, doc, binary)`（`tools/SampleGen` 就是这么造样例的）
 - 不确定 API 时用 `tools/Probe`（反射枚举）验证，不要猜
 
-### Avalonia 11.3
+### Avalonia 12.1（2026-09-16 由 11.3 升级，实升踩坑）
+- **包版本必须成套对齐**：`Avalonia` / `Avalonia.Desktop` / `Avalonia.Themes.Fluent` 统一 `12.1.2`；
+  SkiaSharp 锁 **3.119.4**（与 `Avalonia.Skia` 12.1.2 的依赖声明一致）。**不要升到 SkiaSharp 4.x**，会撞原生库。
+- **`OpenFileDialog` / `SaveFileDialog` / `FolderDialog` / `FileDialogFilter` 在 12 中已彻底移除**
+  （11 时代即为 Windows 专用 API）。文件选择统一改走跨平台的
+  `TopLevel.StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions { ... })` + `FilePickerFileType`，
+  取本地路径用 `IStorageFile.TryGetLocalPath()`（可能返回 null，要显式判空）。
+- **Avalonia 12 不再支持 .NET Framework / .NET Standard**，最低 .NET 8。本项目 `net8.0` 仍受支持（nuspec 有 net8.0 目标），官方推荐 net10。
+- **编译绑定默认开启**（`AvaloniaUseCompiledBindingsByDefault` 默认 true）。本项目 XAML 无绑定，暂无影响；将来写 `{Binding}` 需配 `x:DataType`。
+- **文本整形器与渲染器解耦**：只有显式 `UseSkia()` 时才需补 `.UseHarfBuzz()`。本项目用 `UsePlatformDetect()`，无需改动。
+- `Avalonia.Diagnostics` 已移除，改用 `AvaloniaUI.DiagnosticsSupport` + `AttachDeveloperTools()`（本项目未用，无影响）。
+- `Window.SystemDecorations` → `WindowDecorations`；`TopLevel` 不再保证是视觉树根，用 `TopLevel.GetTopLevel(visual)`。
+- `IDataObject` 已移除，剪贴板/拖放改走 `IAsyncDataTransfer` / `DataTransfer`。
+- ✅ **自绘渲染链在 12 中零改动**：`ICustomDrawOperation`、`ImmediateDrawingContext.TryGetFeature`、
+  `ISkiaSharpApiLeaseFeature.Lease()` 全部保持兼容——升级只改了 3 处文件选择器相关代码。
+
+### Avalonia 通用踩坑（11 / 12 均适用）
+- **渲染过程中严禁使 Visual 失效**（本项目 2026-09-16 实际踩中）：在 `Render(DrawingContext)` 内部
+  调用 `InvalidateVisual()` 会抛
+  `InvalidOperationException: Visual was invalidated during the render pass`
+  （由 `CompositingRenderer.AddDirty` 抛出）。
+  → 凡是"渲染时才需要更新状态"的逻辑（如首次显示时按布局尺寸做适应窗口），必须把
+  **改状态** 与 **请求重绘** 拆成两个方法：`UpdateFit()`（只改视口）供 `Render` 调用，
+  `FitToContent()`（改视口 + `InvalidateVisual`）供按钮/双击等管线外调用。
+- **`context.Custom(...)` 里传出去的引用必须是不可变快照**：绘制操作在渲染线程执行，
+  而 UI 线程随时会改那些集合（如 `HiddenLayers`），共享可变引用等于无锁并发读写。
+- **`SkCanvas.Clear()` 无视裁剪区**：先 `ClipRect` 再 `Clear`，顺序颠倒会刷到控件外部。
+- **`SKPaint` / `SKFont` 是 IDisposable**，`using` 包住；漏掉会造成原生内存泄漏。
 - `ImmediateDrawingContext.TryGetFeature` 是**非泛型**的（`TryGetFeature(typeof(ISkiaSharpApiLeaseFeature))`）
 - `OnPointerMoved` 重写签名用基类 `PointerEventArgs`（不是 PointerMovedEventArgs）
 - 没有 `OnDoubleTapped` 虚方法，需在构造函数订阅 `DoubleTapped` 事件
 - `dotnet new sln`（SDK 10）默认生成 `.slnx` 新格式
 
 ### 环境注意
-- 部分会话中 Bash/PowerShell **输出捕获异常**（stdout 为空）：把命令输出重定向到日志文件再用 Read 读取
+- **部分会话 Bash 工具完全不可用**：PortableGit 的 `dirname`/`ls`/`cat` 全部报 `command not found`（PATH 未注入），
+  `cd <路径> && ...` 也会失败。此时**一律改用 PowerShell**，并把输出重定向到 `.tmp` 日志文件再用 Read 读取：
+  ```powershell
+  $log = "D:\...\.build.tmp.log"
+  (dotnet build Avalonia2dDWG.slnx -c Debug --nologo) 2>&1 | Out-File -Encoding utf8 $log
+  ```
+- 部分会话中 PowerShell **输出捕获异常**（stdout 为空）：同样重定向到日志文件再 Read
+- **`dotnet run` 跑控制台程序时 stdout 经常整段丢失**（本会话实测：只拿到第一行就没了）。
+  可靠做法是**让被测程序自己写 UTF-8 日志文件**，再 Read 那个文件——`tools/UiSmokeTest`、
+  `tools/SmokeTest`（`CADVIEWER_UISMOKE_LOG` / `CADVIEWER_SMOKE_LOG`）与 `tools/PerfProbe`
+  都是这么做的，`tools/Probe` 用 `PROBE_LOG`。
+- **PowerShell 重定向原生命令 stdout 会按 ANSI 码页解码**，dotnet 输出的 UTF-8 中文变成
+  双重编码乱码（`实` → `瀹炰綋`）；`[Console]::OutputEncoding = UTF8` 在 PS 5.1 非交互重定向下
+  **不生效**（不是设错了，是设了没用）。所以：`dotnet build` 之类纯 ASCII 输出可以重定向，
+  **含中文的测试输出必须走程序自写日志文件**，再用 `Get-Content -Encoding utf8` 读。
+  PowerShell 5.1 里 `& exe > file` 写出的是 **UTF-16LE**，Read 会当成二进制文件，别用错解码方式。
+- **`.ps1` 脚本文件里绝对不要写中文路径**：PowerShell 5.1 按 ANSI 读脚本，`上海八局` 会被
+  mojibake 成 `涓婃捣鍏眬`，然后报"未能找到路径 XXX 的一部分"。脚本里用 `$PSScriptRoot`
+  （`tools/regress.ps1` 就是这么定位仓库根的），确实需要中文路径时改用**内联命令**
+  （工具层传参编码是正确的），或用 `[char]0x6D4B` 拼。脚本注释里的中文不影响执行，但别写路径。
+- **构建失败 + `--no-build` = 悄悄跑到旧二进制**（最阴的坑）：本次实际踩中——SmokeTest 编译
+  失败，回归脚本仍 `--no-build` 跑通了**上一版**SmokeTest，得到"绿"的假结果。
+  回归脚本必须在 Debug 构建失败时**立即退出**，且断言输出里要能看到程序自己的新日志文件确实生成。
+- **`Remove-Item` 可能被沙箱的 safe-delete 包装拦截**（报 `SAFE_DELETE_FAIL_CLOSED` / `trash-failed`）。
+  遇到时改用 .NET API：`[System.IO.File]::Delete($path)`
 - 对**同一文件的多次 Edit 必须串行执行**，并行会互相覆盖、只有最后一个生效
-- 构建命令输出量大时，统一 `> .workbuddy日志文件` 再读取
+- 临时 `.tmp` 日志文件用完即删，不要留在仓库根目录（`.gitignore` 已忽略 `*.tmp`/`*.log`，但仍应清理）
 
 ## 后续路线
 
-P1：SKPicture 静态缓存、线型/填充图案、SHX 字体、文字/块完善；
-P2：拾取选择、属性面板、测量、PNG 导出；P3：10 万实体 ≥45fps。
+P1：SKPicture 静态缓存、线型（DASHED 等）/ 填充图案、SHX 字体、TEXT 组码 72/73 对齐、
+实体 `Normal` 的 OCS→WCS 变换；
+P2：拾取选择、属性面板、测量、PNG 导出；
+P3：大坐标（±1e6）float32 精度（ReadCAD 用 `EnableGpuFloatingOrigin` 解决）。
+
+**P3 的"10 万实体 ≥45fps"已达成**：85,515 可见实体全图视角 63.6 FPS（绘制 4.5ms）。
 完整方案见 WorkBuddy 工作区《Avalonia-2D-CAD查看器实施方案.md》。
