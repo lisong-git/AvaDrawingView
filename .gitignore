@@ -17,3 +17,6 @@ publish/
 # OS
 Thumbs.db
 .DS_Store
+/.workbuddy/memory
+/docs/perf-2026-09-16
+/docs
