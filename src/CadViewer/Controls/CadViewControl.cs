@@ -57,6 +57,22 @@ public class CadViewControl : Control
     /// </summary>
     public float MinEntityPixelSize { get; set; } = 1.5f;
 
+    public static readonly StyledProperty<SKColor> BackgroundColorProperty =
+        AvaloniaProperty.Register<CadViewControl, SKColor>(nameof(BackgroundColor), SKColors.Black);
+
+    public SKColor BackgroundColor
+    {
+        get => GetValue(BackgroundColorProperty);
+        set => SetValue(BackgroundColorProperty, value);
+    }
+
+    protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
+    {
+        base.OnPropertyChanged(change);
+        if (change.Property == BackgroundColorProperty)
+            InvalidateVisual();
+    }
+
     /// <summary>
     /// 批次回放成本 ≈ 多少个逐实体绘制（实测标定）。
     /// 两条路都要遍历同样的几何，差异在调用次数与 SKPaint 状态抖动，
@@ -71,6 +87,8 @@ public class CadViewControl : Control
     private bool _pendingFit;
     private Point? _panStart;
     private SKPoint _panOffsetStart;
+    private Point? _lastMiddlePress;
+    private long _lastMiddlePressTicks;
 
     // ---------- 选择（步骤 B：点选 / 高亮 / zoom-to） ----------
     // 渲染线程读 _selectedSnapshot，UI 线程写入：替换引用而非原地改列表（不可变快照原则）。
@@ -81,8 +99,15 @@ public class CadViewControl : Control
     /// 渲染线程只读快照，不做部分更新。
     /// </summary>
     private OverlayLayer? _overlaySnapshot;
-    private Point? _clickStart;   // 左键按下位置：释放时位移极小视为点选，否则是平移
-    private SKPoint _clickOffsetStart;
+    private Point? _bandStart;
+    private Point _bandCurrent;
+    private bool _bandActive;
+
+    private static readonly SolidColorBrush BandWindowFill = new(Color.FromArgb(36, 68, 138, 255));
+    private static readonly SolidColorBrush BandWindowBorder = new(Color.FromRgb(68, 138, 255));
+    private static readonly SolidColorBrush BandCrossingFill = new(Color.FromArgb(36, 92, 184, 92));
+    private static readonly Pen BandCrossingPen = new(new SolidColorBrush(Color.FromRgb(92, 184, 92)), 1, DashStyle.Dash);
+    private static readonly Pen BandWindowPen = new(BandWindowBorder, 1);
 
     /// <summary>选中集合变化（含清空）。UI 线程触发。</summary>
     public event EventHandler? SelectionChanged;
@@ -105,7 +130,7 @@ public class CadViewControl : Control
         {
             if (_hidden.Count > 0 && _hidden.Contains(e.Layer)) continue;
             if (!e.Bounds.IntersectsWith(rect)) continue;
-            double d = DistanceToEntity(e, world);
+            double d = DistanceToEntity(e, world, tolWorld);
             if (d < bestDist)
             {
                 bestDist = d;
@@ -115,12 +140,25 @@ public class CadViewControl : Control
         return bestDist <= tolWorld ? best : null;
     }
 
-    /// <summary>实体距离（世界单位）：填充/闭合路径包含 = 0，否则取包围盒最近边距离。</summary>
-    private static double DistanceToEntity(CadEntity e, SKPoint world)
+    /// <summary>
+    /// 实体距离（世界单位）：AutoCAD 语义 —— 填充实体点在内部 = 0；描边实体把容差
+    /// 膨胀进描边几何后包含点 = 0（拾取框压到线才算，点在矩形/圆内部空白不选中）。
+    /// 无几何（或膨胀失败）才退回包围盒距离。
+    /// </summary>
+    private static double DistanceToEntity(CadEntity e, SKPoint world, float tolWorld)
     {
-        // 精确命中：填充路径包含点（SOLID/HATCH）；描边路径的 Contains 只对闭合区域可靠，
-        // 对开放路径用包围盒兜底，避免细长实体（线）在包围盒内任意点都被判"命中"。
         if (e.FillPath is { } fp && fp.Contains(world.X, world.Y)) return 0;
+        if (e.Path is { } pth)
+        {
+            using var paint = new SKPaint
+            {
+                Style = SKPaintStyle.Stroke,
+                StrokeWidth = tolWorld * 2,
+            };
+            using var inflated = new SKPath();
+            if (paint.GetFillPath(pth, inflated))
+                return inflated.Contains(world.X, world.Y) ? 0 : double.MaxValue;
+        }
         var b = e.Bounds;
         float dx = MathF.Max(MathF.Max(b.Left - world.X, world.X - b.Right), 0);
         float dy = MathF.Max(MathF.Max(b.Top - world.Y, world.Y - b.Bottom), 0);
@@ -146,8 +184,7 @@ public class CadViewControl : Control
 
     /// <summary>单选切换（点击命中调用）。</summary>
     private void SelectAt(Point p)
-    {
-        var hit = HitTest(new SKPoint((float)p.X, (float)p.Y));
+    {        var hit = HitTest(new SKPoint((float)p.X, (float)p.Y));
         if (hit is null)
         {
             ClearSelection();
@@ -159,6 +196,35 @@ public class CadViewControl : Control
         _selectedSnapshot = new[] { hit };
         SelectionChanged?.Invoke(this, EventArgs.Empty);
         InvalidateVisual();
+    }
+
+    private void SelectInBand()
+    {
+        var bs = _bandStart!.Value;
+        double l = Math.Min(bs.X, _bandCurrent.X);
+        double t = Math.Min(bs.Y, _bandCurrent.Y);
+        double r = Math.Max(bs.X, _bandCurrent.X);
+        double b = Math.Max(bs.Y, _bandCurrent.Y);
+        var wa = Viewport.ScreenToWorld(new SKPoint((float)l, (float)t));
+        var wb = Viewport.ScreenToWorld(new SKPoint((float)r, (float)b));
+        var world = SKRect.Create(
+            MathF.Min(wa.X, wb.X), MathF.Min(wa.Y, wb.Y),
+            MathF.Abs(wb.X - wa.X), MathF.Abs(wb.Y - wa.Y));
+        SelectByRectangle(world, window: _bandCurrent.X >= bs.X);
+    }
+
+    public int SelectByRectangle(SKRect worldRect, bool window)
+    {
+        if (_display is null) return 0;
+        var hits = new List<CadEntity>();
+        foreach (var e in _display.Index.Query(worldRect))
+        {
+            if (_hidden.Count > 0 && _hidden.Contains(e.Layer)) continue;
+            bool hit = window ? worldRect.Contains(e.Bounds) : worldRect.IntersectsWith(e.Bounds);
+            if (hit) hits.Add(e);
+        }
+        SetSelection(hits);
+        return hits.Count;
     }
 
     /// <summary>
@@ -210,6 +276,55 @@ public class CadViewControl : Control
         }
         SetSelection(hits);
         return hits.Count;
+    }
+
+    /// <summary>
+    /// 按「(最外层块引用句柄, 块内实体自身句柄)」精确设置选中 —— 打标签编辑树用。
+    ///
+    /// <para>扁平模型空间里块内子实体的 <see cref="CadEntity.Handle"/> 会被覆盖成最外层
+    /// INSERT 的句柄，因此单靠 Handle 选不中「块内某个特定子实体」，会连带选中整个块引用。
+    /// 加上 <see cref="CadEntity.OwnHandle"/>（块定义层原始句柄，DWG 内全局唯一）后，
+    /// 二元组即构成唯一地址。</para>
+    ///
+    /// <para>Inner 传 0 时退化为「按外层句柄整选」，与
+    /// <see cref="SetSelectionByHandles"/> 等价。</para>
+    /// </summary>
+    /// <returns>实际命中的实体数。</returns>
+    public int SetSelectionBySubTargets(IEnumerable<(ulong Outer, ulong Inner)> targets)
+    {
+        if (_display is null) return 0;
+        // 单次遍历 + 哈希查找：实体数可达 5 万，逐个目标全表扫描会退化成 O(n·m)。
+        var set = new HashSet<(ulong Outer, ulong Inner)>();
+        var outerOnly = new HashSet<ulong>();
+        foreach (var t in targets)
+        {
+            if (t.Outer == 0) continue;
+            if (t.Inner == 0) outerOnly.Add(t.Outer);
+            else set.Add(t);
+        }
+        if (set.Count == 0 && outerOnly.Count == 0) return 0;
+
+        var hits = new List<CadEntity>();
+        foreach (var e in _display.Entities)
+        {
+            if (e.Handle == 0) continue;
+            if (set.Contains((e.Handle, e.OwnHandle)) || outerOnly.Contains(e.Handle))
+                hits.Add(e);
+        }
+        SetSelection(hits);
+        return hits.Count;
+    }
+
+    /// <summary>
+    /// 按二元组集合定位：选中并缩放到命中实体的包围盒。未命中任何实体返回 false。
+    /// </summary>
+    public bool RevealSubTargets(IEnumerable<(ulong Outer, ulong Inner)> targets, float padding = 2.5f)
+    {
+        var list = targets as IReadOnlyCollection<(ulong Outer, ulong Inner)> ?? targets.ToArray();
+        if (list.Count == 0) return false;
+        if (SetSelectionBySubTargets(list) == 0) return false;
+        ZoomTo(_selectedSnapshot, padding);
+        return true;
     }
 
     // ---------- 叠加高亮（临时几何） ----------
@@ -318,8 +433,6 @@ public class CadViewControl : Control
     {
         Focusable = true;
         ClipToBounds = true;
-        // Control 没有 OnDoubleTapped 虚方法，必须在构造函数订阅事件。
-        DoubleTapped += OnDoubleTappedHandler;
     }
 
     /// <summary>
@@ -411,34 +524,84 @@ public class CadViewControl : Control
         base.OnPointerWheelChanged(e);
     }
 
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        if (e.Key == Key.Escape)
+        {
+            if (_bandStart is not null)
+            {
+                _bandStart = null;
+                _bandActive = false;
+                InvalidateVisual();
+            }
+            else
+            {
+                ClearSelection();
+            }
+            e.Handled = true;
+        }
+        base.OnKeyDown(e);
+    }
+
     protected override void OnPointerPressed(PointerPressedEventArgs e)
     {
         var pt = e.GetCurrentPoint(this);
-        if (pt.Properties.IsLeftButtonPressed || pt.Properties.IsMiddleButtonPressed || pt.Properties.IsRightButtonPressed)
+        if (pt.Properties.IsMiddleButtonPressed || pt.Properties.IsRightButtonPressed)
         {
+            if (pt.Properties.IsMiddleButtonPressed && IsMiddleDoubleClick(pt.Position))
+            {
+                _lastMiddlePress = null;
+                FitToContent();
+                e.Handled = true;
+                base.OnPointerPressed(e);
+                return;
+            }
             _panStart = pt.Position;
             _panOffsetStart = Viewport.Offset;
-            // 左键额外记录点击候选：释放时位移极小 = 点选，否则是平移
-            if (pt.Properties.IsLeftButtonPressed)
-            {
-                _clickStart = pt.Position;
-                _clickOffsetStart = Viewport.Offset;
-            }
+            e.Pointer.Capture(this);
+            e.Handled = true;
+        }
+        else if (pt.Properties.IsLeftButtonPressed)
+        {
+            _bandStart = pt.Position;
+            _bandCurrent = pt.Position;
             e.Pointer.Capture(this);
             e.Handled = true;
         }
         base.OnPointerPressed(e);
     }
 
+    private bool IsMiddleDoubleClick(Point p)
+    {
+        var elapsed = TimeSpan.FromSeconds(
+            (Stopwatch.GetTimestamp() - _lastMiddlePressTicks) / (double)Stopwatch.Frequency);
+        if (_lastMiddlePress is { } lp && elapsed <= TimeSpan.FromMilliseconds(500))
+        {
+            var dx = p.X - lp.X; var dy = p.Y - lp.Y;
+            if (dx * dx + dy * dy <= 16) return true;
+        }
+        _lastMiddlePress = p;
+        _lastMiddlePressTicks = Stopwatch.GetTimestamp();
+        return false;
+    }
+
     protected override void OnPointerMoved(PointerEventArgs e)
     {
+        var p = e.GetCurrentPoint(this).Position;
         if (_panStart is { } start)
         {
-            var p = e.GetCurrentPoint(this).Position;
             Viewport.Offset = new SKPoint(
                 _panOffsetStart.X + (float)(p.X - start.X),
                 _panOffsetStart.Y + (float)(p.Y - start.Y));
             InvalidateVisual();
+            e.Handled = true;
+        }
+        else if (_bandStart is { } bs)
+        {
+            _bandCurrent = p;
+            var dx = p.X - bs.X; var dy = p.Y - bs.Y;
+            if (dx * dx + dy * dy > 16) _bandActive = true;
+            if (_bandActive) InvalidateVisual();
             e.Handled = true;
         }
         base.OnPointerMoved(e);
@@ -446,24 +609,20 @@ public class CadViewControl : Control
 
     protected override void OnPointerReleased(PointerReleasedEventArgs e)
     {
-        // 左键位移极小（≤4px）视为点选而非平移结束
-        if (_clickStart is { } cs)
+        if (_bandStart is { } bs)
         {
             var p = e.GetCurrentPoint(this).Position;
-            var dx = p.X - cs.X; var dy = p.Y - cs.Y;
-            if (dx * dx + dy * dy <= 16 && Viewport.Offset == _clickOffsetStart)
+            var dx = p.X - bs.X; var dy = p.Y - bs.Y;
+            if (dx * dx + dy * dy <= 16)
                 SelectAt(p);
-            _clickStart = null;
+            else
+                SelectInBand();
+            _bandStart = null;
+            _bandActive = false;
         }
         _panStart = null;
         e.Pointer.Capture(null);
         base.OnPointerReleased(e);
-    }
-
-    private void OnDoubleTappedHandler(object? sender, TappedEventArgs e)
-    {
-        FitToContent();
-        e.Handled = true;
     }
 
     // ---------- 渲染 ----------
@@ -482,7 +641,7 @@ public class CadViewControl : Control
         if (_display is null)
         {
             var hint = new FormattedText(
-                "打开 DWG / DXF 文件开始查看\n滚轮缩放 · 拖拽平移 · 双击适应窗口",
+                "打开 DWG / DXF 文件开始查看\n滚轮缩放 · 中键/右键拖拽平移 · 左键点选/框选 · 双击中键适应窗口",
                 System.Globalization.CultureInfo.CurrentCulture,
                 FlowDirection.LeftToRight, Typeface.Default, 14, Brushes.Gray);
             context.DrawText(hint, new Point(16, 16));
@@ -492,6 +651,16 @@ public class CadViewControl : Control
         context.Custom(new CadDrawOperation(
             this, new Rect(Bounds.Size), _display, Viewport.Zoom, Viewport.Offset,
             _hiddenSnapshot, MinTextPixelSize, MinEntityPixelSize, _overlaySnapshot));
+
+        if (_bandActive && _bandStart is { } bs)
+        {
+            var rect = new Rect(
+                Math.Min(bs.X, _bandCurrent.X), Math.Min(bs.Y, _bandCurrent.Y),
+                Math.Abs(_bandCurrent.X - bs.X), Math.Abs(_bandCurrent.Y - bs.Y));
+            bool window = _bandCurrent.X >= bs.X;
+            context.FillRectangle(window ? BandWindowFill : BandCrossingFill, rect);
+            context.DrawRectangle(window ? BandWindowPen : BandCrossingPen, rect);
+        }
     }
 
     private sealed class CadDrawOperation : ICustomDrawOperation
@@ -505,12 +674,14 @@ public class CadViewControl : Control
         private readonly float _minTextPx;
         private readonly float _minEntityPx;
         private readonly OverlayLayer? _overlay;
+        private readonly SKColor _bg;
 
         public CadDrawOperation(CadViewControl owner, Rect bounds, DisplayList list, float zoom, SKPoint offset,
                                 HashSet<string> hidden, float minTextPx, float minEntityPx,
                                 OverlayLayer? overlay)
         {
             _owner = owner;
+            _bg = owner.BackgroundColor;
             _bounds = bounds;
             _list = list;
             _zoom = zoom;
@@ -568,7 +739,7 @@ public class CadViewControl : Control
             canvas.Save();
             // 先裁剪再清屏：Clear 会无视裁剪区，若在 ClipRect 之前调用会刷到控件外部。
             canvas.ClipRect(SKRect.Create(0, 0, w, h));
-            canvas.Clear(SKColors.White);
+            canvas.Clear(_bg);
 
             var worldToScreen = new SKMatrix(_zoom, 0, _offset.X, 0, -_zoom, _offset.Y, 0, 0, 1);
             var worldRect = ScreenRectToWorld(w, h);
@@ -605,21 +776,30 @@ public class CadViewControl : Control
             }
 
             // ---- 选中高亮 pass：叠加在最上层，不走 LOD（选中了就要看得见）----
+            // AutoCAD 默认样式：蓝色 glow（宽半透明外圈 + 实线内芯），
+            // 实心填充用半透明蓝罩（与 AutoCAD 的选中半透明着色一致）。
             var selected = _owner._selectedSnapshot;
             if (selected.Count > 0)
             {
+                using var hlGlow = new SKPaint
+                {
+                    IsAntialias = true,
+                    Style = SKPaintStyle.Stroke,
+                    Color = new SKColor(0, 120, 215, 80),
+                    StrokeWidth = hairline * 6,
+                };
                 using var hlStroke = new SKPaint
                 {
                     IsAntialias = true,
                     Style = SKPaintStyle.Stroke,
-                    Color = SKColors.OrangeRed,
+                    Color = new SKColor(0, 120, 215),
                     StrokeWidth = hairline * 2,
                 };
                 using var hlFill = new SKPaint
                 {
                     IsAntialias = true,
                     Style = SKPaintStyle.Fill,
-                    Color = new SKColor(255, 69, 0, 96), // 半透明橙红，实心填充也看得见轮廓
+                    Color = new SKColor(0, 120, 215, 70),
                 };
                 canvas.Save();
                 canvas.Concat(worldToScreen);
@@ -628,7 +808,11 @@ public class CadViewControl : Control
                     // 渲染线程只读不可变快照 _hiddenSnapshot（与主绘制 pass 同一规则）
                     if (_owner._hiddenSnapshot.Count > 0 && _owner._hiddenSnapshot.Contains(e.Layer)) continue;
                     if (e.FillPath is { } fp) canvas.DrawPath(fp, hlFill);
-                    if (e.Path is { } pth) canvas.DrawPath(pth, hlStroke);
+                    if (e.Path is { } pth)
+                    {
+                        canvas.DrawPath(pth, hlGlow);
+                        canvas.DrawPath(pth, hlStroke);
+                    }
                 }
                 canvas.Restore();
             }
@@ -800,9 +984,14 @@ public class CadViewControl : Control
             return MathF.Max(bounds.Width, bounds.Height) * _zoom >= _minEntityPx;
         }
 
-        /// <summary>白 → 黑（白底）。批次路径与逐实体路径必须用同一套规则，否则两条路观感不一致。</summary>
-        private static uint ResolveColor(uint color)
-            => (color & 0x00FFFFFF) == 0x00FFFFFF ? 0xFF000000u : color;
+        /// <summary>与背景同色的实体反过来画（纯白实体在白底上、纯黑实体在黑底上都不可见）。批次路径与逐实体路径必须用同一套规则，否则两条路观感不一致。</summary>
+        private uint ResolveColor(uint color)
+        {
+            var bgLuma = (_bg.Red * 299 + _bg.Green * 587 + _bg.Blue * 114) / 1000;
+            if (bgLuma < 128)
+                return (color & 0x00FFFFFF) == 0x00000000u ? 0xFFFFFFFFu : color;
+            return (color & 0x00FFFFFF) == 0x00FFFFFFu ? 0xFF000000u : color;
+        }
 
         private SKRect ScreenRectToWorld(float w, float h)
         {

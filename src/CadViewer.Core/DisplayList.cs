@@ -1,4 +1,5 @@
 using SkiaSharp;
+using System.Threading.Tasks;
 
 namespace CadViewer.Core;
 
@@ -53,6 +54,19 @@ public sealed class DisplayList : IDisposable
     /// <summary>累计已释放的实例数（诊断与回归测试断言用）。</summary>
     public static int DisposedCount => Volatile.Read(ref _disposedCount);
 
+    private static int _disposalDelayMs = 300;
+    /// <summary>
+    /// 引用计数归零后延迟销毁原生几何的毫秒数。
+    /// 合成器线程可能仍在回放持有这些 SKPath 的最后一帧绘制流（关闭文档标签页即此场景），
+    /// 归零瞬间立即销毁会与回放并发，在 sk_canvas_draw_path 上触发 AccessViolation；
+    /// 延迟一段远大于单帧的窗口即可避开。测试/基准工具可置 0 恢复立即释放。
+    /// </summary>
+    public static int DisposalDelayMs
+    {
+        get => Volatile.Read(ref _disposalDelayMs);
+        set => Volatile.Write(ref _disposalDelayMs, value);
+    }
+
     public static DisplayList Empty { get; } = new()
     {
         Entities = Array.Empty<CadEntity>(),
@@ -74,7 +88,12 @@ public sealed class DisplayList : IDisposable
     {
         if (IsSharedInstance) return;
         if (Interlocked.Decrement(ref _refCount) > 0) return;
-        DisposeCore();
+        if (DisposalDelayMs <= 0)
+        {
+            DisposeCore();
+            return;
+        }
+        _ = Task.Delay(DisposalDelayMs).ContinueWith(_ => DisposeCore());
     }
 
     public void Dispose() => Release();

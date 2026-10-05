@@ -49,6 +49,7 @@ int Run(string[] argv)
     if (!File.Exists(path)) { Log($"FAIL: 找不到 {path}"); return 1; }
 
     var fileSize = new FileInfo(path).Length;
+    DisplayList.DisposalDelayMs = 0;
     Log($"=== PerfProbe ===");
     Log($"文件: {path}");
     Log($"大小: {fileSize / 1024.0 / 1024.0:F2} MB");

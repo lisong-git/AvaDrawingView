@@ -8,10 +8,10 @@ namespace CadViewer.Core;
 /// </summary>
 public static class CadDocumentLoader
 {
-    public static Task<DisplayList> LoadAsync(string path, IProgress<string>? progress = null, CancellationToken ct = default)
-        => Task.Run(() => Load(path, progress, ct), ct);
+    public static Task<DisplayList> LoadAsync(string path, IProgress<string>? progress = null, CancellationToken ct = default, GeometryConvertOptions? options = null)
+        => Task.Run(() => Load(path, progress, ct, options), ct);
 
-    public static DisplayList Load(string path, IProgress<string>? progress = null, CancellationToken ct = default)
+    public static DisplayList Load(string path, IProgress<string>? progress = null, CancellationToken ct = default, GeometryConvertOptions? options = null)
     {
         progress?.Report("解析文件…");
         ct.ThrowIfCancellationRequested();
@@ -20,7 +20,7 @@ public static class CadDocumentLoader
         progress?.Report("转换几何…");
         ct.ThrowIfCancellationRequested();
         var converter = new GeometryConverter();
-        var entities = converter.Convert(doc, ct);
+        var entities = converter.Convert(doc, ct, options);
 
         progress?.Report("构建空间索引…");
         ct.ThrowIfCancellationRequested();

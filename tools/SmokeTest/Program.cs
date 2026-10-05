@@ -198,6 +198,16 @@ void RunFeatureSample(string path)
     Check(texts.Count == 2, $"文本实体 == 2（TEXT + MTEXT，实际 {texts.Count}）");
     Check(texts.Any(t => t.Text!.Text.Contains('\n')), "MTEXT 的 \\P 已转成换行符");
 
+    var filtered = CadDocumentLoader.Load(path, null, default,
+        new GeometryConvertOptions { SkipRootAnnotations = true });
+    Check(filtered.Entities.Count == 26, $"根层标注过滤后实体总数 == 26（实际 {filtered.Entities.Count}）");
+    Check(!filtered.Entities.Any(e => e.Text is not null), "过滤后无文本实体");
+    Check(filtered.Entities.Count(e => e.OwnHandle == e.Handle) == 12,
+          $"过滤后根层实体 == 12（实际 {filtered.Entities.Count(e => e.OwnHandle == e.Handle)}）");
+    Check(filtered.Entities.Count(e => e.OwnHandle != e.Handle) == 14,
+          $"过滤只作用于根层：块内实体仍 == 14（实际 {filtered.Entities.Count(e => e.OwnHandle != e.Handle)}）");
+    Check(HasEntity(filtered, 50, 50, 39, 41), "过滤不影响普通几何（CIRCLE 仍在）");
+
     // ---- 范围 ----
     Check(MathF.Abs(list.Extents.Left + 20f) < 0.5f, $"范围左边界 ≈ -20（ELLIPSE，实际 {list.Extents.Left:F2}）");
     Check(MathF.Abs(list.Extents.Right - 180f) < 0.5f, $"范围右边界 ≈ 180（LEADER，实际 {list.Extents.Right:F2}）");
@@ -223,6 +233,7 @@ void RunFeatureSample(string path)
     // ---- 资源释放 ----
     // DisplayList 持有一批 SKPath（原生内存），引用计数归零才释放。
     // 加载器返回的实例初始计数为 1，显式 Release 后应被回收。
+    DisplayList.DisposalDelayMs = 0;
     int before = DisplayList.DisposedCount;
     var temp = CadDocumentLoader.Load(path);
     temp.Release();

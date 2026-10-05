@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using ACadSharp.Entities;
+using CSMath;
 using SkiaSharp;
 
 namespace CadViewer.Core;
@@ -16,6 +17,25 @@ namespace CadViewer.Core;
 /// </summary>
 public static class CadGeometry
 {
+    // ---------- OCS 镜像 ----------
+
+    /// <summary>
+    /// 法线 Z 为负的实体由 OCS 转到 WCS 所需的镜像（x→−x）。
+    /// <para>显示层与本类型的段/环几何必须施加同一份，否则标注高亮会落在 X 镜像位置。</para>
+    /// </summary>
+    public static SKMatrix OcsMirrorMatrix(Entity e) => e switch
+    {
+        Arc a => MirrorMatrix(a.Normal),
+        Circle c => MirrorMatrix(c.Normal),
+        Line l => MirrorMatrix(l.Normal),
+        IPolyline pl => MirrorMatrix(pl.Normal),
+        Ellipse el => MirrorMatrix(el.Normal),
+        _ => SKMatrix.Identity,
+    };
+
+    private static SKMatrix MirrorMatrix(XYZ n)
+        => n != null && n.Z < 0 ? SKMatrix.CreateScale(-1, 1) : SKMatrix.Identity;
+
     // ---------- 圆弧 / 凸度 ----------
 
     public static SKRect OvalRect(double cx, double cy, double r)
@@ -56,21 +76,59 @@ public static class CadGeometry
     /// </summary>
     public static void AppendBulgeArc(SKPath path, SKPoint p1, SKPoint p2, double bulge)
     {
-        double theta = 4.0 * Math.Atan(bulge);
-        double dx = p2.X - p1.X, dy = p2.Y - p1.Y;
-        double d = Math.Sqrt(dx * dx + dy * dy);
-        if (d < 1e-9 || Math.Abs(theta) >= Math.PI * 2 - 1e-6) { path.LineTo(p2); return; }
-
-        double r = d / (2 * Math.Sin(Math.Abs(theta) / 2));
-        double mx = (p1.X + p2.X) / 2, my = (p1.Y + p2.Y) / 2;
-        double hSq = r * r - d * d / 4;
-        double h = Math.Sqrt(Math.Max(0, hSq));
-        double sign = bulge > 0 ? 1 : -1;                 // 逆时针 → 圆心在行进方向左侧
-        double cx = mx + (-dy / d) * h * sign;
-        double cy = my + (dx / d) * h * sign;
-        double a1 = Math.Atan2(p1.Y - cy, p1.X - cx);
+        if (!BulgeArcParams(p1, p2, bulge, out var cx, out var cy, out var r, out var a1, out var theta))
+        {
+            path.LineTo(p2);
+            return;
+        }
+        if (theta < 0)
+        {
+            int n = Math.Max(8, (int)Math.Ceiling(Math.Abs(theta) * 180 / Math.PI / 5));
+            for (int s = 1; s <= n; s++)
+            {
+                double a = a1 + theta * s / n;
+                path.LineTo((float)(cx + r * Math.Cos(a)), (float)(cy + r * Math.Sin(a)));
+            }
+            return;
+        }
         var oval = OvalRect(cx, cy, r);
         AppendArcTo(path, oval, a1, theta);
+    }
+
+    /// <summary>凸度段的圆弧参数（圆心/半径/起始角/扫角，扫角与凸度同号）。false = 退化为直线。</summary>
+    private static bool BulgeArcParams(SKPoint p1, SKPoint p2, double bulge,
+        out double cx, out double cy, out double r, out double a1, out double theta)
+    {
+        cx = cy = r = a1 = theta = 0;
+        double dx = p2.X - p1.X, dy = p2.Y - p1.Y;
+        double d = Math.Sqrt(dx * dx + dy * dy);
+        if (d < 1e-9) return false;
+        theta = 4.0 * Math.Atan(bulge);
+        if (Math.Abs(theta) < 1e-9 || Math.Abs(theta) >= Math.PI * 2 - 1e-6) return false;
+        r = d / (2 * Math.Sin(Math.Abs(theta) / 2));
+        double mx = (p1.X + p2.X) / 2, my = (p1.Y + p2.Y) / 2;
+        double h = Math.Sqrt(Math.Max(0, r * r - d * d / 4));
+        double sign = bulge > 0 ? 1 : -1;                 // 逆时针 → 圆心在行进方向左侧
+        cx = mx + (-dy / d) * h * sign;
+        cy = my + (dx / d) * h * sign;
+        a1 = Math.Atan2(p1.Y - cy, p1.X - cx);
+        return true;
+    }
+
+    /// <summary>把凸度段的采样点追加进点列（不含起点 p1，调用方保证已在列中）。</summary>
+    private static void AppendBulgeChordPoints(List<SKPoint> pts, SKPoint p1, SKPoint p2, double bulge)
+    {
+        if (!BulgeArcParams(p1, p2, bulge, out var cx, out var cy, out var r, out var a1, out var theta))
+        {
+            pts.Add(p2);
+            return;
+        }
+        int n = Math.Max(8, (int)Math.Ceiling(Math.Abs(theta) * 180 / Math.PI / 5));
+        for (int s = 1; s <= n; s++)
+        {
+            double a = a1 + theta * s / n;
+            pts.Add(new SKPoint((float)(cx + r * Math.Cos(a)), (float)(cy + r * Math.Sin(a))));
+        }
     }
 
     /// <summary>
@@ -270,6 +328,106 @@ public static class CadGeometry
         return unsupported;
     }
 
+    /// <summary>
+    /// 把 hatch 边界环压平成<b>闭合点列</b>（相邻边端点精确共享）。
+    ///
+    /// <para>与 <see cref="AppendHatchLoop"/>（逐边独立 MoveTo，多子路径）不同：
+    /// 图案行扫描的奇偶计数要求环闭合且顶点一致——SKPath 经 <c>ArcTo</c> 后
+    /// 弧端点与相邻边端点有 float 级微差，行线在圆角切点附近（1/4 圆弧的
+    /// 45° 切点与 45° 图案行平行）交点会变奇数，导致整行图案被误丢。
+    /// 点列直接从边源数据一次取整，相邻点共享同一 float 值，循环符号变化
+    /// 计数对闭合环<b>数学上恒为偶数</b>。</para>
+    ///
+    /// <para>返回 null = 含不支持的边（Spline），调用方回退 SKPath 压平路径。</para>
+    /// </summary>
+    public static List<SKPoint>? FlattenHatchLoopPoints(Hatch.BoundaryPath bp)
+    {
+        if (bp?.Edges == null || bp.Edges.Count == 0) return null;
+        var pts = new List<SKPoint>();
+
+        void Add(double x, double y)
+        {
+            var p = new SKPoint((float)x, (float)y);
+            if (pts.Count > 0)
+            {
+                var q = pts[^1];
+                if (MathF.Abs(p.X - q.X) < 1e-3f && MathF.Abs(p.Y - q.Y) < 1e-3f) return;
+            }
+            pts.Add(p);
+        }
+
+        foreach (var edge in bp.Edges)
+        {
+            switch (edge)
+            {
+                case Hatch.BoundaryPath.Line le:
+                    Add(le.Start.X, le.Start.Y);
+                    Add(le.End.X, le.End.Y);
+                    break;
+
+                case Hatch.BoundaryPath.Arc ae:
+                {
+                    // CW 弧（ccw=false）按顺时针参数化取点：点(θ)=c+r(cosθ,−sinθ)，θ 仍 start→end
+                    int n = Math.Max(8, (int)Math.Ceiling(Math.Abs(ae.EndAngle - ae.StartAngle) * 180 / Math.PI / 5));
+                    for (int k = 0; k <= n; k++)
+                    {
+                        double t = ae.StartAngle + (ae.EndAngle - ae.StartAngle) * k / n;
+                        double sy = ae.CounterClockWise ? Math.Sin(t) : -Math.Sin(t);
+                        Add(ae.Center.X + ae.Radius * Math.Cos(t), ae.Center.Y + ae.Radius * sy);
+                    }
+                    break;
+                }
+
+                case Hatch.BoundaryPath.Ellipse ee:
+                {
+                    double mx = ee.MajorAxisEndPoint.X, my = ee.MajorAxisEndPoint.Y;
+                    double ratio = ee.MinorToMajorRatio;
+                    int n = Math.Max(16, (int)Math.Ceiling(Math.Abs(ee.EndAngle - ee.StartAngle) * 180 / Math.PI / 5));
+                    for (int k = 0; k <= n; k++)
+                    {
+                        double t = ee.StartAngle + (ee.EndAngle - ee.StartAngle) * k / n;
+                        double ct = Math.Cos(t), st = Math.Sin(t);
+                        Add(ee.Center.X + mx * ct - my * ratio * st,
+                            ee.Center.Y + my * ct + mx * ratio * st);
+                    }
+                    break;
+                }
+
+                case Hatch.BoundaryPath.Polyline pe:
+                {
+                    if (pe.Vertices == null || pe.Vertices.Count == 0) return null;
+                    var verts = pe.Vertices;
+                    var bulges = pe.Bulges?.ToList();
+                    int n = verts.Count;
+                    Add(verts[0].X, verts[0].Y);
+                    for (int i = 1; i < n; i++)
+                    {
+                        double b = (bulges != null && i - 1 < bulges.Count) ? bulges[i - 1] : 0;
+                        AppendBulgeChordPoints(pts,
+                            P(verts[i - 1].X, verts[i - 1].Y), P(verts[i].X, verts[i].Y), b);
+                    }
+                    if (pe.IsClosed && n > 1)
+                    {
+                        double bl = (bulges != null && n - 1 < bulges.Count) ? bulges[n - 1] : 0;
+                        AppendBulgeChordPoints(pts,
+                            P(verts[n - 1].X, verts[n - 1].Y), P(verts[0].X, verts[0].Y), bl);
+                    }
+                    break;
+                }
+
+                default:
+                    return null;    // Spline 等 → 调用方回退
+            }
+        }
+
+        if (pts.Count < 3) return null;
+        var first = pts[0];
+        var last = pts[^1];
+        if (MathF.Abs(first.X - last.X) > 1e-3f || MathF.Abs(first.Y - last.Y) > 1e-3f)
+            pts.Add(first);
+        return pts;
+    }
+
     /// <summary>追加一条边界边。</summary>
     /// <returns>false = 该边类型未支持（当前仅 <c>Spline</c>）。</returns>
     public static bool AppendHatchEdge(SKPath path, Hatch.BoundaryPath.Edge edge)
@@ -283,12 +441,23 @@ public static class CadGeometry
 
             case Hatch.BoundaryPath.Arc ae:
             {
-                // 边界弧：方向由 CounterClockWise 给出，扫角的正负号即代表方向
-                double sweep = ae.EndAngle - ae.StartAngle;
-                if (ae.CounterClockWise) { while (sweep <= 0) sweep += 2 * Math.PI; }
-                else { while (sweep >= 0) sweep -= 2 * Math.PI; }
                 var oval = OvalRect(ae.Center.X, ae.Center.Y, ae.Radius);
-                AppendArcTo(path, oval, ae.StartAngle, sweep);
+                if (ae.CounterClockWise)
+                {
+                    double sweep = ae.EndAngle - ae.StartAngle;
+                    while (sweep <= 0) sweep += 2 * Math.PI;
+                    AppendArcTo(path, oval, ae.StartAngle, sweep);
+                }
+                else
+                {
+                    // ACadSharp 的 CW 边界弧角度按顺时针参数化给出（点(θ)=c+r(cosθ,−sinθ)），
+                    // 与标准逆时针参数化差一个 y 取反；换算成标准角：θ_std = −θ_cw，
+                    // 顺时针 start→end 即逆时针 −start→−end。
+                    double startStd = -ae.EndAngle, endStd = -ae.StartAngle;
+                    double sweep = endStd - startStd;
+                    while (sweep <= 0) sweep += 2 * Math.PI;
+                    AppendArcTo(path, oval, startStd, sweep);
+                }
                 return true;
             }
 

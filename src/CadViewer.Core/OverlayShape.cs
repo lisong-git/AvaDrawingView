@@ -1,4 +1,5 @@
 using SkiaSharp;
+using System.Threading.Tasks;
 
 namespace CadViewer.Core;
 
@@ -85,7 +86,12 @@ public sealed class OverlayLayer : IDisposable
     public void Release()
     {
         if (Interlocked.Decrement(ref _refCount) > 0) return;
-        DisposeCore();
+        if (DisplayList.DisposalDelayMs <= 0)
+        {
+            DisposeCore();
+            return;
+        }
+        _ = Task.Delay(DisplayList.DisposalDelayMs).ContinueWith(_ => DisposeCore());
     }
 
     public void Dispose() => Release();

@@ -10,6 +10,8 @@
 - 渲染核心：`Control.Render` → `ICustomDrawOperation` → `ISkiaSharpApiLeaseFeature.Lease()` 直接借 Avalonia 的 Skia GPU 上下文，**零互操作层**
 - 显示数据为不可变快照，原子替换，渲染线程无锁；原生几何（`SKPath`）由 `DisplayList` 引用计数释放
   （`AddRef`/`Release`，见「显示保真与资源释放」第 4 节），**GC 管不到原生内存**
+- 画布背景：`CadViewControl.BackgroundColor`（StyledProperty，默认 **黑**）；清屏与「与背景同色实体反转」
+  （黑底画黑线 → 反转成白）都以它为准，两条渲染路径必须用同一套规则
 
 ## 项目结构
 
@@ -54,6 +56,11 @@ Avalonia 的渲染管线，所以像"渲染期调用 InvalidateVisual"这类缺�
 `SetDisplay → 布局 → 渲染`，并用 `CaptureRenderedFrame()` 逐帧驱动。
 
 **改渲染性能相关代码后必须跑 `PerfProbe` 并与下表基线对比**（详见「大图性能」一节）。
+
+**`CadDrawOperation` 里绝不能读 Avalonia 依赖属性**（2026-09-24 实测踩中）：`Render` 跑在渲染线程，
+在渲染期读 `_owner.<StyledProperty>` 会让**整个窗口停止渲染**（内容全空 = 宿主窗口看起来"透明"，
+且不抛异常、不写崩溃日志，只能靠截图对比发现）。需要宿主状态时一律在**构造函数里快照成字段**
+（`_bg` / `_hidden` / `_selectedSnapshot` 都是这个模式），`Render` 期间只读字段。
 
 ## 大图性能架构（借鉴 ReadCAD，2026-09-16 实测落地）
 
@@ -126,7 +133,7 @@ Avalonia 的渲染管线，所以像"渲染期调用 InvalidateVisual"这类缺�
 - 测量方法论（教训）：无预热/不隔离 GC 的帧测量，同一配置两次能差 25%——
   必须预热 3 帧 + `GC.Collect` + ≥12 帧 + 中位数；对比配置看"绘制耗时"而非墙钟。
 
-## 显示保真与资源释放（2026-09-16 修复；断言数实测 2026-09-23：52 项核心 + 21 项 UI）
+## 显示保真与资源释放（2026-09-16 修复；断言数实测 2026-09-25：57 项核心 + 21 项 UI）
 
 ### 1. `Arc.Sweep` 在 ACadSharp 3.4.9 里是**负值**（最隐蔽的真缺陷）
 `Arc.Sweep` 返回的是 `startAngle - endAngle`（正常逆时针弧为负），原实现写
@@ -193,6 +200,12 @@ private static void AddArcTo(SKPath path, SKRect oval, double startRad, double s
 **`BakedGeometry.Dispose()` 只释放合并后的 `StrokePath`/`FillPath`**，不要释放
 WideStroke/Text 实体——那些是 `DisplayList.Entities` 里的同一批对象引用，由 `DisplayList` 统一释放，
 重复释放会二次释放原生句柄。
+
+**计数归零后延迟 300ms 才真正销毁（`DisposalDelayMs`，2026-09-25 修复崩溃）**：
+合成器线程可能仍在回放持有这些 SKPath 的最后一帧绘制流，归零瞬间销毁会与回放并发，
+在 `sk_canvas_draw_path` 上 AccessViolation 直接杀进程（宿主"关闭文档标签页崩溃"的根因，
+WER 事件 0xc0000005 实证）。`OverlayLayer` 共用同一延迟。测试/基准工具置 0 恢复立即释放，
+但断言要用 `IsDisposed` 轮询等待。
 
 ### 5. 取消令牌真的生效
 `Convert` / `SpatialIndex.Build` / `GeometryBaker.Bake` 都收 `CancellationToken ct = default`，
@@ -283,11 +296,62 @@ view.ClearOverlay();
 - 即 **ACadSharp 3.4.9 的读取器根本没有把 ACIS 专有数据读进来**（字段在，永远是空）。
   故面域只能维持"整体定位 + 虚线框降级"，**不是当前优先级能解决的问题**。
 
+### 10. 根层标注过滤：`GeometryConvertOptions.SkipRootAnnotations`（2026-09-25）
+
+- `GeometryConverter.Convert(doc, ct, options)` / `CadDocumentLoader.Load(path, progress, ct, options)`：
+  `SkipRootAnnotations = true` 时跳过模型空间**根层**的 Dimension / Leader / TextEntity / MText
+  （只读等价于 WPF 标注页 `ClearModelSpaceDimension` 的真删除；块内同名实体不受影响；
+  Table 本就不渲染无需处理）。
+- 断言在 SmokeTest 功能样例：总数 29 → 26、根层 15 → 12、块内仍 14，全部精确值。
+- 排查时踩掉的假事实：`MText` **不**继承 `TextEntity`（见踩坑节），过滤集合必须显式带上 MText。
+
+### 11. 法线 (0,0,-1) 的实体必须做 OCS→WCS 镜像（2026-09-25 修复，最隐蔽第二名的真缺陷）
+
+- DXF/DWG 里实体可带**挤出方向（法线）**：`Normal = (0,0,-1)` 时实体坐标存的是 OCS，
+  2D 情形 OCS→WCS = **绕 Y 轴镜像（x→-x）**。不做这步，实体被画到 X 镜像位置。
+- 实测 0053datr.dwg：41 条轮廓圆角弧 `Normal=(0,0,-1)`，圆心 OCS x≈+900，
+  WCS 应在 x≈-900 —— 全部画到 +900 一侧 → **轮廓每处圆角断开（"线段不连贯"）、
+  右侧多出一撮杂点、Extents 被撑大 1867.8 → 94.7（近 20 倍）导致"适应窗口不能占满"**。
+  一个缺陷同时解释两个用户报障。
+- 修复：`GeometryConverter.AddStroke/AddFill` 汇聚点统一 `OcsMirrorMatrix(e)`
+  （`Normal.Z < 0` → `SKMatrix.CreateScale(-1,1)`，在块插入矩阵之前先镜像）。
+  **Normal 不在 Entity 基类上**（各具体类自行声明：Line/Arc/Circle/IPolyline/Ellipse…），
+  只能 switch 逐类型取；任意轴法向（非 ±Z）2D 图纸未遇到，未处理。
+- 验证：端点连通性分析（BlockScan `--gaps`）悬空端点 120 → **0**；
+  手工验算 0x9E：WCS 圆心 (-900.372,-13516.825) r=0.5 两端精确接上邻接线段。
+- 通用教训：**线段端点对不上的"断线"，先查法线再怀疑转换器**——源数据几乎总是对的。
+
+### 12. 画布鼠标语义：左键点选/框选，平移走中键/右键（2026-09-25）
+
+- `CadViewControl` 输入约定（对齐 WPF/Teigha 的 `MouseMode.Selection`）：
+  **左键单击 = 点选**（释放时位移 ≤4px），**左键按下拖动 = 框选**（橡皮筋矩形），
+  **中键/右键拖动 = 平移**，**Esc = 取消**（框选拖动中只取消橡皮筋，否则清空选择），
+  **双击中键 = 适应窗口（Zoom Extents）**。旧实现"左键拖动 = 平移"、"左键双击 = 适应窗口"
+  已移除——双击左键在 AutoCAD 里是编辑实体，查看器无编辑能力，故无操作（两次点选自然退化）。
+  双击判定自实现（`IsMiddleDoubleClick`：500ms + 4px 内两次中键按下），因 Avalonia 的
+  DoubleTapped 手势只认左键，且 12 的 `TopLevel` 无 `PlatformSettings` 可取系统双击间隔。
+- 框选方向语义沿 CAD 惯例：**左→右 = 窗选**（完全包含才选中，蓝色实线框），
+  **右→左 = 叉选**（与包围盒相交即选中，绿色虚线框）。判定用 `CadEntity.Bounds`，
+  命中候选来自 `DisplayList.Index.Query(worldRect)`，并过滤隐藏图层（与 `HitTest` 同规则）。
+- 框选零命中 = 清空选择（与点选空白处一致）。公开 API：`SelectByRectangle(SKRect worldRect, bool window)`
+  供程序化调用；橡皮筋矩形在 `Render` 里画（屏幕坐标，`_bandStart/_bandCurrent/_bandActive`）。
+- **点选命中 = AutoCAD 拾取语义（2026-09-25 修正）**：填充实体点在内部才算命中；描边实体
+  把容差膨胀进描边几何（`SKPaint.GetFillPath`，宽度 = 2×容差）压线才算——**点在矩形/圆
+  内部空白不再选中**（旧实现"包围盒内距离按 0"会让图框/大矩形吃掉内部所有点击，
+  双击"莫名选中所在的矩形"即此根因，双击本身只是两次点选）。无几何实体才退回包围盒距离。
+- 世界矩形换算注意：`Viewport.ScreenToWorld` 屏 Y 向下 → 世界 Y 向上，两角换算后取
+  Min/Max 归一成合法 `SKRect`（Top&lt;Bottom），不要直接拿屏幕矩形套。
+- **选中高亮样式 = AutoCAD 默认（2016+ glow）**：蓝色 (0,120,215)——描边两趟
+  （宽 `hairline×6`、α=80 外圈模拟光晕 + `hairline×2` 实线内芯），实心填充罩半透明蓝
+  （α=70）。框选带同色系（窗选蓝实线 / 叉选绿虚线）。旧橙红高亮已废弃。
+
 ## 已知踩坑（重要）
 
 ### ACadSharp 3.4.9 API（与旧版/文档差异大）
 - 点类型：`CSMath.XYZ`（不在 ACadSharp 根命名空间）
-- `Text` 实体类改名为 `TextEntity`；`MText` **继承自** `TextEntity`（switch-case 中 MText 必须放在 TextEntity 前面）
+- `Text` 实体类改名为 `TextEntity`；**`MText` 与 `TextEntity` 是兄弟类型**（都直接继承 Entity）——
+  `is TextEntity` 匹配不到 MText（2026-09-25 SmokeTest 实证：根层过滤 29 实体只少 2 不少 3）。
+  旧文档写的「MText 继承自 TextEntity」是错的，switch-case 顺序也无实际约束。
 - `Arc` **继承自** `Circle`（Circle 的 case 必须放在 Arc 后面）
 - `Color` 是**结构体**（非引用类型），`IsByLayer`/`IsByBlock`/`Index` 直接访问
 - `CadDocument` 不是 IDisposable；`DwgReader.Read()` 不接收 CancellationToken

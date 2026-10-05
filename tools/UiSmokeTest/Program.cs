@@ -157,21 +157,18 @@ int Run(string[] argv)
     Check(rendered, "连续 5 帧渲染不抛异常");
     if (error is not null) Log($"       {error}");
 
-    // ---------- 6. 双击适应窗口（基准 = 适应窗口应有的缩放，而非缩放前的值） ----------
+    // ---------- 6. 双击中键适应窗口（AutoCAD 语义；基准 = 适应窗口应有的缩放） ----------
     view.FitToContent();
     double fitted = view.Viewport.Zoom;
     view.ZoomBy(8f);
     double zoomed = view.Viewport.Zoom;
-    window.MouseDown(new Point(400, 300), MouseButton.Left);
-    window.MouseUp(new Point(400, 300), MouseButton.Left);
-    window.MouseDown(new Point(400, 300), MouseButton.Left);
-    window.MouseUp(new Point(400, 300), MouseButton.Left);
+    window.MouseDown(new Point(400, 300), MouseButton.Middle);
+    window.MouseUp(new Point(400, 300), MouseButton.Middle);
+    window.MouseDown(new Point(400, 300), MouseButton.Middle);
+    window.MouseUp(new Point(400, 300), MouseButton.Middle);
     window.CaptureRenderedFrame();
-    if (Math.Abs(view.Viewport.Zoom - zoomed) < 1e-6f)
-        Log("  SKIP - 双击适应窗口（无头平台未合成双击手势，需真实桌面环境验证）");
-    else
-        Check(Math.Abs(view.Viewport.Zoom - fitted) < 1e-3f,
-              $"双击适应窗口（{zoomed:F3} → {view.Viewport.Zoom:F3}，期望 {fitted:F3}）");
+    Check(Math.Abs(view.Viewport.Zoom - fitted) < 1e-3f,
+          $"双击中键适应窗口（{zoomed:F3} → {view.Viewport.Zoom:F3}，期望 {fitted:F3}）");
 
     // ---------- 7. 资源释放：换图后旧 DisplayList 必须被回收 ----------
     // 每张图的几何都是一批 SKPath（原生内存，GC 管不到）。若换图时不释放，
@@ -183,7 +180,7 @@ int Run(string[] argv)
     view.SetDisplay(secondList);      // 所有权转移给控件，控件归还 firstList 的引用
     window.CaptureRenderedFrame();
     window.CaptureRenderedFrame();
-    bool released = firstList.IsDisposed;
+    bool released = WaitUntil(() => firstList.IsDisposed, 3000);
     Check(released,
           $"换图后旧 DisplayList 已释放（DisposedCount {disposedBefore} → {DisplayList.DisposedCount}）");
     if (!released)
@@ -251,7 +248,8 @@ int Run(string[] argv)
     int mag4 = CountMagenta(window.CaptureRenderedFrame());
     Check(view.OverlayShapeCount == 0, $"换图后叠加层已自动清空（图元数 {view.OverlayShapeCount}）");
     Check(mag4 == 0, $"换图后画面上无叠加层残留（洋红像素 {mag4}）");
-    Check(layer2.IsDisposed && OverlayLayer.DisposedCount > disposedBeforeOverlay,
+    bool overlayReleased = WaitUntil(() => layer2.IsDisposed && OverlayLayer.DisposedCount > disposedBeforeOverlay, 3000);
+    Check(overlayReleased,
           $"换图后叠加层原生几何已归还（DisposedCount {disposedBeforeOverlay} → {OverlayLayer.DisposedCount}）");
 
     view.MinEntityPixelSize = 1.5f;
@@ -271,6 +269,17 @@ int Run(string[] argv)
 /// 调用方一律用**增量**判断（叠加前 → 叠加后），图纸本身含洋红实体（ACI 6）也不会误判。
 /// 返回 -1 表示拿不到渲染帧。
 /// </summary>
+static bool WaitUntil(Func<bool> condition, int timeoutMs)
+{
+    var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+    while (DateTime.UtcNow < deadline)
+    {
+        if (condition()) return true;
+        Thread.Sleep(50);
+    }
+    return condition();
+}
+
 static int CountMagenta(WriteableBitmap? frame)
 {
     if (frame is null) return -1;

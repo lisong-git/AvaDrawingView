@@ -6,6 +6,11 @@ using SkiaSharp;
 
 namespace CadViewer.Core;
 
+public sealed class GeometryConvertOptions
+{
+    public bool SkipRootAnnotations { get; init; }
+}
+
 /// <summary>
 /// 几何转换器：ACadSharp 实体 → 显示基元（SKPath / 文本）。
 /// 单个实体转换失败时跳过并计数，不影响整图。
@@ -42,7 +47,7 @@ public sealed class GeometryConverter
     /// <summary>图纸里被关闭或冻结的图层：打开时应默认隐藏。</summary>
     public IReadOnlyCollection<string> InitiallyHiddenLayers => _initiallyHidden;
 
-    public List<CadEntity> Convert(CadDocument doc, CancellationToken ct = default)
+    public List<CadEntity> Convert(CadDocument doc, CancellationToken ct = default, GeometryConvertOptions? options = null)
     {
         _entities.Clear();
         _layerColors.Clear();
@@ -57,6 +62,7 @@ public sealed class GeometryConverter
         {
             // 大图解析后仍有十几万实体要转换，必须让取消能真正中断（原来只在阶段之间检查）
             if ((++n % CancellationCheckInterval) == 0) ct.ThrowIfCancellationRequested();
+            if (options?.SkipRootAnnotations == true && IsRootAnnotation(e)) { Skipped++; continue; }
             ConvertEntity(e, SKMatrix.Identity, 0, inheritedColor: null);
         }
 
@@ -77,6 +83,9 @@ public sealed class GeometryConverter
             foreach (var e in ms.Entities)
                 yield return e;
     }
+
+    private static bool IsRootAnnotation(Entity e)
+        => e is Dimension || e is Leader || e is TextEntity || e is MText;
 
     /// <param name="inheritedColor">
     /// 块内实体的 BYBLOCK 继承色：由外层 INSERT 解析后的颜色传入。
@@ -112,7 +121,7 @@ public sealed class GeometryConverter
                 case Spline sp: AddSpline(sp, parent, color); break;
                 case MText mt:
                 {
-                    // MText 继承自 TextEntity，case 必须排在它前面
+                    // MText 与 TextEntity 是兄弟类型（is TextEntity 匹配不到 MText，2026-09-25 SmokeTest 实证）
                     var raw = !string.IsNullOrEmpty(mt.PlainText) ? mt.PlainText : CleanMText(mt.Value);
                     AddTextEntity(raw, mt.InsertPoint, mt.Height, mt.Rotation, mt, parent, color);
                     break;
@@ -302,10 +311,265 @@ public sealed class GeometryConverter
                 path.Close();
                 AddFill(path, h, color, m);
             }
+            else if (AddHatchPatternLines(path, bp, h, color, m))
+            {
+                // 图案已生成；边界不描边（AutoCAD/ODA 语义：非实心填充只显示图案线）
+                path.Dispose();
+            }
             else
             {
                 AddStroke(path, h, color, m);
             }
+        }
+    }
+
+    private const int MaxHatchPatternRows = 4096;
+    private const int MaxHatchPatternSegments = 200_000;
+
+    // 诊断计数（RenderShot 排查用）
+    public static int DiagHatchPatternOk;
+    public static int DiagHatchPatternFallback;
+    public static int DiagHatchOddRows;
+    public static string DiagHatchLastReason = "";
+    // 临时诊断：最后一次图案生成的边界线段与图案路径（RenderShot/HatchProbe 排查用）
+    public static System.Collections.Generic.List<(SKPoint a, SKPoint b)> DiagHatchBoundarySegs;
+    public static SKPath DiagHatchPatternPath;
+
+    /// <summary>
+    /// 非实心 HATCH → 图案线（经典 hatch 线族算法）。
+    /// 对图案定义的每条线（角度/基点/行步距/虚线表）生成平行线族：
+    /// 行号由边界包围盒在行法线上的投影区间反推（图案基点可能是远处绝对坐标，
+    /// 不能从 0 起步遍历）；行线与边界压平线段求交，按奇偶规则取内部区间，
+    /// 再按虚线表切段（相位锚定图案基点）。全部坐标在实体空间生成，经 AddStroke
+    /// 统一施加 OCS 镜像与父矩阵，与边界路径同一变换链。
+    /// 返回 false = 无法生成（渐变填充 / 无图案定义 / 行数或线段数超限），调用方回退边界轮廓。
+    /// </summary>
+    private bool AddHatchPatternLines(SKPath boundary, Hatch.BoundaryPath bp, Hatch h, uint color, in SKMatrix m)
+    {
+        var defs = h.Pattern?.Lines;
+        if (defs == null || defs.Count == 0) { DiagHatchPatternFallback++; DiagHatchLastReason = "no-defs"; return false; }
+
+        // 首选闭合点列（顶点精确共享 → 行交点奇偶守恒）；
+        // 含 Spline 等不支持边时回退 SKPath 压平（奇偶可能被弧端点浮点差破坏）。
+        var loop = CadGeometry.FlattenHatchLoopPoints(bp);
+        var segs = loop != null
+            ? loop.Zip(loop.Skip(1).Append(loop[0]), (a, b) => (a, b)).Take(loop.Count)
+                  .Where(s => s.a != s.b).ToList()
+            : FlattenForHatch(boundary);
+        if (segs.Count == 0) { DiagHatchPatternFallback++; DiagHatchLastReason = "no-segs"; return false; }
+
+        var bbox = boundary.Bounds;
+        float pad = MathF.Max(bbox.Width, bbox.Height) * 0.05f + 1f;
+        float minX = bbox.Left - pad, maxX = bbox.Right + pad;
+        float minY = bbox.Bottom - pad, maxY = bbox.Top + pad;
+
+        var pattern = new SKPath();
+        var hits = new List<float>();
+        int emitted = 0;
+        bool overflow = false;
+        try
+        {
+            foreach (var def in defs)
+            {
+                double ang = def.Angle + h.PatternAngle;
+                float dx = (float)Math.Cos(ang), dy = (float)Math.Sin(ang);
+                float nx = -dy, ny = dx;
+                float bx = (float)def.BasePoint.X, by = (float)def.BasePoint.Y;
+                float ox = (float)def.Offset.X, oy = (float)def.Offset.Y;
+                float offN = ox * nx + oy * ny;
+                if (MathF.Abs(offN) < 1e-9f) continue;
+
+                float cN0 = minX * nx + minY * ny, cN1 = maxX * nx + minY * ny;
+                float cN2 = minX * nx + maxY * ny, cN3 = maxX * nx + maxY * ny;
+                float nMin = MathF.Min(MathF.Min(cN0, cN1), MathF.Min(cN2, cN3));
+                float nMax = MathF.Max(MathF.Max(cN0, cN1), MathF.Max(cN2, cN3));
+                float bN = bx * nx + by * ny;
+                int i0 = (int)Math.Floor((nMin - bN) / offN) - 1;
+                int i1 = (int)Math.Ceiling((nMax - bN) / offN) + 1;
+                if (i0 > i1) (i0, i1) = (i1, i0);   // offN 为负时区间端点颠倒
+                if (i1 - i0 > MaxHatchPatternRows) { overflow = true; break; }
+
+                var dashes = def.DashLengths;
+                bool dashed = dashes != null && dashes.Count > 0;
+                float cycle = 0f;
+                if (dashed)
+                    foreach (var d in dashes) cycle += MathF.Abs((float)d);
+
+                for (int i = i0; i <= i1; i++)
+                {
+                    float rX = bx + ox * i, rY = by + oy * i;
+                    float rowShiftD = ox * i * dx + oy * i * dy;
+
+                    hits.Clear();
+                    foreach (var (a, b) in segs)
+                    {
+                        // 符号距离穿越法：交点由两端点在行法线上的符号距离线性插值，
+                        // 不解方程组 → 行线与边共线/近共线（det≈0）时无假交点。
+                        // d=0 归正侧（半开区间），顶点穿越/擦过的奇偶计数自洽。
+                        float da = (a.X - rX) * nx + (a.Y - rY) * ny;
+                        float db = (b.X - rX) * nx + (b.Y - rY) * ny;
+                        bool aneg = da < 0f, bneg = db < 0f;
+                        if (aneg == bneg) continue;
+                        float tt = da / (da - db);
+                        float px = a.X + (b.X - a.X) * tt - rX;
+                        float py = a.Y + (b.Y - a.Y) * tt - rY;
+                        hits.Add(rowShiftD + px * dx + py * dy);
+                    }
+                    if (hits.Count < 2) continue;
+                    hits.Sort();
+                    if (hits.Count % 2 != 0)
+                    {
+                        DiagHatchOddRows++;
+                        continue;
+                    }
+
+                    float eps = MathF.Max(bbox.Width, bbox.Height) * 1e-4f + 1e-5f;
+                    for (int k = 0; k + 1 < hits.Count; k += 2)
+                    {
+                        // 相邻交点几乎重合 = 行线擦过顶点，奇偶不可靠，丢弃该对
+                        if (hits[k + 1] - hits[k] < eps) continue;
+                        emitted += EmitDashes(pattern, rX, rY, dx, dy, hits[k], hits[k + 1],
+                            dashed, cycle, dashes, 1f);
+                        if (emitted > MaxHatchPatternSegments) { overflow = true; break; }
+                    }
+                    if (overflow) break;
+                }
+                if (overflow) break;
+            }
+        }
+        catch
+        {
+            pattern.Dispose();
+            throw;
+        }
+        if (overflow || pattern.IsEmpty)
+        {
+            pattern.Dispose();
+            DiagHatchPatternFallback++;
+            DiagHatchLastReason = overflow ? "overflow" : "empty";
+            return false;
+        }
+        DiagHatchPatternOk++;
+        DiagHatchBoundarySegs = segs;
+        DiagHatchPatternPath = new SKPath(pattern);
+        AddStroke(pattern, h, color, m);
+        return true;
+    }
+
+    /// <summary>区间 [s0,s1] 内按虚线表切段并写入 path，返回写入的段数（dashed=false 时整段直通）。</summary>
+    private static int EmitDashes(SKPath path, float rX, float rY, float dx, float dy,
+        float s0, float s1, bool dashed, float cycle, System.Collections.Generic.List<double> dashes, float scale)
+    {
+        int emitted = 0;
+        void Emit(float a, float b)
+        {
+            path.MoveTo(rX + a * dx, rY + a * dy);
+            path.LineTo(rX + b * dx, rY + b * dy);
+            emitted++;
+        }
+        if (!dashed || cycle <= 0f)
+        {
+            Emit(s0, s1);
+            return emitted;
+        }
+        int k0 = (int)MathF.Floor(s0 / cycle) - 1;
+        int k1 = (int)MathF.Ceiling(s1 / cycle) + 1;
+        for (int k = k0; k <= k1; k++)
+        {
+            float t = k * cycle;
+            foreach (var d in dashes)
+            {
+                float len = MathF.Abs((float)(d * scale));
+                if (d > 0 && len > 0)
+                {
+                    float a = MathF.Max(s0, t), b = MathF.Min(s1, t + len);
+                    if (b > a) Emit(a, b);
+                }
+                t += len;
+            }
+        }
+        return emitted;
+    }
+
+    /// <summary>路径 → 线段表（曲线按固定密度取样），供图案求交使用。</summary>
+    private static List<(SKPoint a, SKPoint b)> FlattenForHatch(SKPath path)
+    {
+        var result = new List<(SKPoint, SKPoint)>();
+        using var it = path.CreateRawIterator();
+        var pts = new SKPoint[4];
+        SKPoint current = default, start = default;
+        SKPathVerb verb;
+        while ((verb = it.Next(pts)) != SKPathVerb.Done)
+        {
+            switch (verb)
+            {
+                case SKPathVerb.Move:
+                    current = start = pts[0];
+                    break;
+                case SKPathVerb.Line:
+                    result.Add((current, pts[1]));
+                    current = pts[1];
+                    break;
+                case SKPathVerb.Quad:
+                    FlattenQuad(current, pts[1], pts[2], 12, result);
+                    current = pts[2];
+                    break;
+                case SKPathVerb.Conic:
+                    FlattenConic(current, pts[1], pts[2], it.ConicWeight(), 16, result);
+                    current = pts[2];
+                    break;
+                case SKPathVerb.Cubic:
+                    FlattenCubic(current, pts[1], pts[2], pts[3], 16, result);
+                    current = pts[3];
+                    break;
+                case SKPathVerb.Close:
+                    result.Add((current, start));
+                    current = start;
+                    break;
+            }
+        }
+        return result;
+    }
+
+    private static void FlattenQuad(SKPoint p0, SKPoint p1, SKPoint p2, int n, List<(SKPoint, SKPoint)> outSegs)
+    {
+        var prev = p0;
+        for (int j = 1; j <= n; j++)
+        {
+            float t = (float)j / n, mt = 1f - t;
+            var p = new SKPoint(
+                mt * mt * p0.X + 2 * mt * t * p1.X + t * t * p2.X,
+                mt * mt * p0.Y + 2 * mt * t * p1.Y + t * t * p2.Y);
+            outSegs.Add((prev, p));
+            prev = p;
+        }
+    }
+
+    private static void FlattenConic(SKPoint p0, SKPoint p1, SKPoint p2, float w, int n, List<(SKPoint, SKPoint)> outSegs)
+    {
+        var prev = p0;
+        for (int j = 1; j <= n; j++)
+        {
+            float t = (float)j / n, mt = 1f - t;
+            float u0 = mt * mt, u1 = 2 * mt * t * w, u2 = t * t;
+            float sum = u0 + u1 + u2;
+            var p = new SKPoint((u0 * p0.X + u1 * p1.X + u2 * p2.X) / sum, (u0 * p0.Y + u1 * p1.Y + u2 * p2.Y) / sum);
+            outSegs.Add((prev, p));
+            prev = p;
+        }
+    }
+
+    private static void FlattenCubic(SKPoint p0, SKPoint p1, SKPoint p2, SKPoint p3, int n, List<(SKPoint, SKPoint)> outSegs)
+    {
+        var prev = p0;
+        for (int j = 1; j <= n; j++)
+        {
+            float t = (float)j / n, mt = 1f - t;
+            var p = new SKPoint(
+                mt * mt * mt * p0.X + 3 * mt * mt * t * p1.X + 3 * mt * t * t * p2.X + t * t * t * p3.X,
+                mt * mt * mt * p0.Y + 3 * mt * mt * t * p1.Y + 3 * mt * t * t * p2.Y + t * t * t * p3.Y);
+            outSegs.Add((prev, p));
+            prev = p;
         }
     }
 
@@ -427,8 +691,16 @@ public sealed class GeometryConverter
         return ToArgb(c, 7);
     }
 
+    // 法线 (0,0,-1) 的实体：OCS→WCS 需绕 Y 轴镜像（x→-x）。
+    // 不做这步，弧/圆会画到 X 镜像位置（实测 0053datr：41 条圆角弧全跑到 +900，
+    // 轮廓每处圆角断开、Extents 被撑大近 20 倍）。2D 图纸法向只有 ±Z 两种。
+    // Normal 不在 Entity 基类上（ACadSharp 3.4.9 各具体类自行声明），只能逐类型取。
+    private static SKMatrix OcsMirrorMatrix(Entity e) => CadGeometry.OcsMirrorMatrix(e);
+
     private void AddStroke(SKPath path, Entity e, uint color, in SKMatrix m, float lineWidth = 0)
     {
+        var ocs = OcsMirrorMatrix(e);
+        if (!ocs.IsIdentity) path.Transform(ocs);
         path.Transform(m);
         var bounds = path.Bounds;
         if (float.IsNaN(bounds.Left)) { path.Dispose(); Skipped++; return; }
@@ -446,6 +718,8 @@ public sealed class GeometryConverter
 
     private void AddFill(SKPath path, Entity e, uint color, in SKMatrix m)
     {
+        var ocs = OcsMirrorMatrix(e);
+        if (!ocs.IsIdentity) path.Transform(ocs);
         path.Transform(m);
         var bounds = path.Bounds;
         if (float.IsNaN(bounds.Left)) { path.Dispose(); Skipped++; return; }
