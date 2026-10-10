@@ -22,6 +22,9 @@ tools/SmokeTest/      冒烟测试（解析→转换→索引全链路，不经�
 tools/UiSmokeTest/    UI 冒烟测试（无头 Avalonia 真实跑渲染管线，拦截"渲染期非法操作"类缺陷，21 项断言含像素级校验）
 tools/PerfProbe/      性能基准（加载分段耗时 / 内存 / 逐缩放帧耗时 / LOD 扫描 / 墨迹覆盖率 / 泄漏验证）
 tools/SampleGen/      生成 samples/sample_features.dxf（覆盖全部实体类型与边界情况）
+tools/BlockExport/    把图纸里的块定义逐个导出成独立 DWG（WBLOCK 语义，含嵌套块依赖 + 回读校验）
+tools/ShapeExport/    把模型空间图元按相交关系分组（连通分量），每组导出成独立 DWG
+tools/Shared/         CadToolkit.cs：上面两个导出工具共用的读写 + 跨文档拷贝（<Compile Include> 链进各自项目，不单独建程序集）
 tools/Probe/          ACadSharp API 反射探针（摸 API 用，可删）
 tools/regress.ps1     一键回归：Debug/Release 构建 + 核心冒烟 + UI 冒烟，汇总到 .regress.log
 samples/              样例 DXF
@@ -37,6 +40,8 @@ dotnet run --project tools/SmokeTest   # 核心链路冒烟（不要加 --nologo
 dotnet run --project tools/UiSmokeTest # UI 渲染冒烟（无头，不弹窗口）
 dotnet run --project tools/PerfProbe -- "D:\path\to.dwg"   # 性能基准（--load-only 只测加载，--repeat 8 验泄漏）
 dotnet run --project tools/SampleGen   # 重新生成 samples/sample_features.dxf
+dotnet run --project tools/BlockExport -- "D:\src.dwg" "D:\out" --referenced  # 块导出为独立 DWG
+dotnet run --project tools/ShapeExport -- "D:\src.dwg" "D:\out"               # 相交分组导出为独立 DWG
 ```
 
 **改完代码先跑一键回归**（省掉手敲上面四条，且构建失败会 fail-fast）：
@@ -364,7 +369,16 @@ view.ClearOverlay();
 - `Entity.IsInvisible`（DXF 组码 60）；图层可见性看 `Layer.IsOn` 与 `Layer.Flags.HasFlag(LayerFlags.Frozen)`
 - 图层颜色查 `Layer.Color.Index`，但**颜色表里可能没有该图层**（要兜底默认色）
 - `BlockRecord` 在 `Tables` 命名空间
-- 写 DXF 用 `new DxfWriter(filename, doc, binary)`（`tools/SampleGen` 就是这么造样例的）
+- 写 DXF 用 `new DxfWriter(filename, doc, binary)`（`tools/SampleGen` 就是这么造样例的）；
+  **3.4.9 也能写 DWG**（`new DwgWriter(path, doc).Write()`），实测 AC1032/AC1027/…/AC1015 都能落盘
+- **`Insert.Block` / `Dimension.Block` 是只读属性**（无公开 setter，`IsMultiple` 同理）。
+  跨文档克隆实体后要把块引用指向新文档的 BlockRecord：只能反射取非公开 setter 或后备字段
+  （`tools/BlockExport` 的 `RefSetter.TrySet` 就是干这个的）；构造期指定块只有 `new Insert(BlockRecord)` 这条路
+- `CadObject.Clone()` 可用于 Entity / BlockRecord / 表项（Layer、LineType、TextStyle…），
+  克隆体加进新文档后句柄由新文档重新分配；属性实体（`Insert.Attributes`）要单独克隆再挂回去
+- `BlockRecord.GetBoundingBox()` 返回的是**值类型** `BoundingBox`，判空前必须装箱
+- 统计「被引用的块」时**只跟 `Insert.Block`，不要跟 `Dimension.Block`**：尺寸标注实体每个都引用一个
+  `*D` 匿名块，实测 5330 个标注会带出 5330 个块（`tools/BlockExport` 的 `--referenced` 只走 INSERT）
 - 不确定 API 时用 `tools/Probe`（反射枚举）验证，不要猜
 
 ### Avalonia 12.1（2026-09-16 由 11.3 升级，实升踩坑）

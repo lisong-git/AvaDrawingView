@@ -96,6 +96,18 @@ public static class CadGeometry
     }
 
     /// <summary>凸度段的圆弧参数（圆心/半径/起始角/扫角，扫角与凸度同号）。false = 退化为直线。</summary>
+    public static bool TryBulgeArc(SKPoint p1, SKPoint p2, double bulge,
+        out SKPoint center, out double radius, out double startRad, out double sweepRad)
+    {
+        var ok = BulgeArcParams(p1, p2, bulge, out var cx, out var cy, out var r, out var a1, out var theta);
+        center = new SKPoint((float)cx, (float)cy);
+        radius = r;
+        startRad = a1;
+        sweepRad = theta;
+        return ok;
+    }
+
+    /// <summary>凸度段的圆弧参数（圆心/半径/起始角/扫角，扫角与凸度同号）。false = 退化为直线。</summary>
     private static bool BulgeArcParams(SKPoint p1, SKPoint p2, double bulge,
         out double cx, out double cy, out double r, out double a1, out double theta)
     {
@@ -109,6 +121,7 @@ public static class CadGeometry
         double mx = (p1.X + p2.X) / 2, my = (p1.Y + p2.Y) / 2;
         double h = Math.Sqrt(Math.Max(0, r * r - d * d / 4));
         double sign = bulge > 0 ? 1 : -1;                 // 逆时针 → 圆心在行进方向左侧
+        if (Math.Abs(theta) > Math.PI) sign = -sign;      // 优弧(>180°)圆心翻到弦的另一侧
         cx = mx + (-dy / d) * h * sign;
         cy = my + (dx / d) * h * sign;
         a1 = Math.Atan2(p1.Y - cy, p1.X - cx);
@@ -307,6 +320,93 @@ public static class CadGeometry
         a = new SKPoint((float)p.Vertices[segmentIndex].Location.X, (float)p.Vertices[segmentIndex].Location.Y);
         b = new SKPoint((float)p.Vertices[j].Location.X, (float)p.Vertices[j].Location.Y);
         return true;
+    }
+
+    /// <summary>
+    /// 段级拾取：返回距 <paramref name="localPoint"/> 最近的段索引（局部坐标，
+    /// 直线段按点到线段距离，凸度段按点到弧距离）；最近距离超过
+    /// <paramref name="tolLocal"/> 或实体不是多段线返回 -1。
+    /// </summary>
+    public static int HitSegment(Entity poly, SKPoint localPoint, float tolLocal)
+    {
+        int n = poly switch
+        {
+            LwPolyline lw => SegmentCount(lw),
+            Polyline2D p2 => SegmentCount(p2),
+            _ => 0,
+        };
+        int best = -1;
+        double bestDist = tolLocal;
+        for (int i = 0; i < n; i++)
+        {
+            double d = DistanceToSegment(poly, i, localPoint);
+            if (d < bestDist)
+            {
+                bestDist = d;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    private static double DistanceToSegment(Entity poly, int segmentIndex, SKPoint p)
+    {
+        SKPoint a, b;
+        double bulge;
+        switch (poly)
+        {
+            case LwPolyline lw:
+                if (!TryLwSegmentEndpoints(lw, segmentIndex, out a, out b)) return double.MaxValue;
+                bulge = LwSegmentBulge(lw, segmentIndex);
+                break;
+            case Polyline2D p2:
+                if (!TryPolyline2DSegmentEndpoints(p2, segmentIndex, out a, out b)) return double.MaxValue;
+                bulge = Polyline2DSegmentBulge(p2, segmentIndex);
+                break;
+            default:
+                return double.MaxValue;
+        }
+        if (Math.Abs(bulge) > 1e-9 && BulgeArcParams(a, b, bulge, out var cx, out var cy, out var r, out var a1, out var theta))
+            return DistanceToArc(p, cx, cy, r, a1, theta, a, b);
+        return DistanceToLineSegment(p, a, b);
+    }
+
+    private static double DistanceToArc(SKPoint p, double cx, double cy, double r,
+                                        double a1, double theta, SKPoint p1, SKPoint p2)
+    {
+        double dx = p.X - cx, dy = p.Y - cy;
+        double angle = Math.Atan2(dy, dx);
+        double twoPi = Math.PI * 2;
+        double rel;
+        if (theta >= 0)
+        {
+            rel = angle - a1;
+            while (rel < 0) rel += twoPi;
+            while (rel >= twoPi) rel -= twoPi;
+            if (rel <= theta) return Math.Abs(Math.Sqrt(dx * dx + dy * dy) - r);
+        }
+        else
+        {
+            rel = a1 - angle;
+            while (rel < 0) rel += twoPi;
+            while (rel >= twoPi) rel -= twoPi;
+            if (rel <= -theta) return Math.Abs(Math.Sqrt(dx * dx + dy * dy) - r);
+        }
+        double d1 = Math.Sqrt((p.X - p1.X) * (p.X - p1.X) + (p.Y - p1.Y) * (p.Y - p1.Y));
+        double d2 = Math.Sqrt((p.X - p2.X) * (p.X - p2.X) + (p.Y - p2.Y) * (p.Y - p2.Y));
+        return Math.Min(d1, d2);
+    }
+
+    private static double DistanceToLineSegment(SKPoint p, SKPoint a, SKPoint b)
+    {
+        double abx = b.X - a.X, aby = b.Y - a.Y;
+        double lenSq = abx * abx + aby * aby;
+        if (lenSq < 1e-12)
+            return Math.Sqrt((p.X - a.X) * (p.X - a.X) + (p.Y - a.Y) * (p.Y - a.Y));
+        double t = ((p.X - a.X) * abx + (p.Y - a.Y) * aby) / lenSq;
+        t = Math.Clamp(t, 0, 1);
+        double px = a.X + t * abx, py = a.Y + t * aby;
+        return Math.Sqrt((p.X - px) * (p.X - px) + (p.Y - py) * (p.Y - py));
     }
 
     // ---------- 填充边界 ----------

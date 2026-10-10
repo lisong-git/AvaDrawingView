@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>CadViewer.Tools.ShapeExport</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="ACadSharp" Version="3.4.9" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- 与 BlockExport 共用的读写 / 跨文档拷贝逻辑 -->
+    <Compile Include="..\Shared\CadToolkit.cs" />
+  </ItemGroup>
+</Project>

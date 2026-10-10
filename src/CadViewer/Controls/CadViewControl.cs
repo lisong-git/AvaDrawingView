@@ -115,6 +115,30 @@ public class CadViewControl : Control
     /// <summary>当前选中实体（不可变快照）。</summary>
     public IReadOnlyList<CadEntity> SelectedEntities => _selectedSnapshot;
 
+    private List<SubEntityPick> _subPicks;
+    private bool _subPickOwnsOverlay;
+
+    /// <summary>当前二级拾取集合（空 = 无）。任何选中变化都会清除。</summary>
+    public IReadOnlyList<SubEntityPick> CurrentSubPicks => _subPicks ?? (IReadOnlyList<SubEntityPick>)Array.Empty<SubEntityPick>();
+
+    /// <summary>二级拾取集合变化时触发（含框选清空时的空列表。UI 线程）。</summary>
+    public event EventHandler<IReadOnlyList<SubEntityPick>>? SubEntitiesPicked;
+
+    /// <summary>
+    /// 二级拾取解析器：命中实体被「再次点击」或 Ctrl+点击时调用。
+    /// 入参 = 命中图元、世界坐标指针位置、世界单位容差；
+    /// 返回 null = 该实体没有可二级拾取的子目标，走普通选择。
+    /// </summary>
+    public Func<CadEntity, SKPoint, float, SubEntityPick>? SubEntityResolver { get; set; }
+
+    /// <summary>
+    /// Ctrl+框选解析器：已选中目标的情况下框选时调用。
+    /// 入参 = 世界坐标矩形 + window（AutoCAD 框选规则：true = 左→右实线窗口，
+    /// 只收完全包含者；false = 右→左虚线窗交，相交即收）；
+    /// 返回其中命中的子图元集合（空 = 无）。
+    /// </summary>
+    public Func<SKRect, bool, IReadOnlyList<SubEntityPick>>? SubEntitiesInRectResolver { get; set; }
+
     /// <summary>单点拾取（屏幕坐标）：容差内最近的实体；无命中返回 null。</summary>
     public CadEntity? HitTest(SKPoint screenPoint, float tolerancePx = 5f)
     {
@@ -168,6 +192,7 @@ public class CadViewControl : Control
     /// <summary>替换选中集合并重绘（供外部面板/程序化驱动）。</summary>
     public void SetSelection(IEnumerable<CadEntity> entities)
     {
+        ClearSubPick();
         _selectedSnapshot = entities.ToArray();
         SelectionChanged?.Invoke(this, EventArgs.Empty);
         InvalidateVisual();
@@ -176,6 +201,7 @@ public class CadViewControl : Control
     /// <summary>清空选中集合并重绘。</summary>
     public void ClearSelection()
     {
+        ClearSubPick();
         if (_selectedSnapshot.Count == 0) return;
         _selectedSnapshot = Array.Empty<CadEntity>();
         SelectionChanged?.Invoke(this, EventArgs.Empty);
@@ -183,19 +209,122 @@ public class CadViewControl : Control
     }
 
     /// <summary>单选切换（点击命中调用）。</summary>
-    private void SelectAt(Point p)
-    {        var hit = HitTest(new SKPoint((float)p.X, (float)p.Y));
+    private void SelectAt(Point p, bool subRequested)
+    {
+        var hit = HitTest(new SKPoint((float)p.X, (float)p.Y));
         if (hit is null)
         {
             ClearSelection();
             return;
         }
         var current = _selectedSnapshot;
+        if (SubEntityResolver != null
+            && (subRequested || (current.Count == 1 && ReferenceEquals(current[0], hit))))
+        {
+            var world = Viewport.ScreenToWorld(new SKPoint((float)p.X, (float)p.Y));
+            var tol = 5f / MathF.Max(Viewport.Zoom, 1e-6f);
+            var pick = SubEntityResolver(hit, world, tol);
+            if (pick != null)
+            {
+                // Ctrl+点 = 切换：已选中的子图元再次 Ctrl+点取消，未选的加入（可与框选混用）
+                if (subRequested) ToggleSubPick(pick);
+                else SetSubPicks(new[] { pick });
+                return;
+            }
+        }
         // 最小实现：单击命中 = 单选（重复点击已选实体保持选中）
         if (current.Count == 1 && ReferenceEquals(current[0], hit)) return;
+        ClearSubPick();
         _selectedSnapshot = new[] { hit };
         SelectionChanged?.Invoke(this, EventArgs.Empty);
         InvalidateVisual();
+    }
+
+    private void SetSubPicks(IReadOnlyList<SubEntityPick> picks)
+    {
+        ClearSubPickCore();
+        var list = picks?.Where(p => p != null).ToList();
+        if (list is { Count: > 0 })
+        {
+            var shapes = new List<OverlayShape>();
+            foreach (var p in list)
+                shapes.AddRange(p.Highlight);
+            SetOverlay(new OverlayLayer { Shapes = shapes });
+            _subPicks = list;
+            _subPickOwnsOverlay = true;
+        }
+        SubEntitiesPicked?.Invoke(this, CurrentSubPicks);
+    }
+
+    /// <summary>Ctrl+点切换：按 (Handle, OwnHandle, SubPath) 识别，已在集合中则移除，否则追加。</summary>
+    private void ToggleSubPick(SubEntityPick pick)
+    {
+        var next = new List<SubEntityPick>();
+        bool removed = false;
+        if (_subPicks is { Count: > 0 })
+        {
+            foreach (var q in _subPicks)
+            {
+                if (q.Handle == pick.Handle && q.OwnHandle == pick.OwnHandle
+                    && string.Equals(q.SubPath, pick.SubPath, System.StringComparison.Ordinal))
+                {
+                    removed = true;   // 直接丢弃：其几何随旧叠加层延迟释放一并回收
+                    continue;
+                }
+                next.Add(ClonePick(q));
+            }
+        }
+        if (!removed)
+            next.Add(pick);
+        SetSubPicks(next);
+    }
+
+    /// <summary>
+    /// 复用既有拾取必须深拷贝高亮几何：旧叠加层 Release 后（含延迟释放窗口）
+    /// 会 Dispose 底下的 SKPath，直接把同一批 <see cref="OverlayShape"/> 挂进新层
+    /// 就是释放后使用。克隆路径后旧层自生自灭，与新层互不相干。
+    /// </summary>
+    private static SubEntityPick ClonePick(SubEntityPick p)
+    {
+        var shapes = new List<OverlayShape>(p.Highlight.Count);
+        foreach (var s in p.Highlight)
+        {
+            if (s?.Path is null) continue;
+            shapes.Add(new OverlayShape
+            {
+                Path = new SKPath(s.Path),
+                Fill = s.Fill,
+                ColorArgb = s.ColorArgb,
+                FillAlpha = s.FillAlpha,
+                StrokeWidthWorld = s.StrokeWidthWorld,
+                Dashed = s.Dashed,
+            });
+        }
+        return new SubEntityPick
+        {
+            Handle = p.Handle,
+            OwnHandle = p.OwnHandle,
+            SubPath = p.SubPath,
+            Highlight = shapes,
+            Bounds = p.Bounds,
+        };
+    }
+
+    /// <summary>清除二级拾取；仅当叠加层当前属于二级拾取时才一并清除。</summary>
+    public void ClearSubPick()
+    {
+        if (_subPicks == null) return;
+        ClearSubPickCore();
+    }
+
+    private void ClearSubPickCore()
+    {
+        _subPicks = null;
+        if (_subPickOwnsOverlay)
+        {
+            _subPickOwnsOverlay = false;
+            ClearOverlay();
+        }
     }
 
     private void SelectInBand()
@@ -614,9 +743,28 @@ public class CadViewControl : Control
             var p = e.GetCurrentPoint(this).Position;
             var dx = p.X - bs.X; var dy = p.Y - bs.Y;
             if (dx * dx + dy * dy <= 16)
-                SelectAt(p);
+            {
+                SelectAt(p, e.KeyModifiers.HasFlag(KeyModifiers.Control));
+            }
+            else if (e.KeyModifiers.HasFlag(KeyModifiers.Control)
+                     && SubEntitiesInRectResolver != null
+                     && _selectedSnapshot.Count > 0)
+            {
+                // Ctrl+框选：只框「已选中目标」的子图元（多段线段 / 块内子实体）。
+                // 空结果 = 清除二级拾取（事件带空列表，宿主同步清状态）。
+                var wa = Viewport.ScreenToWorld(new SKPoint(
+                    (float)Math.Min(bs.X, p.X), (float)Math.Min(bs.Y, p.Y)));
+                var wb = Viewport.ScreenToWorld(new SKPoint(
+                    (float)Math.Max(bs.X, p.X), (float)Math.Max(bs.Y, p.Y)));
+                var rect = SKRect.Create(
+                    Math.Min(wa.X, wb.X), Math.Min(wa.Y, wb.Y),
+                    Math.Abs(wb.X - wa.X), Math.Abs(wb.Y - wa.Y));
+                SetSubPicks(SubEntitiesInRectResolver(rect, p.X >= bs.X));
+            }
             else
+            {
                 SelectInBand();
+            }
             _bandStart = null;
             _bandActive = false;
         }

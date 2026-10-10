@@ -52,6 +52,8 @@ dotnet run --project tools\SmokeTest        # 核心链路冒烟测试（解析�
 dotnet run --project tools\UiSmokeTest      # UI 渲染冒烟测试（无头，不弹窗口）
 dotnet run --project tools\PerfProbe -- "D:\path\to.dwg"   # 性能基准（--load-only 只测加载；--repeat 8 验内存泄漏）
 dotnet run --project tools\SampleGen        # 重新生成 samples\sample_features.dxf
+dotnet run --project tools\BlockExport -- "D:\path\to.dwg" "D:\out" --referenced   # 按块导出独立 DWG
+dotnet run --project tools\ShapeExport -- "D:\path\to.dwg" "D:\out"               # 按相交分组导出独立 DWG
 ```
 
 一键跑完构建 + 两项冒烟（结果汇总到 `.regress.log`）：
@@ -61,6 +63,38 @@ powershell -ExecutionPolicy Bypass -File tools\regress.ps1
 ```
 
 需要 .NET 8 SDK。
+
+### BlockExport：块导出为独立 DWG
+
+```powershell
+dotnet run --project tools\BlockExport -- "D:\src.dwg" "D:\out" --referenced
+```
+
+- `--referenced`：只导出模型空间 INSERT **递归**引用到的块（推荐）。只跟 INSERT，不跟
+  `Dimension.Block`——否则 5330 个标注会带出 5330 个 `*D` 块（实测踩过）。这些 `*D` 块仍会作为
+  「被导出块的内部依赖」随块一起拷进新图，导出的标注不会丢几何
+- `--list` 只看清单；`--include-anon` 含匿名块；`--format dxf` 出 DXF；`--only <关键字>` 过滤
+- 块内嵌套 INSERT、图层 / 线型 / 文字样式 / 标注样式都会按名字在新图里重建，不会留下悬空句柄
+- 每个文件写完自动回读校验：**实体数 + 实体构成 + 包围盒**三项与源块一致才标 OK
+- 输出目录会落一份 `_块导出清单.csv`（文件名 ↔ 块名 ↔ 实体数 ↔ 模型空间引用次数）
+- 候选块 > 300 个需加 `--force`（保险线）；日志用 `BLOCKEXPORT_LOG=<路径>` 写 UTF-8 文件
+
+### ShapeExport：相交分组导出为独立 DWG
+
+```powershell
+dotnet run --project tools\ShapeExport -- "D:\src.dwg" "D:\out"   # 默认输出到 <源图目录>\blocks
+```
+
+- 把模型空间的几何图元按**相交关系**聚成组（连通分量：A–B 相交、B–C 相交 ⇒ A/B/C 同组），
+  每组导出一个独立 DWG，文件名 `0001.dwg`、`0002.dwg`…（默认按组包围盒面积从大到小）
+- 只判几何：LINE / LWPOLYLINE / POLYLINE / ARC / CIRCLE / ELLIPSE / SPLINE / HATCH / SOLID /
+  FACE3D / INSERT（块引用会按插入点、缩放、旋转、MINSERT 阵列展开后参与判定）；
+  文字、标注、引线默认不参与（否则每个轮廓都会碰到标注线），要带上就加 `--annotations`
+- 相交 = 压平后的线段真正相交 / 端点相接 / 搭接，容差 `--tol`（默认 1e-6）
+- `--list` 只统计分组；`--min-size N` 只导出 ≥N 个图元的组；`--min-extent` 按尺寸过滤；
+  `--origin` 把每组平移到自身左下角为原点（默认保留源坐标）；`--format dxf` 出 DXF
+- 输出目录落一份 `_图形分组清单.csv`（序号 ↔ 文件名 ↔ 图元数 ↔ 类型构成 ↔ 包围盒 ↔ 成员句柄）
+- 组数 > 3000 会中止（保险线），确认无误加 `--force`；日志用 `SHAPEEXPORT_LOG=<路径>` 写 UTF-8 文件
 
 > 改渲染相关代码后请同时跑 `tools\UiSmokeTest`。`SmokeTest` 不经过 Avalonia 渲染管线，
 > 无法拦截"渲染期非法操作"这类缺陷（例如在 `Render` 内调用 `InvalidateVisual`）。
@@ -77,6 +111,9 @@ tools/SmokeTest         # 样例 DXF 全链路测试（解析→转换→索引�
 tools/UiSmokeTest       # 无头 Avalonia 渲染测试（真实跑渲染管线）
 tools/PerfProbe         # 性能基准（加载分段 / 内存 / 帧耗时 / LOD 扫描 / 墨迹覆盖率 / 泄漏验证）
 tools/SampleGen         # 生成 samples\sample_features.dxf（覆盖全部实体类型与边界情况）
+tools/BlockExport       # 把图纸里的块定义逐个导出成独立 DWG（WBLOCK 语义，含嵌套块依赖）
+tools/ShapeExport       # 把模型空间的图元按相交关系分组，每组导出成独立 DWG（连通分量）
+tools/Shared            # 上面两个导出工具共用的读写 / 跨文档拷贝逻辑（CadToolkit.cs，链进各自项目）
 tools/regress.ps1       # 一键回归：Debug/Release 构建 + 核心冒烟 + UI 冒烟（构建失败即中止）
 tools/Probe             # ACadSharp API 反射探针（开发辅助）
 samples/                # 样例图纸
