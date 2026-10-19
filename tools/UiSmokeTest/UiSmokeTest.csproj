@@ -10,9 +10,9 @@
 
   <ItemGroup>
     <!-- 无头平台：让 Avalonia 在不弹窗口的情况下真实跑一遍渲染管线 -->
-    <PackageReference Include="Avalonia.Headless" Version="12.1.2" />
-    <PackageReference Include="Avalonia.Skia" Version="12.1.2" />
-    <PackageReference Include="Avalonia.Desktop" Version="12.1.2" />
+    <PackageReference Include="Avalonia.Headless" Version="12.1.4" />
+    <PackageReference Include="Avalonia.Skia" Version="12.1.4" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.4" />
   </ItemGroup>
 
   <ItemGroup>

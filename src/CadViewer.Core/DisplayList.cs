@@ -33,6 +33,13 @@ public sealed class DisplayList : IDisposable
     /// <summary>图纸范围（世界坐标），空图纸时为默认占位范围。</summary>
     public required SKRect Extents { get; init; }
     /// <summary>
+    /// 核心区范围：鲁棒化的图纸范围，供「适应窗口」首屏定位（见
+    /// <c>CadDocumentLoader.ComputeCoreExtents</c>）。绝大多数图纸与 <see cref="Extents"/>
+    /// 一致；含远处孤立实体（插入点垃圾值）的图纸会切掉孤立簇，避免画面被压成一个小点。
+    /// 索引 / 句柄查询 / 打印范围仍用 <see cref="Extents"/>。
+    /// </summary>
+    public required SKRect CoreExtents { get; init; }
+    /// <summary>
     /// 烘焙批次（大图才有；小图为 null，直接逐实体绘制）。
     /// 见 <see cref="BakedGeometry"/> 的说明。
     /// </summary>
@@ -73,6 +80,7 @@ public sealed class DisplayList : IDisposable
         Index = SpatialIndex.Build(Array.Empty<CadEntity>()),
         LayerNames = Array.Empty<string>(),
         Extents = SKRect.Create(0, 0, 100, 100),
+        CoreExtents = SKRect.Create(0, 0, 100, 100),
         IsSharedInstance = true,
     };
 

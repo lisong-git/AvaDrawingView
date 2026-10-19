@@ -41,11 +41,38 @@ public sealed class GeometryConverter
     /// </summary>
     private ulong _currentOwnHandle;
 
+    /// <summary>全局线型比例（LTSCALE，文件头）；<=0 时按 1。</summary>
+    private double _globalLtScale = 1.0;
+
+    /// <summary>虚线间隔数组池：等值的线型共用同一实例，便于烘焙按引用分桶。</summary>
+    private readonly Dictionary<string, float[]> _dashPool = new(StringComparer.Ordinal);
+
     /// <summary>转换失败 / 有意跳过的实体数（含隐藏实体）。</summary>
     public int Skipped { get; private set; }
 
+    // 块引用展开的丢弃原因计数（诊断用：定位「块内容整片消失」）
+    public int DroppedNoBlock { get; private set; }
+    public int DroppedByDepth { get; private set; }
+    public int DroppedByMatrix { get; private set; }
+    public int DroppedByMInsert { get; private set; }
+
     /// <summary>图纸里被关闭或冻结的图层：打开时应默认隐藏。</summary>
     public IReadOnlyCollection<string> InitiallyHiddenLayers => _initiallyHidden;
+
+    private static readonly bool ConvTrace = Environment.GetEnvironmentVariable("CADVIEWER_CONV_TRACE") == "1";
+    private static readonly bool ShowInvisible = Environment.GetEnvironmentVariable("CADVIEWER_SHOW_INVISIBLE") == "1";
+    private static readonly string TracePath = Path.Combine(Path.GetTempPath(), "conv_trace.log");
+    private static int _traceSeq;
+
+    private static void Trace(string m)
+    {
+        if (!ConvTrace) return;
+        try
+        {
+            File.AppendAllText(TracePath, $"[{_traceSeq++}] {DateTime.Now:HH:mm:ss.fff} {m}{Environment.NewLine}");
+        }
+        catch { }
+    }
 
     public List<CadEntity> Convert(CadDocument doc, CancellationToken ct = default, GeometryConvertOptions? options = null)
     {
@@ -56,6 +83,18 @@ public sealed class GeometryConverter
         Skipped = 0;
 
         CacheLayerColors(doc);
+        try
+        {
+            double lts = doc.Header.LineTypeScale;
+            if (lts > 0 && !double.IsNaN(lts) && !double.IsInfinity(lts)) _globalLtScale = lts;
+        }
+        catch { }
+
+        if (ConvTrace)
+        {
+            try { File.Delete(TracePath); } catch { }
+            _traceSeq = 0;
+        }
 
         int n = 0;
         foreach (var e in EnumerateModelSpace(doc))
@@ -100,12 +139,16 @@ public sealed class GeometryConverter
         // 实体被显式隐藏（DXF 组码 60 = 1，AutoCAD 亦不显示）。
         // 实测测试图.dwg：7836 个源实体带此标记（其中 1734 个 INSERT），展开约 5 万个显示实体；
         // 过滤后全图墨迹覆盖率 3.06% → 2.03%，经与 AutoCAD 语义核对属于正确行为而非内容丢失。
-        if (e.IsInvisible) { Skipped++; return; }
+        // CADVIEWER_SHOW_INVISIBLE=1 可关闭过滤（仅供与第三方渲染器对照基准用）。
+        if (e.IsInvisible && !ShowInvisible) { Skipped++; return; }
 
         var prevHandle = _currentHandle;
         var prevOwnHandle = _currentOwnHandle;
         _currentHandle = handleOverride ?? e.Handle;
         _currentOwnHandle = e.Handle;
+
+        if (ConvTrace)
+            Trace($"depth={depth} {e.GetType().Name} H={e.Handle:X} L={e.Layer?.Name}");
 
         try
         {
@@ -136,9 +179,10 @@ public sealed class GeometryConverter
                 default: Skipped++; break;
             }
         }
-        catch
+        catch (Exception ex)
         {
             Skipped++;
+            if (ConvTrace) Trace($"THROW depth={depth} H={_currentHandle:X} {ex.GetType().Name}: {ex.Message}");
         }
         finally
         {
@@ -258,17 +302,22 @@ public sealed class GeometryConverter
     /// </summary>
     private void ConvertInsert(Insert ins, in SKMatrix parent, int depth, uint? inheritedColor)
     {
-        if (depth >= MaxInsertDepth || ins.Block is null) { Skipped++; return; }
+        if (ins.Block is null) { DroppedNoBlock++; Skipped++; return; }
+        if (depth >= MaxInsertDepth) { DroppedByDepth++; Skipped++; return; }
         // 变换链与标注目标树共用（CadTransform），保证「高亮几何」与「显示几何」不会漂移
-        if (!CadTransform.TryInsertMatrix(ins, out var m)) return;
+        if (!CadTransform.TryInsertMatrix(ins, out var m)) { DroppedByMatrix++; Skipped++; return; }
 
         // 子实体继承色：INSERT 自身的颜色（BYLAYER 时已解析到图层色）
         uint blockColor = ResolveColor(ins, inheritedColor);
+
+        if (ConvTrace)
+            Trace($"EXPAND depth={depth} H={ins.Handle:X} block={ins.Block?.Name} blockH={ins.Block?.Handle:X} ents={ins.Block?.Entities.Count} scale=({ins.XScale:F2},{ins.YScale:F2}) rot={ins.Rotation:F3}");
 
         CadTransform.ArraySize(ins, out int rows, out int cols, out long total);
         if (total > MaxMInsertInstances)
         {
             // 异常阵列直接放弃整个插入，避免生成天量几何拖垮渲染
+            DroppedByMInsert++;
             Skipped++;
             return;
         }
@@ -366,27 +415,48 @@ public sealed class GeometryConverter
         var pattern = new SKPath();
         var hits = new List<float>();
         int emitted = 0;
+        int diagRows = 0, diagHits = 0, diagOdd = 0, diagEpsKill = 0;
         bool overflow = false;
         try
         {
             foreach (var def in defs)
             {
                 double ang = def.Angle + h.PatternAngle;
-                float dx = (float)Math.Cos(ang), dy = (float)Math.Sin(ang);
-                float nx = -dy, ny = dx;
-                float bx = (float)def.BasePoint.X, by = (float)def.BasePoint.Y;
-                float ox = (float)def.Offset.X, oy = (float)def.Offset.Y;
-                float offN = ox * nx + oy * ny;
-                if (MathF.Abs(offN) < 1e-9f) continue;
+                double dx = Math.Cos(ang), dy = Math.Sin(ang);
+                double nx = -dy, ny = dx;
+                double ox = def.Offset.X, oy = def.Offset.Y;
+                double bx = def.BasePoint.X, by = def.BasePoint.Y;
+                double offN = ox * nx + oy * ny;
+                if (!double.IsFinite(offN) || Math.Abs(offN) < 1e-9) continue;
 
-                float cN0 = minX * nx + minY * ny, cN1 = maxX * nx + minY * ny;
-                float cN2 = minX * nx + maxY * ny, cN3 = maxX * nx + maxY * ny;
-                float nMin = MathF.Min(MathF.Min(cN0, cN1), MathF.Min(cN2, cN3));
-                float nMax = MathF.Max(MathF.Max(cN0, cN1), MathF.Max(cN2, cN3));
-                float bN = bx * nx + by * ny;
-                int i0 = (int)Math.Floor((nMin - bN) / offN) - 1;
-                int i1 = (int)Math.Ceiling((nMax - bN) / offN) + 1;
-                if (i0 > i1) (i0, i1) = (i1, i0);   // offN 为负时区间端点颠倒
+                double cN0 = minX * nx + minY * ny, cN1 = maxX * nx + minY * ny;
+                double cN2 = minX * nx + maxY * ny, cN3 = maxX * nx + maxY * ny;
+                double nMin = Math.Min(Math.Min(cN0, cN1), Math.Min(cN2, cN3));
+                double nMax = Math.Max(Math.Max(cN0, cN1), Math.Max(cN2, cN3));
+                if (!double.IsFinite(nMin) || !double.IsFinite(nMax) || nMax <= nMin) continue;
+                double bN = bx * nx + by * ny;
+
+                // 行号原点折进边界带（整数倍 offset 不改变行集合）；基点太远折不动时
+                // （标准图案的历史垃圾坐标可达 1e81，double 加法都吃不掉 offset）
+                // 以带中心重锚：只丢法向相位（≤半行距），行集合保持有界。
+                double kFold = Math.Floor((nMin - bN) / offN);
+                if (!double.IsFinite(kFold) || Math.Abs(kFold) > MaxHatchPatternRows)
+                {
+                    double cx = (minX + maxX) * 0.5, cy = (minY + maxY) * 0.5;
+                    double cn = cx * nx + cy * ny;
+                    bN = (nMin + nMax) * 0.5;
+                    bx = cx + (bN - cn) * nx;
+                    by = cy + (bN - cn) * ny;
+                    kFold = 0;
+                }
+                else if (kFold != 0)
+                {
+                    bx += ox * kFold; by += oy * kFold; bN += offN * kFold;
+                }
+
+                long i0 = (long)Math.Floor((nMin - bN) / offN) - 1;
+                long i1 = (long)Math.Ceiling((nMax - bN) / offN) + 1;
+                if (i0 > i1) (i0, i1) = (i1, i0);
                 if (i1 - i0 > MaxHatchPatternRows) { overflow = true; break; }
 
                 var dashes = def.DashLengths;
@@ -395,10 +465,9 @@ public sealed class GeometryConverter
                 if (dashed)
                     foreach (var d in dashes) cycle += MathF.Abs((float)d);
 
-                for (int i = i0; i <= i1; i++)
+                for (long i = i0; i <= i1; i++)
                 {
-                    float rX = bx + ox * i, rY = by + oy * i;
-                    float rowShiftD = ox * i * dx + oy * i * dy;
+                    float rX = (float)(bx + ox * i), rY = (float)(by + oy * i);
 
                     hits.Clear();
                     foreach (var (a, b) in segs)
@@ -406,30 +475,34 @@ public sealed class GeometryConverter
                         // 符号距离穿越法：交点由两端点在行法线上的符号距离线性插值，
                         // 不解方程组 → 行线与边共线/近共线（det≈0）时无假交点。
                         // d=0 归正侧（半开区间），顶点穿越/擦过的奇偶计数自洽。
-                        float da = (a.X - rX) * nx + (a.Y - rY) * ny;
-                        float db = (b.X - rX) * nx + (b.Y - rY) * ny;
-                        bool aneg = da < 0f, bneg = db < 0f;
+                        double da = (a.X - rX) * nx + (a.Y - rY) * ny;
+                        double db = (b.X - rX) * nx + (b.Y - rY) * ny;
+                        bool aneg = da < 0, bneg = db < 0;
                         if (aneg == bneg) continue;
-                        float tt = da / (da - db);
-                        float px = a.X + (b.X - a.X) * tt - rX;
-                        float py = a.Y + (b.Y - a.Y) * tt - rY;
-                        hits.Add(rowShiftD + px * dx + py * dy);
+                        double tt = da / (da - db);
+                        double px = a.X + (b.X - a.X) * tt - rX;
+                        double py = a.Y + (b.Y - a.Y) * tt - rY;
+                        hits.Add((float)(px * dx + py * dy));
                     }
                     if (hits.Count < 2) continue;
+                    diagRows++;
+                    diagHits += hits.Count;
                     hits.Sort();
                     if (hits.Count % 2 != 0)
                     {
                         DiagHatchOddRows++;
+                        diagOdd++;
                         continue;
                     }
 
                     float eps = MathF.Max(bbox.Width, bbox.Height) * 1e-4f + 1e-5f;
+                    float dotLen = MathF.Max(MathF.Sqrt(bbox.Width * bbox.Width + bbox.Height * bbox.Height) * 5e-4f, 1e-3f);
                     for (int k = 0; k + 1 < hits.Count; k += 2)
                     {
                         // 相邻交点几乎重合 = 行线擦过顶点，奇偶不可靠，丢弃该对
-                        if (hits[k + 1] - hits[k] < eps) continue;
-                        emitted += EmitDashes(pattern, rX, rY, dx, dy, hits[k], hits[k + 1],
-                            dashed, cycle, dashes, 1f);
+                        if (hits[k + 1] - hits[k] < eps) { diagEpsKill++; continue; }
+                        emitted += EmitDashes(pattern, rX, rY, (float)dx, (float)dy, hits[k], hits[k + 1],
+                            dashed, cycle, dashes, 1f, dotLen);
                         if (emitted > MaxHatchPatternSegments) { overflow = true; break; }
                     }
                     if (overflow) break;
@@ -446,7 +519,9 @@ public sealed class GeometryConverter
         {
             pattern.Dispose();
             DiagHatchPatternFallback++;
-            DiagHatchLastReason = overflow ? "overflow" : "empty";
+            DiagHatchLastReason = overflow
+                ? $"overflow(H={h.Handle:X})"
+                : $"empty(H={h.Handle:X}):segs={segs.Count} rows={diagRows} hits={diagHits} odd={diagOdd} epsKill={diagEpsKill} emitted={emitted}";
             return false;
         }
         DiagHatchPatternOk++;
@@ -457,8 +532,10 @@ public sealed class GeometryConverter
     }
 
     /// <summary>区间 [s0,s1] 内按虚线表切段并写入 path，返回写入的段数（dashed=false 时整段直通）。</summary>
+    /// <para>DWG 虚线表语义：正值=实线段，负值=空段，0=点。点按 <paramref name="dotLen"/> 长的
+    /// 最短线段绘制（DisplayList 预转换、无缩放信息，取边界尺度的固定比例，放大后清晰可见）。</para>
     private static int EmitDashes(SKPath path, float rX, float rY, float dx, float dy,
-        float s0, float s1, bool dashed, float cycle, System.Collections.Generic.List<double> dashes, float scale)
+        float s0, float s1, bool dashed, float cycle, System.Collections.Generic.List<double> dashes, float scale, float dotLen)
     {
         int emitted = 0;
         void Emit(float a, float b)
@@ -472,9 +549,11 @@ public sealed class GeometryConverter
             Emit(s0, s1);
             return emitted;
         }
-        int k0 = (int)MathF.Floor(s0 / cycle) - 1;
-        int k1 = (int)MathF.Ceiling(s1 / cycle) + 1;
-        for (int k = k0; k <= k1; k++)
+        long k0 = (long)MathF.Floor(s0 / cycle) - 1;
+        long k1 = (long)MathF.Ceiling(s1 / cycle) + 1;
+        if (k0 > k1) (k0, k1) = (k1, k0);
+        if (k1 - k0 > 262144) return emitted;
+        for (long k = k0; k <= k1; k++)
         {
             float t = k * cycle;
             foreach (var d in dashes)
@@ -483,6 +562,11 @@ public sealed class GeometryConverter
                 if (d > 0 && len > 0)
                 {
                     float a = MathF.Max(s0, t), b = MathF.Min(s1, t + len);
+                    if (b > a) Emit(a, b);
+                }
+                else if (d == 0)
+                {
+                    float a = MathF.Max(s0, t), b = MathF.Min(s1, t + dotLen);
                     if (b > a) Emit(a, b);
                 }
                 t += len;
@@ -695,11 +779,10 @@ public sealed class GeometryConverter
     // 不做这步，弧/圆会画到 X 镜像位置（实测 0053datr：41 条圆角弧全跑到 +900，
     // 轮廓每处圆角断开、Extents 被撑大近 20 倍）。2D 图纸法向只有 ±Z 两种。
     // Normal 不在 Entity 基类上（ACadSharp 3.4.9 各具体类自行声明），只能逐类型取。
-    private static SKMatrix OcsMirrorMatrix(Entity e) => CadGeometry.OcsMirrorMatrix(e);
 
     private void AddStroke(SKPath path, Entity e, uint color, in SKMatrix m, float lineWidth = 0)
     {
-        var ocs = OcsMirrorMatrix(e);
+        var ocs = CadGeometry.OcsMirrorMatrix(e);
         if (!ocs.IsIdentity) path.Transform(ocs);
         path.Transform(m);
         var bounds = path.Bounds;
@@ -712,13 +795,64 @@ public sealed class GeometryConverter
             OwnHandle = _currentOwnHandle,
             Path = path,
             LineWidth = lineWidth,
+            DashPattern = ResolveDashPattern(e, m),
             Bounds = bounds,
         });
     }
 
+    /// <summary>
+    /// 解析实体的显示线型为 Skia 虚线间隔（on/off 交替，世界单位）。
+    /// 实线（Continuous / ByBlock / 无段 / 全为实段）返回 null。
+    /// </summary>
+    private float[]? ResolveDashPattern(Entity e, in SKMatrix m)
+    {
+        var lt = e.LineType;
+        if (lt == null || lt.Segments == null) return null;
+
+        double unit = _globalLtScale * (e.LineTypeScale > 0 ? e.LineTypeScale : 1.0);
+        double det = Math.Abs((double)m.ScaleX * m.ScaleY - (double)m.SkewX * m.SkewY);
+        if (det > 0 && !double.IsNaN(det) && !double.IsInfinity(det)) unit *= Math.Sqrt(det);
+        if (unit <= 0) return null;
+
+        var segs = lt.Segments.ToList();
+        if (segs.Count == 0) return null;
+
+        double total = 0;
+        foreach (var s in segs) total += Math.Abs(s.Length);
+        if (total <= 0) return null;
+
+        // 段长带符号（负 = 空档），同时用 IsSpace 兜底；点段按极短实段画，保证交替序列合法。
+        var list = new List<double>();
+        foreach (var s in segs)
+        {
+            double len = Math.Abs(s.Length) * unit;
+            bool on = !s.IsSpace && !s.IsText && !s.IsShape;
+            if (on && len <= 0) len = Math.Max(total * unit * 0.02, 1e-6);
+            if (len <= 0) continue;
+            bool expectOn = list.Count % 2 == 0;
+            if (expectOn == on) list.Add(len);
+            else if (list.Count > 0) list[^1] += len;   // 同类型相邻 → 合并，保持 on/off 交替
+            else list.Add(len);
+        }
+        if (list.Count < 2) return null;
+
+        var arr = new float[list.Count];
+        for (int i = 0; i < list.Count; i++) arr[i] = (float)Math.Max(list[i], 1e-6);
+        return PoolDash(arr);
+    }
+
+    /// <summary>等值线型复用同一数组实例（烘焙按引用分桶、渲染按引用缓存路径效果）。</summary>
+    private float[] PoolDash(float[] pattern)
+    {
+        var key = string.Join("|", Array.ConvertAll(pattern, v => v.ToString("R")));
+        if (_dashPool.TryGetValue(key, out var hit)) return hit;
+        _dashPool[key] = pattern;
+        return pattern;
+    }
+
     private void AddFill(SKPath path, Entity e, uint color, in SKMatrix m)
     {
-        var ocs = OcsMirrorMatrix(e);
+        var ocs = CadGeometry.OcsMirrorMatrix(e);
         if (!ocs.IsIdentity) path.Transform(ocs);
         path.Transform(m);
         var bounds = path.Bounds;

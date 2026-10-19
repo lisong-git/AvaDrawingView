@@ -1,61 +1,87 @@
 namespace CadViewer.Core;
 
 /// <summary>
-/// AutoCAD Color Index (ACI 1-255) → RGB 转换。
-/// 0=BYBLOCK, 7=白（白底渲染时由渲染器转黑）。
+/// AutoCAD Color Index (ACI 0-255) → RGB 转换。
+/// 表值为 AutoCAD 暗底（黑画布）显示色，与 ODA DarkPalette 逐项一致（2026-10-18 比对修正，
+/// 原 HSV 公式表有 223/256 项偏离官方值，含最常用 ACI8/9 与 251-254 灰阶）。
+/// 0 与 7 的语义不变（0=BYBLOCK 退白、7=白底渲染时由渲染器转黑）。
 /// </summary>
 public static class AciColorTable
 {
     public static uint FromAci(int index) => 0xFF000000u | ToRgb(index);
 
+    static readonly uint[] s_table = new uint[256]
+    {
+        0x000000u, 0xFF0000u, 0xFFFF00u, 0x00FF00u,
+        0x00FFFFu, 0x0000FFu, 0xFF00FFu, 0xFFFFFFu,
+        0x808080u, 0xC0C0C0u, 0xFF0000u, 0xFF7F7Fu,
+        0xCC0000u, 0xCC6666u, 0x990000u, 0x994C4Cu,
+        0x7F0000u, 0x7F3F3Fu, 0x4C0000u, 0x4C2626u,
+        0xFF3F00u, 0xFF9F7Fu, 0xCC3300u, 0xCC7F66u,
+        0x992600u, 0x995F4Cu, 0x7F1F00u, 0x7F4F3Fu,
+        0x4C1300u, 0x4C2F26u, 0xFF7F00u, 0xFFBF7Fu,
+        0xCC6600u, 0xCC9966u, 0x994C00u, 0x99724Cu,
+        0x7F3F00u, 0x7F5F3Fu, 0x4C2600u, 0x4C3926u,
+        0xFFBF00u, 0xFFDF7Fu, 0xCC9900u, 0xCCB266u,
+        0x997200u, 0x99854Cu, 0x7F5F00u, 0x7F6F3Fu,
+        0x4C3900u, 0x4C4226u, 0xFFFF00u, 0xFFFF7Fu,
+        0xCCCC00u, 0xCCCC66u, 0x999900u, 0x99994Cu,
+        0x7F7F00u, 0x7F7F3Fu, 0x4C4C00u, 0x4C4C26u,
+        0xBFFF00u, 0xDFFF7Fu, 0x99CC00u, 0xB2CC66u,
+        0x729900u, 0x85994Cu, 0x5F7F00u, 0x6F7F3Fu,
+        0x394C00u, 0x424C26u, 0x7FFF00u, 0xBFFF7Fu,
+        0x66CC00u, 0x99CC66u, 0x4C9900u, 0x72994Cu,
+        0x3F7F00u, 0x5F7F3Fu, 0x264C00u, 0x394C26u,
+        0x3FFF00u, 0x9FFF7Fu, 0x33CC00u, 0x7FCC66u,
+        0x269900u, 0x5F994Cu, 0x1F7F00u, 0x4F7F3Fu,
+        0x134C00u, 0x2F4C26u, 0x00FF00u, 0x7FFF7Fu,
+        0x00CC00u, 0x66CC66u, 0x009900u, 0x4C994Cu,
+        0x007F00u, 0x3F7F3Fu, 0x004C00u, 0x264C26u,
+        0x00FF3Fu, 0x7FFF9Fu, 0x00CC33u, 0x66CC7Fu,
+        0x009926u, 0x4C995Fu, 0x007F1Fu, 0x3F7F4Fu,
+        0x004C13u, 0x264C2Fu, 0x00FF7Fu, 0x7FFFBFu,
+        0x00CC66u, 0x66CC99u, 0x00994Cu, 0x4C9972u,
+        0x007F3Fu, 0x3F7F5Fu, 0x004C26u, 0x264C39u,
+        0x00FFBFu, 0x7FFFDFu, 0x00CC99u, 0x66CCB2u,
+        0x009972u, 0x4C9985u, 0x007F5Fu, 0x3F7F6Fu,
+        0x004C39u, 0x264C42u, 0x00FFFFu, 0x7FFFFFu,
+        0x00CCCCu, 0x66CCCCu, 0x009999u, 0x4C9999u,
+        0x007F7Fu, 0x3F7F7Fu, 0x004C4Cu, 0x264C4Cu,
+        0x00BFFFu, 0x7FDFFFu, 0x0099CCu, 0x66B2CCu,
+        0x007299u, 0x4C8599u, 0x005F7Fu, 0x3F6F7Fu,
+        0x00394Cu, 0x26424Cu, 0x007FFFu, 0x7FBFFFu,
+        0x0066CCu, 0x6699CCu, 0x004C99u, 0x4C7299u,
+        0x003F7Fu, 0x3F5F7Fu, 0x00264Cu, 0x26394Cu,
+        0x003FFFu, 0x7F9FFFu, 0x0033CCu, 0x667FCCu,
+        0x002699u, 0x4C5F99u, 0x001F7Fu, 0x3F4F7Fu,
+        0x00134Cu, 0x262F4Cu, 0x0000FFu, 0x7F7FFFu,
+        0x0000CCu, 0x6666CCu, 0x000099u, 0x4C4C99u,
+        0x00007Fu, 0x3F3F7Fu, 0x00004Cu, 0x26264Cu,
+        0x3F00FFu, 0x9F7FFFu, 0x3300CCu, 0x7F66CCu,
+        0x260099u, 0x5F4C99u, 0x1F007Fu, 0x4F3F7Fu,
+        0x13004Cu, 0x2F264Cu, 0x7F00FFu, 0xBF7FFFu,
+        0x6600CCu, 0x9966CCu, 0x4C0099u, 0x724C99u,
+        0x3F007Fu, 0x5F3F7Fu, 0x26004Cu, 0x39264Cu,
+        0xBF00FFu, 0xDF7FFFu, 0x9900CCu, 0xB266CCu,
+        0x720099u, 0x854C99u, 0x5F007Fu, 0x6F3F7Fu,
+        0x39004Cu, 0x42264Cu, 0xFF00FFu, 0xFF7FFFu,
+        0xCC00CCu, 0xCC66CCu, 0x990099u, 0x994C99u,
+        0x7F007Fu, 0x7F3F7Fu, 0x4C004Cu, 0x4C264Cu,
+        0xFF00BFu, 0xFF7FDFu, 0xCC0099u, 0xCC66B2u,
+        0x990072u, 0x994C85u, 0x7F005Fu, 0x7F3F6Fu,
+        0x4C0039u, 0x4C2642u, 0xFF007Fu, 0xFF7FBFu,
+        0xCC0066u, 0xCC6699u, 0x99004Cu, 0x994C72u,
+        0x7F003Fu, 0x7F3F5Fu, 0x4C0026u, 0x4C2639u,
+        0xFF003Fu, 0xFF7F9Fu, 0xCC0033u, 0xCC667Fu,
+        0x990026u, 0x994C5Fu, 0x7F001Fu, 0x7F3F4Fu,
+        0x4C0013u, 0x4C262Fu, 0x333333u, 0x5B5B5Bu,
+        0x848484u, 0xADADADu, 0xD6D6D6u, 0xFFFFFFu,
+    };
+
     public static uint ToRgb(int index)
     {
-        switch (index)
-        {
-            case <= 0: return 0xFFFFFF;
-            case 1: return 0xFF0000;
-            case 2: return 0xFFFF00;
-            case 3: return 0x00FF00;
-            case 4: return 0x00FFFF;
-            case 5: return 0x0000FF;
-            case 6: return 0xFF00FF;
-            case 7: return 0xFFFFFF;
-            case 8: return 0x414141;
-            case 9: return 0x808080;
-            case >= 250:
-            {
-                byte v = index switch { 250 => (byte)51, 251 => (byte)80, 252 => (byte)105, 253 => (byte)130, 254 => (byte)190, _ => (byte)255 };
-                return (uint)(v << 16 | v << 8 | v);
-            }
-            default:
-            {
-                int group = (index - 10) / 10;   // 0-23 个色相组，每组 15°
-                int r = (index - 10) % 10;       // 组内明度/饱和度档位
-                double hue = (group % 24) * 15.0;
-                double val = r < 5 ? 1.0 - 0.2 * r : 1.0 - 0.2 * (r - 5);
-                double sat = r < 5 ? 1.0 : 0.5;
-                return HsvToRgb(hue, sat, val);
-            }
-        }
-    }
-
-    private static uint HsvToRgb(double h, double s, double v)
-    {
-        double c = v * s;
-        double x = c * (1 - Math.Abs(h / 60 % 2 - 1));
-        double m = v - c;
-        (double r, double g, double b) = (h % 360) switch
-        {
-            < 60 => (c, x, 0.0),
-            < 120 => (x, c, 0.0),
-            < 180 => (0.0, c, x),
-            < 240 => (0.0, x, c),
-            < 300 => (x, 0.0, c),
-            _ => (c, 0.0, x),
-        };
-        byte ri = (byte)Math.Clamp((r + m) * 255, 0, 255);
-        byte gi = (byte)Math.Clamp((g + m) * 255, 0, 255);
-        byte bi = (byte)Math.Clamp((b + m) * 255, 0, 255);
-        return (uint)(ri << 16 | gi << 8 | bi);
+        if (index <= 0) return 0xFFFFFF;
+        if (index > 255) index = 7;
+        return s_table[index];
     }
 }

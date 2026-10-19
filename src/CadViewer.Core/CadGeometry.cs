@@ -21,21 +21,22 @@ public static class CadGeometry
 
     /// <summary>
     /// 法线 Z 为负的实体由 OCS 转到 WCS 所需的镜像（x→−x）。
+    /// <para>ACadSharp 3.7.1 对类型处理不一致（100 张 --nzfit 实证）：Arc/Circle/IPolyline
+    /// 的坐标仍是 OCS 必须镜像；Line/Ellipse 已归一化为 WCS 再镜像会画反（096/091 实证）。</para>
     /// <para>显示层与本类型的段/环几何必须施加同一份，否则标注高亮会落在 X 镜像位置。</para>
     /// </summary>
     public static SKMatrix OcsMirrorMatrix(Entity e) => e switch
     {
         Arc a => MirrorMatrix(a.Normal),
         Circle c => MirrorMatrix(c.Normal),
-        Line l => MirrorMatrix(l.Normal),
         IPolyline pl => MirrorMatrix(pl.Normal),
-        Ellipse el => MirrorMatrix(el.Normal),
         _ => SKMatrix.Identity,
     };
 
     private static SKMatrix MirrorMatrix(XYZ n)
         => n != null && n.Z < 0 ? SKMatrix.CreateScale(-1, 1) : SKMatrix.Identity;
 
+    // ---------- 几何基础 ----------
     // ---------- 圆弧 / 凸度 ----------
 
     public static SKRect OvalRect(double cx, double cy, double r)
@@ -481,7 +482,7 @@ public static class CadGeometry
                 case Hatch.BoundaryPath.Ellipse ee:
                 {
                     double mx = ee.MajorAxisEndPoint.X, my = ee.MajorAxisEndPoint.Y;
-                    double ratio = ee.MinorToMajorRatio;
+                    double ratio = ee.RadiusRatio;
                     int n = Math.Max(16, (int)Math.Ceiling(Math.Abs(ee.EndAngle - ee.StartAngle) * 180 / Math.PI / 5));
                     for (int k = 0; k <= n; k++)
                     {
@@ -564,8 +565,8 @@ public static class CadGeometry
             case Hatch.BoundaryPath.Ellipse ee:
             {
                 var ax = (float)ee.MajorAxisEndPoint.X; var ay = (float)ee.MajorAxisEndPoint.Y;
-                var bx = (float)(-ee.MajorAxisEndPoint.Y * ee.MinorToMajorRatio);
-                var by = (float)(ee.MajorAxisEndPoint.X * ee.MinorToMajorRatio);
+                var bx = (float)(-ee.MajorAxisEndPoint.Y * ee.RadiusRatio);
+                var by = (float)(ee.MajorAxisEndPoint.X * ee.RadiusRatio);
                 AppendEllipticalArc(path, ee.Center.X, ee.Center.Y, ax, ay, bx, by,
                                     ee.StartAngle, ee.EndAngle, 48);
                 return true;

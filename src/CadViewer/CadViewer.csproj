@@ -13,9 +13,9 @@
   <ItemGroup>
     <!-- Avalonia 12 线。12 已不支持 .NET Framework / .NET Standard，net8.0 为最低受支持目标。 -->
     <!-- SkiaSharp 版本须与 Avalonia.Skia 12.1.2 的依赖保持一致（3.119.4），不可自行升级到 4.x。 -->
-    <PackageReference Include="Avalonia" Version="12.1.2" />
-    <PackageReference Include="Avalonia.Desktop" Version="12.1.2" />
-    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.2" />
+    <PackageReference Include="Avalonia" Version="12.1.4" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.4" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.4" />
     <PackageReference Include="SkiaSharp" Version="3.119.4" />
   </ItemGroup>
 

@@ -8,7 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="ACadSharp" Version="3.4.9" />
+    <PackageReference Include="ACadSharp" Version="3.7.1" />
     <PackageReference Include="NetTopologySuite" Version="2.6.0" />
     <!-- SkiaSharp 版本须与 Avalonia.Skia 12.1.2 的依赖保持一致（3.119.4），避免原生库版本冲突。 -->
     <PackageReference Include="SkiaSharp" Version="3.119.4" />

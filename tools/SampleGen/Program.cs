@@ -179,6 +179,29 @@ using (var writer = new DxfWriter(outPath, doc, false))
     writer.Write();
 }
 
+// ACadSharp 的 DXF 写出端把 HATCH 边界弧角度按弧度原样写进度字段（普通 ARC 实体写得对），
+// 而读入端已按规范把度换弧度 → 整圆边界读回来变成 2π° ≈ 0.11 rad 的一小段，实心填充塌成缝。
+// 真实 DWG 走二进制弧度不受影响，只有本工具产出的 DXF 需要就地修正。
+FixHatchArcDegrees(outPath);
+
+void FixHatchArcDegrees(string path)
+{
+    var lines = File.ReadAllLines(path);
+    int fixedCount = 0;
+    for (int i = 0; i < lines.Length - 3; i++)
+    {
+        if (lines[i].Trim() != "50" || lines[i + 2].Trim() != "51") continue;
+        if (!double.TryParse(lines[i + 3], System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var end)) continue;
+        if (!double.TryParse(lines[i + 1], System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var start)) continue;
+        if (Math.Abs(end - 2 * Math.PI) < 1e-9 && Math.Abs(start) < 1e-9) { lines[i + 3] = "360.0"; fixedCount++; }
+        else if (Math.Abs(end) < 1e-9 && Math.Abs(start) < 1e-9) { lines[i + 3] = "360.0"; fixedCount++; }
+    }
+    if (fixedCount > 0) File.WriteAllLines(path, lines);
+    Console.WriteLine($"填充边界角度修正: {fixedCount} 处");
+}
+
 Console.WriteLine($"已生成: {outPath}");
 Console.WriteLine($"模型空间实体: {doc.Entities.Count()}");
 Console.WriteLine($"图层: {string.Join(", ", doc.Layers.Select(l => l.Name))}");

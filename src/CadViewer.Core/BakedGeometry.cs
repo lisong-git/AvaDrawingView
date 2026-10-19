@@ -19,6 +19,8 @@ public sealed class BakedBucket
     public SKRect Bounds { get; init; }
     /// <summary>本批次合并了多少个实体。</summary>
     public int EntityCount { get; init; }
+    /// <summary>线型虚线间隔（世界单位）；null = 实线。同一批次内线型相同。</summary>
+    public float[]? DashPattern { get; init; }
 }
 
 /// <summary>
@@ -132,14 +134,14 @@ public static class GeometryBaker
             if (e.Path is not null)
             {
                 if (e.LineWidth > 0f) { wide.Add(e); continue; }
-                var acc = Get(map, SizeClassOf(e.Bounds), e.Layer, e.ColorArgb);
+                var acc = Get(map, SizeClassOf(e.Bounds), e.Layer, e.ColorArgb, e.DashPattern);
                 acc.Stroke ??= new SKPath();
                 acc.Stroke.AddPath(e.Path, 0f, 0f);
                 acc.AddBounds(e.Bounds);
             }
             if (e.FillPath is not null)
             {
-                var acc = Get(map, SizeClassOf(e.Bounds), e.Layer, e.ColorArgb);
+                var acc = Get(map, SizeClassOf(e.Bounds), e.Layer, e.ColorArgb, e.DashPattern);
                 acc.Fill ??= new SKPath();
                 acc.Fill.AddPath(e.FillPath, 0f, 0f);
                 acc.AddBounds(e.Bounds);
@@ -162,6 +164,7 @@ public static class GeometryBaker
                     FillPath = kv.Value.Fill,
                     Bounds = kv.Value.HasBounds ? kv.Value.Bounds : SKRect.Empty,
                     EntityCount = kv.Value.Count,
+                    DashPattern = kv.Key.Dash,
                 })
                 .ToArray();
 
@@ -198,9 +201,9 @@ public static class GeometryBaker
         return SizeEdges.Length - 2;
     }
 
-    private static Accum Get(Dictionary<Key, Accum> map, int cls, string layer, uint color)
+    private static Accum Get(Dictionary<Key, Accum> map, int cls, string layer, uint color, float[]? dash)
     {
-        var key = new Key(cls, layer, color);
+        var key = new Key(cls, layer, color, dash);
         if (!map.TryGetValue(key, out var acc))
         {
             acc = new Accum();
@@ -210,7 +213,7 @@ public static class GeometryBaker
         return acc;
     }
 
-    private readonly record struct Key(int Class, string Layer, uint Color);
+    private readonly record struct Key(int Class, string Layer, uint Color, float[]? Dash);
 
     private sealed class Accum
     {

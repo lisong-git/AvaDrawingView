@@ -40,6 +40,11 @@ public sealed class CadEntity
     public TextDraw? Text { get; init; }
     /// <summary>世界单位线宽，0 = 细线（随缩放保持 1px）。</summary>
     public float LineWidth { get; init; }
+    /// <summary>
+    /// 线型虚线间隔（世界单位，按 on/off 交替；null = 实线）。
+    /// 值已含 LTSCALE、实体线型比例与块变换缩放，渲染时直接作为 Skia 路径效果使用。
+    /// </summary>
+    public float[]? DashPattern { get; init; }
     /// <summary>世界坐标包围盒（用于空间索引与视口裁剪）。</summary>
     public SKRect Bounds { get; init; }
 }

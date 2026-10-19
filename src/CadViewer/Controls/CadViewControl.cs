@@ -84,6 +84,9 @@ public class CadViewControl : Control
     private static readonly ConcurrentDictionary<int, SKFont> FontCache = new();
 
     private DisplayList? _display;
+
+    /// <summary>线型间隔 → Skia 路径效果（间隔为世界单位，画布矩阵负责缩放到屏幕）。</summary>
+    private readonly Dictionary<float[], SKPathEffect> _dashEffects = new();
     private bool _pendingFit;
     private Point? _panStart;
     private SKPoint _panOffsetStart;
@@ -317,6 +320,9 @@ public class CadViewControl : Control
         ClearSubPickCore();
     }
 
+    /// <summary>程序化安装二级拾取（与 Ctrl+点/框选同一条高亮与所有权路径；空集合 = 清除）。</summary>
+    public void SetSubEntityPicks(IReadOnlyList<SubEntityPick> picks) => SetSubPicks(picks);
+
     private void ClearSubPickCore()
     {
         _subPicks = null;
@@ -464,6 +470,9 @@ public class CadViewControl : Control
     /// <summary>当前叠加层的图元数（诊断用）。</summary>
     public int OverlayShapeCount => _overlaySnapshot?.Shapes.Count ?? 0;
 
+    /// <summary>当前叠加层是否归二级拾取所有（自检用：标注叠层接管后应为 false）。</summary>
+    public bool SubPickOwnsOverlay => _subPickOwnsOverlay;
+
     /// <summary>
     /// 替换叠加高亮层；传 null 等同于清除。
     ///
@@ -475,6 +484,9 @@ public class CadViewControl : Control
     public void SetOverlay(OverlayLayer? layer)
     {
         var old = _overlaySnapshot;
+        // 外部写入（标注叠层/目标高亮）接管通道：二级拾取的视觉与所有权一并失效 ——
+        // 否则过期的 _subPickOwnsOverlay 会让下一次 ClearSubPick 把别人的叠层清空
+        ReleaseSubPickOwnership();
         if (ReferenceEquals(old, layer)) return;
         _overlaySnapshot = layer;
         if (old is not null) old.Release();
@@ -484,10 +496,20 @@ public class CadViewControl : Control
     /// <summary>清除叠加高亮层。</summary>
     public void ClearOverlay()
     {
+        ReleaseSubPickOwnership();
         if (_overlaySnapshot is null) return;
         _overlaySnapshot.Release();
         _overlaySnapshot = null;
         InvalidateVisual();
+    }
+
+    /// <summary>拾取高亮被替换/清除时同步丢弃所有权与清单，并通知 VM 拾取已空。</summary>
+    private void ReleaseSubPickOwnership()
+    {
+        if (_subPicks == null) return;
+        _subPicks = null;
+        _subPickOwnsOverlay = false;
+        SubEntitiesPicked?.Invoke(this, CurrentSubPicks);
     }
 
     /// <summary>
@@ -594,10 +616,40 @@ public class CadViewControl : Control
 
         _pendingFit = display is not null;
 
+        // 线型路径效果按图缓存（间隔是世界单位，随画布矩阵缩放），换图即失效
+        DisposeDashEffects();
+
         // 同一实例重复 SetDisplay 时不能释放（否则会把正在使用的数据释放掉）
         if (!ReferenceEquals(old, display)) old?.Release();
 
         InvalidateVisual();
+    }
+
+    /// <summary>线型图案整段在屏幕上低于此像素数即按实线绘制。</summary>
+    private const float MinDashPixels = 4f;
+
+    /// <summary>
+    /// 取（并缓存）线型间隔对应的 Skia 路径效果。
+    /// null = 按实线画：无线型，或整段图案在屏幕上不足 <see cref="MinDashPixels"/> 像素
+    /// （AutoCAD 语义：线型过密时退化为实线，否则缩到像素级只剩一片灰雾）。
+    /// </summary>
+    private SKPathEffect? DashEffectOf(float[]? pattern, float zoom)
+    {
+        if (pattern is null || pattern.Length < 2) return null;
+        double total = 0;
+        for (int i = 0; i < pattern.Length; i++) total += pattern[i];
+        if (total * zoom < MinDashPixels) return null;
+
+        if (_dashEffects.TryGetValue(pattern, out var hit)) return hit;
+        var eff = SKPathEffect.CreateDash(pattern, 0);
+        _dashEffects[pattern] = eff;
+        return eff;
+    }
+
+    private void DisposeDashEffects()
+    {
+        foreach (var eff in _dashEffects.Values) eff.Dispose();
+        _dashEffects.Clear();
     }
 
     // ---------- 图层可见性 ----------
@@ -618,6 +670,12 @@ public class CadViewControl : Control
     // ---------- 视口 ----------
 
     /// <summary>
+    /// 「适应窗口」用哪个范围：true=核心区（默认，过滤远处孤立实体）；
+    /// false=全量 <see cref="DisplayList.Extents"/>（看清孤立实体时用，画面会变小）。
+    /// </summary>
+    public bool FitUseCoreExtents { get; set; } = true;
+
+    /// <summary>
     /// 只更新视口，**不**请求重绘。
     /// 切勿在此调用 InvalidateVisual：本方法会被 Render 调用，而在渲染过程中使 Visual
     /// 失效会抛 InvalidOperationException（"Visual was invalidated during the render pass"）。
@@ -625,12 +683,14 @@ public class CadViewControl : Control
     private void UpdateFit()
     {
         if (_display is null) return;
-        Viewport.Fit(_display.Extents, (float)Bounds.Width, (float)Bounds.Height);
+        var target = FitUseCoreExtents ? _display.CoreExtents : _display.Extents;
+        Viewport.Fit(target, (float)Bounds.Width, (float)Bounds.Height);
     }
 
-    /// <summary>适应窗口（菜单 / 按钮 / 双击调用，会请求重绘）。</summary>
-    public void FitToContent()
+    /// <summary>适应窗口（菜单 / 按钮 / 双击调用，会请求重绘）。coreOnly=false 按全量范围。</summary>
+    public void FitToContent(bool coreOnly = true)
     {
+        FitUseCoreExtents = coreOnly;
         UpdateFit();
         InvalidateVisual();
     }
@@ -717,21 +777,43 @@ public class CadViewControl : Control
     protected override void OnPointerMoved(PointerEventArgs e)
     {
         var p = e.GetCurrentPoint(this).Position;
+        var pt = e.GetCurrentPoint(this);
+        // 平移/框选只在对应键仍被物理按下时进行：popup（右键菜单）打开会截断
+        // release 路由，_panStart/_bandStart 残留时鼠标一动画布就跑 —— 键已抬起
+        // 就地清状态，下一次按下重新开始
         if (_panStart is { } start)
         {
-            Viewport.Offset = new SKPoint(
-                _panOffsetStart.X + (float)(p.X - start.X),
-                _panOffsetStart.Y + (float)(p.Y - start.Y));
-            InvalidateVisual();
-            e.Handled = true;
+            if (!pt.Properties.IsMiddleButtonPressed && !pt.Properties.IsRightButtonPressed)
+            {
+                _panStart = null;
+                e.Pointer.Capture(null);
+            }
+            else
+            {
+                Viewport.Offset = new SKPoint(
+                    _panOffsetStart.X + (float)(p.X - start.X),
+                    _panOffsetStart.Y + (float)(p.Y - start.Y));
+                InvalidateVisual();
+                e.Handled = true;
+            }
         }
         else if (_bandStart is { } bs)
         {
-            _bandCurrent = p;
-            var dx = p.X - bs.X; var dy = p.Y - bs.Y;
-            if (dx * dx + dy * dy > 16) _bandActive = true;
-            if (_bandActive) InvalidateVisual();
-            e.Handled = true;
+            if (!pt.Properties.IsLeftButtonPressed)
+            {
+                _bandStart = null;
+                _bandActive = false;
+                e.Pointer.Capture(null);
+                InvalidateVisual();
+            }
+            else
+            {
+                _bandCurrent = p;
+                var dx = p.X - bs.X; var dy = p.Y - bs.Y;
+                if (dx * dx + dy * dy > 16) _bandActive = true;
+                if (_bandActive) InvalidateVisual();
+                e.Handled = true;
+            }
         }
         base.OnPointerMoved(e);
     }
@@ -1038,6 +1120,7 @@ public class CadViewControl : Control
             stroke.StrokeWidth = hairline;
             uint current = 0;
             bool hasColor = false;
+            float[]? currentDash = null;
 
             foreach (var cls in baked.Classes)
             {
@@ -1060,6 +1143,12 @@ public class CadViewControl : Control
                         fill.Color = c;
                     }
 
+                    if (!ReferenceEquals(b.DashPattern, currentDash))
+                    {
+                        currentDash = b.DashPattern;
+                        stroke.PathEffect = _owner.DashEffectOf(currentDash, _zoom);
+                    }
+
                     if (b.StrokePath is not null) canvas.DrawPath(b.StrokePath, stroke);
                     if (b.FillPath is not null) canvas.DrawPath(b.FillPath, fill);
                 }
@@ -1078,6 +1167,7 @@ public class CadViewControl : Control
                     if (!PassesEntityLod(ent.Bounds)) continue;
                     stroke.Color = new SKColor(ResolveColor(ent.ColorArgb));
                     if (ent.LineWidth > 0) stroke.StrokeWidth = ent.LineWidth;
+                    stroke.PathEffect = _owner.DashEffectOf(ent.DashPattern, _zoom);
                     canvas.DrawPath(ent.Path, stroke);
                     if (ent.LineWidth > 0) stroke.StrokeWidth = hairline;
                 }
@@ -1107,6 +1197,7 @@ public class CadViewControl : Control
                 if (!ent.Bounds.IntersectsWith(worldRect)) continue;
                 stroke.Color = new SKColor(ResolveColor(ent.ColorArgb));
                 stroke.StrokeWidth = ent.LineWidth > 0 ? ent.LineWidth : hairline;
+                stroke.PathEffect = _owner.DashEffectOf(ent.DashPattern, _zoom);
                 canvas.DrawPath(ent.Path, stroke);
             }
             canvas.Restore();
