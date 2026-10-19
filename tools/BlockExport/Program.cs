@@ -24,9 +24,9 @@ using ACadSharp;
 using ACadSharp.Entities;
 using ACadSharp.IO;
 using ACadSharp.Tables;
-using CadViewer.Tools.Shared;
+using DrawingView.Tools.Shared;
 
-namespace CadViewer.Tools.BlockExport;
+namespace DrawingView.Tools.BlockExport;
 
 internal static class Program
 {

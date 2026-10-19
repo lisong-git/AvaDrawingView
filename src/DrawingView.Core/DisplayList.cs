@@ -1,7 +1,7 @@
 using SkiaSharp;
 using System.Threading.Tasks;
 
-namespace CadViewer.Core;
+namespace DrawingView.Core;
 
 /// <summary>
 /// 整图显示数据：不可变快照。后台构建完成后通过引用替换交付给渲染线程（无锁）。
@@ -11,7 +11,7 @@ namespace CadViewer.Core;
 /// 不会提前释放，采用引用计数：</para>
 /// <list type="bullet">
 ///   <item>构造完成的实例引用计数为 1，代表"构建方持有"；</item>
-///   <item>把实例交给 <c>CadViewControl.SetDisplay</c> 即**转移所有权**给控件，之后不要再自行 Release；</item>
+///   <item>把实例交给 <c>DrawingView.SetDisplay</c> 即**转移所有权**给控件，之后不要再自行 Release；</item>
 ///   <item>绘制操作（<c>CadDrawOperation</c>）在构造时 <see cref="AddRef"/>、在
 ///         <see cref="Release"/> 被 Avalonia 调用 Dispose 时归还；</item>
 ///   <item>计数归零才真正释放 SKPath。</item>

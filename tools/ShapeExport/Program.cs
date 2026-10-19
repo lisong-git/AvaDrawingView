@@ -35,9 +35,9 @@
 using System.Text;
 using ACadSharp;
 using ACadSharp.Entities;
-using CadViewer.Tools.Shared;
+using DrawingView.Tools.Shared;
 
-namespace CadViewer.Tools.ShapeExport;
+namespace DrawingView.Tools.ShapeExport;
 
 internal static class Program
 {

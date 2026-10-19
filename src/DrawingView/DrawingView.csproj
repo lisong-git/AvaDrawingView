@@ -20,7 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\CadViewer.Core\CadViewer.Core.csproj" />
+    <ProjectReference Include="..\DrawingView.Core\DrawingView.Core.csproj" />
   </ItemGroup>
 
 </Project>

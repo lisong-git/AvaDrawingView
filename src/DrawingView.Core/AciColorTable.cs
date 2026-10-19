@@ -1,4 +1,4 @@
-namespace CadViewer.Core;
+namespace DrawingView.Core;
 
 /// <summary>
 /// AutoCAD Color Index (ACI 0-255) → RGB 转换。

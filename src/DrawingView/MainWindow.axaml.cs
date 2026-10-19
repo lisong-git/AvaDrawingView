@@ -4,9 +4,9 @@ using System.Linq;
 using System.Threading.Tasks;
 using Avalonia.Controls;
 using Avalonia.Platform.Storage;
-using CadViewer.Core;
+using DrawingView.Core;
 
-namespace CadViewer;
+namespace DrawingView;
 
 public partial class MainWindow : Window
 {
@@ -57,7 +57,7 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// 窗口打开后尝试自动加载命令行指定的图纸。
-    /// 用法：CadViewer.exe D:\path\to\file.dxf；无参数或文件不存在时保持空窗口。
+    /// 用法：DrawingView.exe D:\path\to\file.dxf；无参数或文件不存在时保持空窗口。
     /// </summary>
     protected override void OnOpened(EventArgs e)
     {
@@ -90,16 +90,16 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// 诊断日志：仅当环境变量 CADVIEWER_DIAG=1 时，向 %TEMP%\cadviewer_diag.log 追加一行。
+    /// 诊断日志：仅当环境变量 DrawingView_DIAG=1 时，向 %TEMP%\DrawingView_diag.log 追加一行。
     /// 用于排查命令行自动加载问题，正常使用不写任何文件。
     /// </summary>
     private static void WriteDiag(string message)
     {
-        if (Environment.GetEnvironmentVariable("CADVIEWER_DIAG") != "1") return;
+        if (Environment.GetEnvironmentVariable("DrawingView_DIAG") != "1") return;
         try
         {
             var line = $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}";
-            File.AppendAllText(Path.Combine(Path.GetTempPath(), "cadviewer_diag.log"), line);
+            File.AppendAllText(Path.Combine(Path.GetTempPath(), "DrawingView_diag.log"), line);
         }
         catch
         {

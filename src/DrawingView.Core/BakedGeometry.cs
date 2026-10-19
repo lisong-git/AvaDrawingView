@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using SkiaSharp;
 
-namespace CadViewer.Core;
+namespace DrawingView.Core;
 
 /// <summary>
 /// 合并绘制批次：同一 (图层, 颜色) 的所有细线几何合并进单个 SKPath。
@@ -55,7 +55,7 @@ public sealed class BakedBucketSet
 ///   GpuLineBuffer / GpuArcBuffer / GpuPolylineBuffer ...  → Buckets（按颜色合并）
 ///   ViewportFilteringService / ViewportBoundsCache        → BakedBucket.Bounds 整批剔除
 ///   MinEntityPixelSize（LOD）                             → Classes 尺寸分档
-///   MaxViewportEntities（上限保护）                        → 见 CadViewControl 的双路切换
+///   MaxViewportEntities（上限保护）                        → 见 DrawingView 的双路切换
 /// </summary>
 public sealed class BakedGeometry : IDisposable
 {

@@ -1,7 +1,7 @@
 using ACadSharp.Entities;
 using SkiaSharp;
 
-namespace CadViewer.Core;
+namespace DrawingView.Core;
 
 /// <summary>
 /// 实体变换约定：块定义坐标 → 世界坐标。

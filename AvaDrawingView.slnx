@@ -1,7 +1,7 @@
 <Solution>
   <Folder Name="/src/">
-    <Project Path="src/CadViewer.Core/CadViewer.Core.csproj" />
-    <Project Path="src/CadViewer/CadViewer.csproj" />
+    <Project Path="src/DrawingView.Core/DrawingView.Core.csproj" />
+    <Project Path="src/DrawingView/DrawingView.csproj" />
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/SmokeTest/SmokeTest.csproj" />

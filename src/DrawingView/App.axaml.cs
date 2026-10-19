@@ -3,7 +3,7 @@ using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Markup.Xaml;
 using Avalonia.Threading;
 
-namespace CadViewer;
+namespace DrawingView;
 
 public class App : Application
 {

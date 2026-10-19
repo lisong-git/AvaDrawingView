@@ -1,6 +1,6 @@
 using SkiaSharp;
 
-namespace CadViewer.Core;
+namespace DrawingView.Core;
 
 /// <summary>
 /// 视口状态：世界 → 屏幕的缩放/平移。

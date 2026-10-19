@@ -2,7 +2,7 @@ using System.Reflection;
 using ACadSharp;
 using ACadSharp.Entities;
 using ACadSharp.Tables;
-using CadViewer.Core;
+using DrawingView.Core;
 
 // ACadSharp API 反射探针：改代码前先在这里确认属性名，不要猜。
 // 用法：dotnet run --project tools/Probe -- [可选 dgw/dxf 路径]
@@ -38,7 +38,7 @@ if (flagType is not null)
     Console.WriteLine("LayerFlags: " + string.Join(", ", Enum.GetNames(flagType)));
 
 // ---------- 样例文件：图层表实况 ----------
-var path = args.Length > 0 ? args[0] : @"D:\Work\上海八局\Avalonia2dDWG\samples\sample_r12.dxf";
+var path = args.Length > 0 ? args[0] : @"D:\Work\上海八局\AvaDrawingView\samples\sample_r12.dxf";
 Console.WriteLine();
 Console.WriteLine($"=== 加载 {path} ===");
 if (!File.Exists(path)) { Console.WriteLine("文件不存在"); return; }

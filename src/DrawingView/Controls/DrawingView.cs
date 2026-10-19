@@ -6,10 +6,10 @@ using Avalonia.Input;
 using Avalonia.Media;
 using Avalonia.Rendering.SceneGraph;
 using Avalonia.Skia;
-using CadViewer.Core;
+using DrawingView.Core;
 using SkiaSharp;
 
-namespace CadViewer.Controls;
+namespace DrawingView.Controls;
 
 /// <summary>
 /// 2D CAD 视图控件。
@@ -23,7 +23,7 @@ namespace CadViewer.Controls;
 ///   2. 逐实体路径：可见比例低时仍走 R 树剔除 + 逐实体绘制（此时可见实体少，更快）。
 ///   3. 两条路都施加同一套 LOD 与配色规则，切换时画面一致。
 /// </summary>
-public class CadViewControl : Control
+public class DrawingView : Control
 {
     /// <summary>
     /// 文本字体。必须与 <see cref="TextMetrics"/> 度量用的是同一个，
@@ -58,7 +58,7 @@ public class CadViewControl : Control
     public float MinEntityPixelSize { get; set; } = 1.5f;
 
     public static readonly StyledProperty<SKColor> BackgroundColorProperty =
-        AvaloniaProperty.Register<CadViewControl, SKColor>(nameof(BackgroundColor), SKColors.Black);
+        AvaloniaProperty.Register<DrawingView, SKColor>(nameof(BackgroundColor), SKColors.Black);
 
     public SKColor BackgroundColor
     {
@@ -580,7 +580,7 @@ public class CadViewControl : Control
     /// <summary>文本绘制的最小像素高度，低于此值跳过。</summary>
     public float MinTextPixelSize { get; set; } = DefaultMinTextPixelSize;
 
-    public CadViewControl()
+    public DrawingView()
     {
         Focusable = true;
         ClipToBounds = true;
@@ -895,7 +895,7 @@ public class CadViewControl : Control
 
     private sealed class CadDrawOperation : ICustomDrawOperation
     {
-        private readonly CadViewControl _owner;
+        private readonly DrawingView _owner;
         private readonly Rect _bounds;
         private readonly DisplayList _list;
         private readonly float _zoom;
@@ -906,7 +906,7 @@ public class CadViewControl : Control
         private readonly OverlayLayer? _overlay;
         private readonly SKColor _bg;
 
-        public CadDrawOperation(CadViewControl owner, Rect bounds, DisplayList list, float zoom, SKPoint offset,
+        public CadDrawOperation(DrawingView owner, Rect bounds, DisplayList list, float zoom, SKPoint offset,
                                 HashSet<string> hidden, float minTextPx, float minEntityPx,
                                 OverlayLayer? overlay)
         {

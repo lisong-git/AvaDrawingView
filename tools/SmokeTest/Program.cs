@@ -1,4 +1,4 @@
-using CadViewer.Core;
+using DrawingView.Core;
 using SkiaSharp;
 
 // 核心链路冒烟测试：解析 → 转换 → 索引 → 查询。
@@ -16,10 +16,10 @@ using SkiaSharp;
 // 结果同时写 Console 与日志文件。**必须写日志文件**：本机 PowerShell 重定向
 // 会把原生命令的 UTF-8 输出按 GBK 解码，中文断言名全变乱码（[Console]::OutputEncoding
 // 在 PS 5.1 非交互重定向下不生效），日志文件才是可靠通道。
-// 日志路径：环境变量 CADVIEWER_SMOKE_LOG，默认 %TEMP%\cadviewer_smoke.log
+// 日志路径：环境变量 DrawingView_SMOKE_LOG，默认 %TEMP%\DrawingView_smoke.log
 
-var logPath = Environment.GetEnvironmentVariable("CADVIEWER_SMOKE_LOG")
-              ?? Path.Combine(Path.GetTempPath(), "cadviewer_smoke.log");
+var logPath = Environment.GetEnvironmentVariable("DrawingView_SMOKE_LOG")
+              ?? Path.Combine(Path.GetTempPath(), "DrawingView_smoke.log");
 try { File.WriteAllText(logPath, string.Empty); } catch { /* 日志不可写不影响主流程 */ }
 
 void Log(string message = "")
@@ -215,8 +215,8 @@ void RunFeatureSample(string path)
     Check(list.Extents.Bottom > 218f && list.Extents.Bottom < 232f,
           $"范围下边界在 MTEXT 顶部（实际 {list.Extents.Bottom:F2}，字体度量相关）");
 
-    // ---- 诊断导出（设 CADVIEWER_SMOKE_DUMP=1 可打印全部实体，便于核对断言） ----
-    if (Environment.GetEnvironmentVariable("CADVIEWER_SMOKE_DUMP") == "1") DumpEntities(list);
+    // ---- 诊断导出（设 DrawingView_SMOKE_DUMP=1 可打印全部实体，便于核对断言） ----
+    if (Environment.GetEnvironmentVariable("DrawingView_SMOKE_DUMP") == "1") DumpEntities(list);
 
     // ---- 取消令牌 ----
     bool cancelled = false;

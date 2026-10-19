@@ -1,7 +1,7 @@
 using System;
 using Avalonia;
 
-namespace CadViewer;
+namespace DrawingView;
 
 internal static class Program
 {

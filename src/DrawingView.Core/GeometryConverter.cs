@@ -4,7 +4,7 @@ using ACadSharp.Tables;
 using CSMath;
 using SkiaSharp;
 
-namespace CadViewer.Core;
+namespace DrawingView.Core;
 
 public sealed class GeometryConvertOptions
 {
@@ -59,8 +59,8 @@ public sealed class GeometryConverter
     /// <summary>图纸里被关闭或冻结的图层：打开时应默认隐藏。</summary>
     public IReadOnlyCollection<string> InitiallyHiddenLayers => _initiallyHidden;
 
-    private static readonly bool ConvTrace = Environment.GetEnvironmentVariable("CADVIEWER_CONV_TRACE") == "1";
-    private static readonly bool ShowInvisible = Environment.GetEnvironmentVariable("CADVIEWER_SHOW_INVISIBLE") == "1";
+    private static readonly bool ConvTrace = Environment.GetEnvironmentVariable("DrawingView_CONV_TRACE") == "1";
+    private static readonly bool ShowInvisible = Environment.GetEnvironmentVariable("DrawingView_SHOW_INVISIBLE") == "1";
     private static readonly string TracePath = Path.Combine(Path.GetTempPath(), "conv_trace.log");
     private static int _traceSeq;
 
@@ -139,7 +139,7 @@ public sealed class GeometryConverter
         // 实体被显式隐藏（DXF 组码 60 = 1，AutoCAD 亦不显示）。
         // 实测测试图.dwg：7836 个源实体带此标记（其中 1734 个 INSERT），展开约 5 万个显示实体；
         // 过滤后全图墨迹覆盖率 3.06% → 2.03%，经与 AutoCAD 语义核对属于正确行为而非内容丢失。
-        // CADVIEWER_SHOW_INVISIBLE=1 可关闭过滤（仅供与第三方渲染器对照基准用）。
+        // DrawingView_SHOW_INVISIBLE=1 可关闭过滤（仅供与第三方渲染器对照基准用）。
         if (e.IsInvisible && !ShowInvisible) { Skipped++; return; }
 
         var prevHandle = _currentHandle;

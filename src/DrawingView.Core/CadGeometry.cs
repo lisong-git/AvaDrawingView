@@ -4,7 +4,7 @@ using ACadSharp.Entities;
 using CSMath;
 using SkiaSharp;
 
-namespace CadViewer.Core;
+namespace DrawingView.Core;
 
 /// <summary>
 /// 实体几何 → <see cref="SKPath"/>（**局部坐标**，调用方自己施加世界变换）。

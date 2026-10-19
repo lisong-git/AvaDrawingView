@@ -1,4 +1,4 @@
-# Avalonia2dDWG — Avalonia 2D CAD 查看器
+# AvaDrawingView — Avalonia 2D CAD 查看器
 
 参考 ReadCAD 的 2D 技术思路（ACadSharp 解析 + Skia GPU 自绘）在 Avalonia 中实现的纯 2D 图纸查看器。**不做 3D**。
 
@@ -29,7 +29,7 @@
 
 ## 技术要点
 
-- **渲染**：`CadViewControl` → `Render` → `context.Custom(ICustomDrawOperation)` → `ISkiaSharpApiLeaseFeature.Lease()` 借用 Avalonia 自带 Skia GPU 上下文直接绘制，**无任何 GL/D3D 互操作层**（ReadCAD 在 WPF 里需要 Vortice+D3DImage，Avalonia 不需要）
+- **渲染**：`DrawingView` → `Render` → `context.Custom(ICustomDrawOperation)` → `ISkiaSharpApiLeaseFeature.Lease()` 借用 Avalonia 自带 Skia GPU 上下文直接绘制，**无任何 GL/D3D 互操作层**（ReadCAD 在 WPF 里需要 Vortice+D3DImage，Avalonia 不需要）
 - **线程模型**：解析/转换/索引在后台线程完成后产出不可变 `DisplayList`，引用替换交给渲染线程，渲染回调只读无锁
 - **资源生命周期**：`DisplayList` 持有原生 `SKPath`（GC 看不见），用 `AddRef`/`Release` 引用计数——绘制操作在构造时 `AddRef`、`Dispose` 时 `Release`，UI 线程换图时 `Release` 旧实例。计数归零才真正释放，避免"渲染线程还在画、UI 线程已释放"的用例
 - **精度**：圆/弧用圆锥曲线（任意缩放不失真），椭圆/样条压平
@@ -46,8 +46,8 @@
 ## 构建运行
 
 ```powershell
-dotnet build Avalonia2dDWG.slnx -c Debug
-dotnet run --project src\CadViewer          # 启动 GUI
+dotnet build AvaDrawingView.slnx -c Debug
+dotnet run --project src\DrawingView          # 启动 GUI
 dotnet run --project tools\SmokeTest        # 核心链路冒烟测试（解析→转换→索引，54 项断言）
 dotnet run --project tools\UiSmokeTest      # UI 渲染冒烟测试（无头，不弹窗口）
 dotnet run --project tools\PerfProbe -- "D:\path\to.dwg"   # 性能基准（--load-only 只测加载；--repeat 8 验内存泄漏）
@@ -99,14 +99,14 @@ dotnet run --project tools\ShapeExport -- "D:\src.dwg" "D:\out"   # 默认输出
 > 改渲染相关代码后请同时跑 `tools\UiSmokeTest`。`SmokeTest` 不经过 Avalonia 渲染管线，
 > 无法拦截"渲染期非法操作"这类缺陷（例如在 `Render` 内调用 `InvalidateVisual`）。
 > 改渲染性能相关代码后请跑 `tools\PerfProbe` 并与 `AGENTS.md` 中的基线表对比。
-> 两项冒烟测试都会把结果同时写一份 UTF-8 日志文件（`CADVIEWER_SMOKE_LOG` /
-> `CADVIEWER_UISMOKE_LOG` 指定路径），Windows 下控制台重定向会把中文变成乱码，日志文件更可靠。
+> 两项冒烟测试都会把结果同时写一份 UTF-8 日志文件（`DrawingView_SMOKE_LOG` /
+> `DrawingView_UISMOKE_LOG` 指定路径），Windows 下控制台重定向会把中文变成乱码，日志文件更可靠。
 
 ## 结构
 
 ```
-src/CadViewer.Core      # 无 UI 依赖：解析、几何转换、烘焙批次、显示列表、文本度量、空间索引、视口
-src/CadViewer           # Avalonia 应用：CadViewControl、主窗口、图层面板
+src/DrawingView.Core      # 无 UI 依赖：解析、几何转换、烘焙批次、显示列表、文本度量、空间索引、视口
+src/DrawingView           # Avalonia 应用：DrawingView、主窗口、图层面板
 tools/SmokeTest         # 样例 DXF 全链路测试（解析→转换→索引，54 项精确断言）
 tools/UiSmokeTest       # 无头 Avalonia 渲染测试（真实跑渲染管线）
 tools/PerfProbe         # 性能基准（加载分段 / 内存 / 帧耗时 / LOD 扫描 / 墨迹覆盖率 / 泄漏验证）

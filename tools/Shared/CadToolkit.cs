@@ -8,7 +8,7 @@ using ACadSharp.Entities;
 using ACadSharp.IO;
 using ACadSharp.Tables;
 
-namespace CadViewer.Tools.Shared;
+namespace DrawingView.Tools.Shared;
 
 /// <summary>图纸读写 + 通用小工具。</summary>
 public static class CadIo

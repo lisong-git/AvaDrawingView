@@ -1,7 +1,7 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:c="clr-namespace:CadViewer.Controls"
-        x:Class="CadViewer.MainWindow"
+        xmlns:c="clr-namespace:DrawingView.Controls"
+        x:Class="DrawingView.MainWindow"
         Title="Avalonia 2D DWG 查看器"
         Width="1280" Height="800"
         WindowStartupLocation="CenterScreen">
@@ -28,6 +28,6 @@
     </Border>
 
     <!-- CAD 视图 -->
-    <c:CadViewControl x:Name="View" />
+    <c:DrawingView x:Name="View" />
   </DockPanel>
 </Window>

@@ -6,7 +6,7 @@
 
 using ACadSharp.Entities;
 
-namespace CadViewer.Tools.ShapeExport;
+namespace DrawingView.Tools.ShapeExport;
 
 /// <summary>2D 仿射变换：x' = A·x + C·y + E，y' = B·x + D·y + F。</summary>
 internal readonly struct Xform

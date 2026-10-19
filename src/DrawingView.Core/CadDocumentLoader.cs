@@ -1,7 +1,7 @@
 using ACadSharp.IO;
 using SkiaSharp;
 
-namespace CadViewer.Core;
+namespace DrawingView.Core;
 
 /// <summary>
 /// 图纸加载：后台线程 解析 → 几何转换 → 索引构建，产出不可变 DisplayList。

@@ -2,7 +2,7 @@ using NetTopologySuite.Geometries;
 using NetTopologySuite.Index.Strtree;
 using SkiaSharp;
 
-namespace CadViewer.Core;
+namespace DrawingView.Core;
 
 /// <summary>
 /// 基于 NTS STRtree (R树) 的空间索引：视口裁剪 + 拾取查询。

@@ -16,7 +16,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\CadViewer\CadViewer.csproj" />
+    <ProjectReference Include="..\..\src\DrawingView\DrawingView.csproj" />
   </ItemGroup>
 
 </Project>

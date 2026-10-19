@@ -4,12 +4,12 @@ using Avalonia.Headless;
 using Avalonia.Input;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform;
-using CadViewer.Controls;
-using CadViewer.Core;
+using DrawingView.Controls;
+using DrawingView.Core;
 using SkiaSharp;
 using System.Runtime.InteropServices;
 
-// UI 冒烟测试：让 CadViewControl 在无头 Avalonia 平台上真实跑一遍
+// UI 冒烟测试：让 DrawingView 在无头 Avalonia 平台上真实跑一遍
 // SetDisplay → 布局 → 渲染管线，专门拦截"渲染期间非法操作"这类
 // 只有真正渲染才会暴露的缺陷（tools/SmokeTest 不经过渲染管线，覆盖不到）。
 //
@@ -17,10 +17,10 @@ using System.Runtime.InteropServices;
 // InvalidOperationException: Visual was invalidated during the render pass。
 //
 // 结果同时写 Console 与日志文件（本机控制台重定向偶发丢输出，日志文件更可靠）。
-// 日志路径：环境变量 CADVIEWER_UISMOKE_LOG，默认 %TEMP%\cadviewer_uismoke.log
+// 日志路径：环境变量 DrawingView_UISMOKE_LOG，默认 %TEMP%\DrawingView_uismoke.log
 
-var logPath = Environment.GetEnvironmentVariable("CADVIEWER_UISMOKE_LOG")
-              ?? Path.Combine(Path.GetTempPath(), "cadviewer_uismoke.log");
+var logPath = Environment.GetEnvironmentVariable("DrawingView_UISMOKE_LOG")
+              ?? Path.Combine(Path.GetTempPath(), "DrawingView_uismoke.log");
 File.WriteAllText(logPath, string.Empty);
 
 void Log(string message)
@@ -54,7 +54,7 @@ int Run(string[] argv)
 
     Log($"无头平台启动（Skia 真实绘制），样例: {samplePath}");
 
-    AppBuilder.Configure<CadViewer.App>()
+    AppBuilder.Configure<DrawingView.App>()
         .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false })
         .UseSkia()
         .SetupWithoutStarting();
@@ -67,7 +67,7 @@ int Run(string[] argv)
         if (!ok) fails++;
     }
 
-    var view = new CadViewControl();
+    var view = new DrawingView.Controls.DrawingView();
     var window = new Window { Width = 800, Height = 600, Content = view };
     window.Show();
     Log($"窗口已显示，控件布局 {view.Bounds.Width:F0}x{view.Bounds.Height:F0}");
@@ -253,7 +253,7 @@ int Run(string[] argv)
           $"换图后叠加层原生几何已归还（DisposedCount {disposedBeforeOverlay} → {OverlayLayer.DisposedCount}）");
 
     view.MinEntityPixelSize = 1.5f;
-    view.MinTextPixelSize = CadViewControl.DefaultMinTextPixelSize;
+    view.MinTextPixelSize = DrawingView.Controls.DrawingView.DefaultMinTextPixelSize;
 
     if (fails == 0)
     {
@@ -304,10 +304,10 @@ static int CountMagenta(WriteableBitmap? frame)
     return count;
 }
 
-/// <summary>可选：把当前帧导出为 PNG（环境变量 CADVIEWER_UISMOKE_PNG），供人工核对观感。</summary>
+/// <summary>可选：把当前帧导出为 PNG（环境变量 DrawingView_UISMOKE_PNG），供人工核对观感。</summary>
 static void DumpFrame(Window window, Action<string> log)
 {
-    var png = Environment.GetEnvironmentVariable("CADVIEWER_UISMOKE_PNG");
+    var png = Environment.GetEnvironmentVariable("DrawingView_UISMOKE_PNG");
     if (string.IsNullOrEmpty(png)) return;
     try
     {

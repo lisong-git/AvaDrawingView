@@ -1,12 +1,12 @@
 using SkiaSharp;
 using System.Threading.Tasks;
 
-namespace CadViewer.Core;
+namespace DrawingView.Core;
 
 /// <summary>
 /// 叠加高亮图元：世界坐标的一段几何 + 画法。
 ///
-/// <para><b>为什么需要它</b>：<c>CadViewControl.SetSelection</c> 只能选中"整个 CadEntity"，
+/// <para><b>为什么需要它</b>：<c>DrawingView.SetSelection</c> 只能选中"整个 CadEntity"，
 /// 但标注场景的目标可以比一个实体更细 —— 多段线的某一段、填充的某个环、
 /// 块引用内的某个子实体。这些目标在 <see cref="DisplayList"/> 里都不存在独立身份
 /// （一条 LwPolyline 就是一个 <see cref="CadEntity"/>），因此必须有一条
@@ -61,7 +61,7 @@ public sealed class OverlayShape
 /// 一批叠加高亮几何，带引用计数（语义与 <see cref="DisplayList"/> 完全一致）。
 ///
 /// <para><b>所有权</b>：构造完成时计数为 1（构建方持有）；交给
-/// <c>CadViewControl.SetOverlay</c> 即转移所有权给控件，之后不要自行 Release；
+/// <c>DrawingView.SetOverlay</c> 即转移所有权给控件，之后不要自行 Release；
 /// 绘制操作构造时 AddRef、被 Avalonia 回调 Dispose 时 Release；计数归零才释放
 /// 底下的 <see cref="SKPath"/>。</para>
 ///

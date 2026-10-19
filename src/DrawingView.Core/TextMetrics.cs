@@ -1,14 +1,14 @@
 using System.Collections.Concurrent;
 using SkiaSharp;
 
-namespace CadViewer.Core;
+namespace DrawingView.Core;
 
 /// <summary>
 /// 文本度量：转换阶段（算包围盒）与渲染阶段（真正画字）必须用同一字体，
 /// 否则包围盒与实际墨迹不符。
 ///
 /// 背景（2026-09-16 实测修正）：原实现用 <c>raw.Length * height * 0.7</c> 粗估宽度，
-/// 样例里 "Hello CADViewer"（15 字符 / 字高 6）估出半宽 63，而真实渲染宽度约 40，
+/// 样例里 "Hello DrawingView"（15 字符 / 字高 6）估出半宽 63，而真实渲染宽度约 40，
 /// 直接把整图 Extents 左边界从 0 撑到 -53（宽度虚增 34%），后果是打开图纸时画面明显偏小且左偏。
 /// 改用 Skia 真实度量后包围盒与墨迹一致。
 /// </summary>

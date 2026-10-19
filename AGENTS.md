@@ -1,4 +1,4 @@
-# Avalonia2dDWG — AI Agent 上下文
+# AvaDrawingView — AI Agent 上下文
 
 跨平台 2D CAD 查看器（DWG/DXF），参考 ReadCAD 的自绘渲染思路，**明确不做 3D**。
 
@@ -10,14 +10,14 @@
 - 渲染核心：`Control.Render` → `ICustomDrawOperation` → `ISkiaSharpApiLeaseFeature.Lease()` 直接借 Avalonia 的 Skia GPU 上下文，**零互操作层**
 - 显示数据为不可变快照，原子替换，渲染线程无锁；原生几何（`SKPath`）由 `DisplayList` 引用计数释放
   （`AddRef`/`Release`，见「显示保真与资源释放」第 4 节），**GC 管不到原生内存**
-- 画布背景：`CadViewControl.BackgroundColor`（StyledProperty，默认 **黑**）；清屏与「与背景同色实体反转」
+- 画布背景：`DrawingView.BackgroundColor`（StyledProperty，默认 **黑**）；清屏与「与背景同色实体反转」
   （黑底画黑线 → 反转成白）都以它为准，两条渲染路径必须用同一套规则
 
 ## 项目结构
 
 ```
-src/CadViewer.Core/   核心库：解析、几何转换、空间索引、视口、文本度量、烘焙批次
-src/CadViewer/        Avalonia 应用：CadViewControl 渲染控件 + 主窗口
+src/DrawingView.Core/   核心库：解析、几何转换、空间索引、视口、文本度量、烘焙批次
+src/DrawingView/        Avalonia 应用：DrawingView 渲染控件 + 主窗口
 tools/SmokeTest/      冒烟测试（解析→转换→索引全链路，不经过渲染管线，52 项精确断言）
 tools/UiSmokeTest/    UI 冒烟测试（无头 Avalonia 真实跑渲染管线，拦截"渲染期非法操作"类缺陷，21 项断言含像素级校验）
 tools/PerfProbe/      性能基准（加载分段耗时 / 内存 / 逐缩放帧耗时 / LOD 扫描 / 墨迹覆盖率 / 泄漏验证）
@@ -34,8 +34,8 @@ docs/                 分析报告等技术文档
 ## 构建与运行
 
 ```bash
-dotnet build Avalonia2dDWG.slnx        # 注意是 .slnx，不是 .sln
-dotnet run --project src/CadViewer     # 启动 GUI
+dotnet build AvaDrawingView.slnx        # 注意是 .slnx，不是 .sln
+dotnet run --project src/DrawingView     # 启动 GUI
 dotnet run --project tools/SmokeTest   # 核心链路冒烟（不要加 --nologo，会被当应用参数）
 dotnet run --project tools/UiSmokeTest # UI 渲染冒烟（无头，不弹窗口）
 dotnet run --project tools/PerfProbe -- "D:\path\to.dwg"   # 性能基准（--load-only 只测加载，--repeat 8 验泄漏）
@@ -51,7 +51,7 @@ powershell -ExecutionPolicy Bypass -File tools\regress.ps1   # 明细写仓库�
 ```
 
 两项冒烟测试都会把结果**同时**写 Console 和一份 UTF-8 日志文件
-（`CADVIEWER_SMOKE_LOG` / `CADVIEWER_UISMOKE_LOG` 指定路径，默认落 `%TEMP%`）。
+（`DrawingView_SMOKE_LOG` / `DrawingView_UISMOKE_LOG` 指定路径，默认落 `%TEMP%`）。
 Windows 下必须读日志文件：PowerShell 重定向原生命令 stdout 用的是 ANSI 码页，
 dotnet 的 UTF-8 中文会整体变乱码（`[Console]::OutputEncoding` 在 PS 5.1 非交互重定向下不生效）。
 
@@ -75,12 +75,12 @@ Avalonia 的渲染管线，所以像"渲染期调用 InvalidateVisual"这类缺�
 
 我们的 Skia 等价物（零互操作栈）：
 
-1. **几何烘焙合并**（`CadViewer.Core/BakedGeometry.cs`，Skia 版 GpuBuffer）
+1. **几何烘焙合并**（`DrawingView.Core/BakedGeometry.cs`，Skia 版 GpuBuffer）
    加载线程把实体按 **(世界尺寸档, 图层, 颜色)** 合并成少量 SKPath。
    实测 5.36MB 图纸（85,515 个可显示实体）→ **214 个批次**（压缩 399 倍），烘焙仅 38–46ms。
    每帧 DrawPath 次数从 8.5 万降到批次数级，且同色批次连续绘制不再抖动 SKPaint 状态。
    有线宽（8,210 个）与文本（9,999 个）实体不合并，走逐实体 + LOD 路径。
-2. **双路渲染**（`CadViewControl`）
+2. **双路渲染**（`DrawingView`）
    可见比例高（缩小/全图）→ 批次路径；可见比例低（放大）→ R树剔除 + 逐实体路径。
    用"视口面积/图纸面积"估算可见数做切换，避免为决策先跑一次十几万条目的 R树查询。
    **两条路必须施加同一套 LOD 与配色规则**，否则切换瞬间画面会跳变。
@@ -89,7 +89,7 @@ Avalonia 的渲染管线，所以像"渲染期调用 InvalidateVisual"这类缺�
    因为比较的是档上界，**永远不会剔掉屏幕上可见的实体**，最坏只是多留一档。
 4. **文本 LOD + 字体缓存**（`MinTextPixelSize=5`；SKFont 按整数像素缓存复用，
    修掉了原实现每字 new SKPaint 且不释放的泄漏）。
-5. **性能自观测**：`CadViewControl.LastDrawMs / AverageDrawMs / DrawCount`
+5. **性能自观测**：`DrawingView.LastDrawMs / AverageDrawMs / DrawCount`
    （对应 ReadCAD 的 PerformanceMonitorService），由绘制操作用 Interlocked 写入。
 
 ### 实测基线（5.36MB / 1600x900 无头，12 帧中位）
@@ -165,7 +165,7 @@ private static void AddArcTo(SKPath path, SKRect oval, double startRad, double s
 ### 2. 文本包围盒必须走真实字体度量（`TextMetrics`）
 原实现用 `raw.Length * height * 0.7` 估宽度，样例里 15 字符 × 字号 6 估出 halfW≈63
 （真实渲染宽约 49），把 `Extents` 左边界从 0 虚增到 **-53** → 开图后 `Fit()` 画面偏小偏左。
-现统一走 `CadViewer.Core/TextMetrics.cs`：
+现统一走 `DrawingView.Core/TextMetrics.cs`：
 - 插入点语义 = **基线左端**，与 `canvas.DrawText(text, 0, 0, font, paint)` 一致；
 - `MeasureLocalBounds(text, height)` → `ToWorldBounds(local, origin, rotationRad)`；
 - 度量与渲染**共用同一个 `TextMetrics.SharedTypeface`**，否则"量出来的框"和"画出来的字"对不上；
@@ -197,7 +197,7 @@ private static void AddArcTo(SKPath path, SKRect oval, double startRad, double s
 现在 `DisplayList : IDisposable` 用引用计数：
 - `CadDocumentLoader.Load()` 返回时计数 = 1；
 - `CadDrawOperation` 构造时 `AddRef()`、`Dispose()` 时 `Release()`（Avalonia 会在绘制操作销毁时调用）；
-- `CadViewControl.SetDisplay()` 换图时 `Release()` 旧实例；`ReferenceEquals` 相同实例不重复释放；
+- `DrawingView.SetDisplay()` 换图时 `Release()` 旧实例；`ReferenceEquals` 相同实例不重复释放；
 - 计数归零才 `DisposeCore()`：释放全部实体的 `Path`/`FillPath` + `BakedGeometry`；
 - `DisplayList.Empty` 是共享单例（`IsSharedInstance`），`AddRef/Release` 对它空操作；
 - `DisplayList.DisposedCount` 是静态计数，专供测试断言"确实释放了"。
@@ -236,7 +236,7 @@ WER 事件 0xc0000005 实证）。`OverlayLayer` 共用同一延迟。测试/基
 `tools/Probe` 结尾还有一段「OwnHandle 验证」，用**独立遍历块表**的方式
 逐条证实 `(外层句柄 → 目标块 → 自身句柄)` 的可达性（实测 70881 实体 / 68669 条块内实体全通过）。
 
-### 7. 叠加高亮通道：`CadViewControl.SetOverlay`
+### 7. 叠加高亮通道：`DrawingView.SetOverlay`
 `SetSelection` 只能选中**整个 `CadEntity`**。但标注场景的目标可以更细 ——
 多段线的某一段、填充的某个环、块引用内的某个子实体 —— 这些在 `DisplayList`
 里没有独立身份（一条 `LwPolyline` 就是一个 `CadEntity`），因此需要一条
@@ -258,7 +258,7 @@ view.ClearOverlay();
 - **`SetDisplay` 会自动清空叠加层**：它的几何是上一张图的世界坐标，留着会画到错误位置。
 - 回归防线：UiSmokeTest 有 10 条断言，**像素级**（`CaptureRenderedFrame` 里数洋红像素）——
   画面上确有叠加层、LOD 全剔除后仍在、清除后归零、换图后自动清空且原生几何已归还。
-  `CADVIEWER_UISMOKE_PNG=<路径>` 可导出该帧 PNG 供人工核对观感。
+  `DrawingView_UISMOKE_PNG=<路径>` 可导出该帧 PNG 供人工核对观感。
 
 ### 8. 多段线凸度归属：42 组码管「本顶点 → 下一顶点」（2026-09-23 修正）
 
@@ -328,7 +328,7 @@ view.ClearOverlay();
 
 ### 12. 画布鼠标语义：左键点选/框选，平移走中键/右键（2026-09-25）
 
-- `CadViewControl` 输入约定（对齐 WPF/Teigha 的 `MouseMode.Selection`）：
+- `DrawingView` 输入约定（对齐 WPF/Teigha 的 `MouseMode.Selection`）：
   **左键单击 = 点选**（释放时位移 ≤4px），**左键按下拖动 = 框选**（橡皮筋矩形），
   **中键/右键拖动 = 平移**，**Esc = 取消**（框选拖动中只取消橡皮筋，否则清空选择），
   **双击中键 = 适应窗口（Zoom Extents）**。旧实现"左键拖动 = 平移"、"左键双击 = 适应窗口"
@@ -419,12 +419,12 @@ view.ClearOverlay();
   `cd <路径> && ...` 也会失败。此时**一律改用 PowerShell**，并把输出重定向到 `.tmp` 日志文件再用 Read 读取：
   ```powershell
   $log = "D:\...\.build.tmp.log"
-  (dotnet build Avalonia2dDWG.slnx -c Debug --nologo) 2>&1 | Out-File -Encoding utf8 $log
+  (dotnet build AvaDrawingView.slnx -c Debug --nologo) 2>&1 | Out-File -Encoding utf8 $log
   ```
 - 部分会话中 PowerShell **输出捕获异常**（stdout 为空）：同样重定向到日志文件再 Read
 - **`dotnet run` 跑控制台程序时 stdout 经常整段丢失**（本会话实测：只拿到第一行就没了）。
   可靠做法是**让被测程序自己写 UTF-8 日志文件**，再 Read 那个文件——`tools/UiSmokeTest`、
-  `tools/SmokeTest`（`CADVIEWER_UISMOKE_LOG` / `CADVIEWER_SMOKE_LOG`）与 `tools/PerfProbe`
+  `tools/SmokeTest`（`DrawingView_UISMOKE_LOG` / `DrawingView_SMOKE_LOG`）与 `tools/PerfProbe`
   都是这么做的，`tools/Probe` 用 `PROBE_LOG`。
 - **PowerShell 重定向原生命令 stdout 会按 ANSI 码页解码**，dotnet 输出的 UTF-8 中文变成
   双重编码乱码（`实` → `瀹炰綋`）；`[Console]::OutputEncoding = UTF8` 在 PS 5.1 非交互重定向下

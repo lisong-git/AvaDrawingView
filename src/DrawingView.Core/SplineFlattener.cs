@@ -1,6 +1,6 @@
 using SkiaSharp;
 
-namespace CadViewer.Core;
+namespace DrawingView.Core;
 
 /// <summary>B 样条 (NURBS) 压平：de Boor 递推求值。</summary>
 public static class SplineFlattener

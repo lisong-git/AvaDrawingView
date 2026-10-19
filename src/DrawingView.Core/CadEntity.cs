@@ -1,6 +1,6 @@
 using SkiaSharp;
 
-namespace CadViewer.Core;
+namespace DrawingView.Core;
 
 /// <summary>文字绘制信息（屏幕空间绘制，位置/高度均为世界坐标）。</summary>
 public sealed class TextDraw

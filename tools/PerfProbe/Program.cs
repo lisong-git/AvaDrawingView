@@ -3,8 +3,8 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Headless;
 using Avalonia.Threading;
-using CadViewer.Controls;
-using CadViewer.Core;
+using DrawingView.Controls;
+using DrawingView.Core;
 using SkiaSharp;
 
 // 大图性能基准探针：把"卡顿"拆成可测量的分段，先定位瓶颈再优化。
@@ -12,10 +12,10 @@ using SkiaSharp;
 //   阶段 B：内存占用
 //   阶段 C：逐缩放级别的每帧渲染耗时（静态重绘 / 平移）
 // 结果写 Console + 日志文件（本机控制台重定向偶发丢输出）。
-// 日志路径：环境变量 CADVIEWER_PERF_LOG，默认 %TEMP%\cadviewer_perf.log
+// 日志路径：环境变量 DrawingView_PERF_LOG，默认 %TEMP%\DrawingView_perf.log
 
-var logPath = Environment.GetEnvironmentVariable("CADVIEWER_PERF_LOG")
-              ?? Path.Combine(Path.GetTempPath(), "cadviewer_perf.log");
+var logPath = Environment.GetEnvironmentVariable("DrawingView_PERF_LOG")
+              ?? Path.Combine(Path.GetTempPath(), "DrawingView_perf.log");
 File.WriteAllText(logPath, string.Empty);
 
 void Log(string message)
@@ -138,12 +138,12 @@ int Run(string[] argv)
     {
         Log("");
         Log($"--- 泄漏验证：连续打开同一图纸 {repeatCount} 次 ---");
-        AppBuilder.Configure<CadViewer.App>()
+        AppBuilder.Configure<DrawingView.App>()
             .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false })
             .UseSkia()
             .SetupWithoutStarting();
 
-        var memView = new CadViewControl();
+        var memView = new DrawingView.Controls.DrawingView();
         var memWindow = new Window { Width = 1200, Height = 800, Content = memView };
         memWindow.Show();
 
@@ -169,13 +169,13 @@ int Run(string[] argv)
     Log("--- 阶段 C：渲染 ---");
     Log("初始化无头 Avalonia（Skia 真实绘制）…");
 
-    AppBuilder.Configure<CadViewer.App>()
+    AppBuilder.Configure<DrawingView.App>()
         .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false })
         .UseSkia()
         .SetupWithoutStarting();
 
     const int W = 1600, H = 900;
-    var view = new CadViewControl();
+    var view = new DrawingView.Controls.DrawingView();
     var window = new Window { Width = W, Height = H, Content = view };
     window.Show();
     Log($"控件尺寸: {view.Bounds.Width:F0} x {view.Bounds.Height:F0}");
@@ -214,7 +214,7 @@ int Run(string[] argv)
     Log($"平移 {panMs.Count} 帧: 中位 {panMs.Median:F1} ms / p95 {panMs.P95:F1} ms / 最慢 {panMs.Max:F1} ms → 中位 FPS {1000.0 / Math.Max(panMs.Median, 0.001):F1}");
 
     // ---------- LOD 阈值扫描（对应 ReadCAD 的 MinEntityPixelSize） ----------
-    var pngDir = Path.Combine(Path.GetTempPath(), "cadviewer_perf_png");
+    var pngDir = Path.Combine(Path.GetTempPath(), "DrawingView_perf_png");
     Log("");
     Log("--- LOD 阈值扫描（MinEntityPixelSize，耗时均为 12 帧中位） ---");
     Log($"对比图输出: {pngDir}");
@@ -288,7 +288,7 @@ void PrintSizeDistribution(DisplayList list)
 
 // ---------- 辅助 ----------
 
-static int CountVisible(DisplayList list, CadViewControl view, int w, int h)
+static int CountVisible(DisplayList list, DrawingView.Controls.DrawingView view, int w, int h)
 {
     var vp = view.Viewport;
     var p0 = vp.ScreenToWorld(new SKPoint(0, 0));
@@ -339,7 +339,7 @@ static (double Ink, int NonWhite, string? Png) CaptureAndAnalyze(Window window, 
 ///   绘制  —— Custom draw op 自身耗时（不含固定开销，用于配置间对比，噪声小）
 /// 首版测量漏了预热与 GC 隔离，同一配置两次相差 25%，据此下的结论都不可信。
 /// </summary>
-static Stats MeasureFrames(Window window, CadViewControl view, int frames)
+static Stats MeasureFrames(Window window, DrawingView.Controls.DrawingView view, int frames)
 {
     for (int i = 0; i < 3; i++)
     {
@@ -364,7 +364,7 @@ static Stats MeasureFrames(Window window, CadViewControl view, int frames)
     return new Stats(samples) { DrawSamples = drawSamples };
 }
 
-static Stats MeasurePanFrames(Window window, CadViewControl view, int frames, float step)
+static Stats MeasurePanFrames(Window window, DrawingView.Controls.DrawingView view, int frames, float step)
 {
     var samples = new List<double>(frames);
     for (int i = 0; i < frames; i++)

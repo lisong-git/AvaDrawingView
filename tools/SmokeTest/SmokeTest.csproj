@@ -9,7 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\CadViewer.Core\CadViewer.Core.csproj" />
+    <ProjectReference Include="..\..\src\DrawingView.Core\DrawingView.Core.csproj" />
   </ItemGroup>
 
 </Project>

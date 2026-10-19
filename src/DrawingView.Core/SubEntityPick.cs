@@ -1,6 +1,6 @@
 using SkiaSharp;
 
-namespace CadViewer.Core;
+namespace DrawingView.Core;
 
 /// <summary>
 /// 二级拾取结果：比一个 <see cref="CadEntity"/> 更细的画布点选目标
