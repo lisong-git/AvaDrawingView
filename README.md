@@ -48,10 +48,10 @@
 ```powershell
 dotnet build AvaDrawingView.slnx -c Debug
 dotnet run --project src\DrawingView          # 启动 GUI
-dotnet run --project tools\SmokeTest        # 核心链路冒烟测试（解析→转换→索引，54 项断言）
+dotnet run --project tools\SmokeTest        # 核心链路冒烟测试（解析→转换→索引，289 项断言）
 dotnet run --project tools\UiSmokeTest      # UI 渲染冒烟测试（无头，不弹窗口）
 dotnet run --project tools\PerfProbe -- "D:\path\to.dwg"   # 性能基准（--load-only 只测加载；--repeat 8 验内存泄漏）
-dotnet run --project tools\SampleGen        # 重新生成 samples\sample_features.dxf
+dotnet run --project tools\SampleGen        # 重新生成 samples\ 下的样例图纸（含 sample_far.dxf 大坐标样例）
 dotnet run --project tools\BlockExport -- "D:\path\to.dwg" "D:\out" --referenced   # 按块导出独立 DWG
 dotnet run --project tools\ShapeExport -- "D:\path\to.dwg" "D:\out"               # 按相交分组导出独立 DWG
 dotnet run --project tools\DwgCapture -- "D:\path\to.dwg" "D:\out\shot.png"       # 无头渲染 PNG
@@ -64,6 +64,19 @@ powershell -ExecutionPolicy Bypass -File tools\regress.ps1
 ```
 
 需要 .NET 8 SDK。
+
+### 渲染对照 / 实体诊断开关
+
+```powershell
+dotnet run --project tools\DwgCapture -- "D:\src.dwg" "D:\out\shot.png" --rect 31114,-15132,31142,-15111 --report
+dotnet run --project tools\PerfProbe  -- "D:\src.dwg" --types                 # 实体类型直方图 + ACIS 载荷概览
+dotnet run --project tools\PerfProbe  -- "D:\src.dwg" --dump-sab D:\out\a.sab # 导出首条 ACIS 载荷
+$env:DrawingView_NO_REGION = "1"                                              # 关掉 REGION 轮廓，做像素 A/B
+```
+
+- `--rect left,top,right,bottom`：只渲染指定世界坐标窗口，用于同一定点区域的开/关对照
+- `--report` 的 JSON 含 `regionEntities / regionLoops / regionUnresolved / pointMarkEntities`
+- `PerfProbe --types`：实体类型直方图 + 前 14 条 SAB 记录（指针后标目标类型）；`--points` 列点实体
 
 ### BlockExport：块导出为独立 DWG
 
@@ -108,7 +121,7 @@ dotnet run --project tools\ShapeExport -- "D:\src.dwg" "D:\out"   # 默认输出
 ```
 src/DrawingView.Core      # 无 UI 依赖：解析、几何转换、烘焙批次、显示列表、文本度量、空间索引、视口
 src/DrawingView           # Avalonia 应用：DrawingView、主窗口、图层面板
-tools/SmokeTest         # 样例 DXF 全链路测试（解析→转换→索引，262 项精确断言）
+tools/SmokeTest         # 样例 DXF 全链路测试（解析→转换→索引，289 项精确断言）
 tools/UiSmokeTest       # 无头 Avalonia 渲染测试（真实跑渲染管线，40 项像素/几何断言）
 tools/PerfProbe         # 性能基准（加载分段 / 内存 / 帧耗时 / LOD 扫描 / 墨迹覆盖率 / 泄漏验证）
 tools/SampleGen         # 生成 samples\sample_features.dxf（覆盖全部实体类型与边界情况）
@@ -124,13 +137,14 @@ samples/                # 样例图纸
 ## 已知限制 / 后续（P1+）
 
 > 2026-10-21 已修完渲染保真整改文档（`docs/渲染保真对照与整改方案-2026-10-20.md`）的
-> P0 / P1 全部与 P2-1…P2-6、P2-9：文字口径、布局空间、HATCH 孤岛、ATTRIB、线宽、
+> P0 / P1 全部与 P2-1…P2-7、P2-9：文字口径、布局空间、HATCH 孤岛、ATTRIB、线宽、
 > 变宽多段线、曲线精度、POINT 点样式、MTEXT 断行/行距/逐行对齐、通用 OCS、
-> SPLINE 权重与闭合、不打印图层默认隐藏。
+> SPLINE 权重与闭合、REGION 轮廓重建（ACIS/SAB）、不打印图层默认隐藏。
 
 - 大图纸优化：SKPicture 静态层录制、分块缓存、块实例复用（当前 INSERT 为烘焙克隆）
 - SHX / 单线字体未支持：当前统一走系统字体（雅黑）回退，字宽与字形与原图有差异
-- REGION / 3DSOLID 不渲染：ACadSharp 不读 ACIS 实体，需外接 ODA/ACIS 或维持跳过计数
+- 3DSOLID / BODY / SURFACE 不渲染：**REGION 已支持**（ACIS 的 SAB 二进制载荷由
+  `AcisSab` + `RegionOutline` 自建重建，见 P2-7）；三维实体投到 XY 会互相穿插，暂不处理
 - 大坐标（图纸范围 ±1e6）下 float32 精度：深度放大时几何可能抖动
   （ReadCAD 用 `EnableGpuFloatingOrigin` 解决）
 - 选择拾取、属性面板、测量、GUI 内 PNG 导出（命令行 `tools/DwgCapture` 已提供无头 PNG）

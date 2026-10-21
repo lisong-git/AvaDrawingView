@@ -46,6 +46,10 @@ public static class CadDocumentLoader
                              + $"跳过占位符 {converter.AttributeDefsSkipped}");
         if (converter.LineWeightEntities > 0)
             progress?.Report($"线宽：{converter.LineWeightEntities} 个实体带线宽（状态栏「显示线宽」打开后生效）");
+        if (converter.RegionEntities + converter.RegionUnresolved > 0)
+            progress?.Report($"REGION：{converter.RegionEntities} 个重建轮廓（{converter.RegionLoops} 环）"
+                             + (converter.RegionUnresolved > 0
+                                ? $"，{converter.RegionUnresolved} 个无法解析（ACIS 载荷异常）" : ""));
         if (converter.NonPlottingLayers > 0)
             progress?.Report($"不打印图层：{converter.NonPlottingLayers} 个已默认隐藏"
                              + "（对应 AutoCAD 的 DEFPOINTS，可在图层面板打开）");
@@ -84,6 +88,9 @@ public static class CadDocumentLoader
             LineWeightEntities = converter.LineWeightEntities,
             WidePolylineEntities = converter.WidePolylineEntities,
             PointMarkEntities = converter.PointMarkEntities,
+            RegionEntities = converter.RegionEntities,
+            RegionLoops = converter.RegionLoops,
+            RegionUnresolved = converter.RegionUnresolved,
             WorldUnitsPerMm = converter.WorldUnitsPerMm,
         };
     }

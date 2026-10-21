@@ -61,6 +61,8 @@ if (explicitPath is not null)
         RunHatchFileSample(explicitPath);
     else if (name.Contains("lineweight", StringComparison.OrdinalIgnoreCase))
         RunLineWeightFileSample(explicitPath);
+    else if (name.Contains("region", StringComparison.OrdinalIgnoreCase))
+        RunRegionChecks();
     else if (name.Contains("widepoly", StringComparison.OrdinalIgnoreCase))
         RunWidePolylineFileSample(explicitPath);
     else
@@ -105,6 +107,8 @@ var wideSample = FindSample("sample_widepolyline.dxf");
 if (wideSample is not null) RunWidePolylineFileSample(wideSample);
 var hatchSample = FindSample("sample_hatch.dxf");
 if (hatchSample is not null) RunHatchFileSample(hatchSample);
+RunRegionChecks();
+RunFarCoordinateChecks();
 
 Log();
 Log(fails == 0 ? "SMOKE TEST PASSED" : $"SMOKE TEST FAILED ({fails} 项)");
@@ -482,6 +486,143 @@ void RunMTextSample(string path)
     if (wrapped is not null)
         Check(Near(wrapped.LineSpacingFactor, TextMetrics.LineSpacingFactor, 1e-3f),
               $"未指定行距倍数时用默认 1.667（实际 {wrapped.LineSpacingFactor:F3}）");
+}
+
+// ---------------------------------------------------------------- 大坐标 float32 精度（P2-8）
+
+/// <summary>
+/// 大坐标（±1e6）下的 float32 量化误差测量。
+///
+/// <para>几何在显示列表里是 <c>float</c>：1e6 处 的 ulp = 0.0625 单位，也就是 1e6 附近
+/// 任何顶点最多偏 0.0625 个世界单位。这个偏差在整图视角下无感，但放大到 0.01 单位/像素时
+/// 就是 6 个像素。断言把**当前量级**钉住：既不假装没误差，也不让误差悄悄变大。</para>
+/// </summary>
+void RunFarCoordinateChecks()
+{
+    Log();
+    Log("=== 大坐标 float32 精度（P2-8）===");
+    var p = FindSample("sample_far.dxf");
+    if (p is null) { Log("  SKIP: 找不到 samples/sample_far.dxf"); return; }
+
+    var list = CadDocumentLoader.Load(p);
+    Check(list.Entities.Count == 12, $"两组各 6 个实体（实际 {list.Entities.Count}）");
+
+    // 方框左上角顶点：理想 (0,0) 与 (1e6,1e6)
+    (float ex, float ey)? FindCorner(float nearX, float nearY)
+    {
+        float best = float.MaxValue; (float, float)? hit = null;
+        foreach (var e in list.Entities)
+            foreach (var pt in e.Path.Points)
+            {
+                float d = MathF.Abs(pt.X - nearX) + MathF.Abs(pt.Y - nearY);
+                if (d < best) { best = d; hit = (pt.X, pt.Y); }
+            }
+        return hit;
+    }
+
+    const double farIdeal = 1_000_000.3;
+    const float far = (float)farIdeal;
+    var cNear = FindCorner(0, 0);
+    var cFar = FindCorner(far, far);
+    Check(cNear is not null && cFar is not null, "两组方框角点都找到");
+    if (cNear is null || cFar is null) return;
+
+    float eNear = MathF.Abs(cNear.Value.Item1) + MathF.Abs(cNear.Value.Item2);
+    float eFar = (float)(Math.Abs(cFar.Value.Item1 - farIdeal) + Math.Abs(cFar.Value.Item2 - farIdeal));
+    Log($"  原点组角点误差 {eNear:F6}，1e6 组角点误差 {eFar:F6}（float32 在 1e6 的 ulp = 0.0625）");
+
+    Check(eNear < 1e-3f, $"原点处几何无量化误差（{eNear:F6}）");
+    Check(eFar <= 0.125f + 1e-4f, $"1e6 处误差不超过 2 个 ulp（{eFar:F6} ≤ 0.125，1 ulp = 0.0625）");
+
+    // 尺寸不受量化影响：同一个 10×10 方框，两组的包围盒宽高应一致
+    var farBox = list.Entities.Where(e => e.Bounds.Left > 900_000f).Select(e => e.Bounds).ToList();
+    float fw = farBox.Max(b => b.Right) - farBox.Min(b => b.Left);
+    Check(Near(fw, 10f, 0.13f), $"1e6 处方框宽度仍是 10（实际 {fw:F4}，量化误差 ≤ 0.125）");
+
+    // 视口矩阵：world×zoom 会被放大成 1e8 量级，float 矩阵的平移/乘积都会量化。
+    // 这条量的是"渲染管线本身的误差"，与几何存储无关。
+    foreach (float z in new[] { 1f, 10f, 58f, 1000f })
+    {
+        var mtx = new SKMatrix(z, 0, 0, 0, -z, 0, 0, 0, 1);
+        var s1 = mtx.MapPoint(new SKPoint(far + 0.3f, far + 0.7f));
+        double expX = (double)z * (far + 0.3);
+        double errPx = Math.Abs(s1.X - expX) + Math.Abs(s1.Y + (double)z * (far + 0.7));
+        Log($"  zoom={z,6} → 屏幕坐标误差 {errPx,8:F2} px");
+    }
+
+    Log($"  结论：±1e6 时几何已按 float32 存储，误差上限 0.0625 单位/顶点；"
+        + "形状不受影响（整体平移），深度放大时有台阶。");
+}
+
+// ---------------------------------------------------------------- REGION / ACIS（P2-7）
+
+/// <summary>
+/// REGION 的 ACIS 载荷 → B-rep 轮廓重建。
+///
+/// <para>样例 <c>samples/sample_region.sab</c> 是从 <c>3、幕墙横方总汇.dwg</c> 里导出的一条真实
+/// REGION 载荷（20961 字节，SAB 二进制）—— 用真数据而不是手搓的 mock，才能覆盖
+/// 「子类型+基类名两段记录头」「椭圆弧参数方向」「coedge 链回环」这些真实坑。</para>
+/// </summary>
+void RunRegionChecks()
+{
+    Log();
+    Log("=== REGION / ACIS 轮廓重建（P2-7）===");
+    var p = FindSample("sample_region.sab");
+    if (p is null) { Log("  SKIP: 找不到 samples/sample_region.sab"); return; }
+
+    var data = File.ReadAllBytes(p);
+    Check(AcisSab.LooksLikeSab(data), $"识别为 SAB 载荷（{data.Length} 字节）");
+
+    // 空 / 垃圾数据必须干净失败，不能抛也不能给出半截几何
+    Check(AcisSab.Parse(null) is null, "Parse(null) → null");
+    Check(AcisSab.Parse(new byte[] { 1, 2, 3 }) is null, "Parse(垃圾字节) → null");
+    Check(RegionOutline.TryBuild(null, out _) is null, "TryBuild(null) → null");
+    Check(RegionOutline.TryBuild(new byte[] { 1, 2, 3 }, out var why) is null && why is not null,
+          $"TryBuild(垃圾字节) → null 且带原因（{why}）");
+
+    var recs = AcisSab.Parse(data);
+    Check(recs is not null, "记录流解析成功");
+    if (recs is null) return;
+
+    int Count(string name) => recs.Count(r => r.TypeName == name);
+    Check(Count("coedge") == 65, $"coedge 记录 65 条（实际 {Count("coedge")}）");
+    Check(Count("edge") == 65, $"edge 记录 65 条（实际 {Count("edge")}）");
+    Check(Count("vertex") == 65, $"vertex 记录 65 条（实际 {Count("vertex")}）");
+    Check(Count("point") == 65, $"point 记录 65 条（实际 {Count("point")}）");
+    Check(Count("straight") + Count("ellipse") == 65,
+          $"曲线记录 65 条（实际 straight={Count("straight")} + ellipse={Count("ellipse")}）");
+    Check(Count("plane") == 1, $"面所在曲面是 1 条 plane（实际 {Count("plane")}）");
+    Check(recs.All(r => r.TypeName.All(c => char.IsAsciiLetter(c) || c is '_' or '-' or ' ')),
+          "没有残缺记录名（错位时会出现 eye / ref_vt 这类垃圾名）");
+
+    // 指针与记录位置一致：body→lump→shell→face→loop 的链必须走得通
+    var body = recs.FirstOrDefault(r => r.TypeName == "body");
+    Check(body is not null, "存在 body 记录");
+
+    var loops = RegionOutline.TryBuild(data, out var reason);
+    Check(loops is not null, $"轮廓重建成功（{(loops is null ? reason : $"{loops.Count} 环")}）");
+    if (loops is null) return;
+
+    Check(loops.Count == 1, $"单环区域（实际 {loops.Count} 环）");
+    var path = loops[0];
+    Check(path.PointCount == 692, $"环上有 692 个点（实际 {path.PointCount}）");
+    Check(path.PointCount > 65,
+          $"点数多于顶点数 → 椭圆弧已被采样（{path.PointCount} 点 vs 65 顶点）");
+
+    var b = path.Bounds;
+    Check(Near(b.Left, 31115.37f, 0.5f) && Near(b.Top, -15130.88f, 0.5f)
+          && Near(b.Right, 31141.12f, 0.5f) && Near(b.Bottom, -15112.88f, 0.5f),
+          $"包围盒 ({b.Left:F2},{b.Top:F2}) - ({b.Right:F2},{b.Bottom:F2}) 与实测一致");
+    Check(b.Width > 25f && b.Width < 26.5f, $"宽度 ≈ 25.75（实际 {b.Width:F3}）");
+
+    var pts = path.Points;
+    Check(pts.Length > 2 && Near(pts[0].X, pts[^1].X, 1e-3f) && Near(pts[0].Y, pts[^1].Y, 1e-3f),
+          $"闭合：首点 ({pts[0].X:F2},{pts[0].Y:F2}) = 末点 ({pts[^1].X:F2},{pts[^1].Y:F2})");
+
+    // 顶点坐标必须落在包围盒内（错位解析常会得到 0 或天文数字）
+    Check(pts.All(q => q.X >= b.Left - 0.01f && q.X <= b.Right + 0.01f
+                    && q.Y >= b.Top - 0.01f && q.Y <= b.Bottom + 0.01f),
+          "所有点都在包围盒内（无 NaN / 无越界）");
 }
 
 // ---------------------------------------------------------------- 不打印图层

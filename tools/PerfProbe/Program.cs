@@ -41,9 +41,10 @@ int Run(string[] argv)
     int repeatIdx = Array.IndexOf(argv, "--repeat");
     if (repeatIdx >= 0 && repeatIdx + 1 < argv.Length) int.TryParse(argv[repeatIdx + 1], out repeatCount);
 
+    int dumpSabIdx = Array.IndexOf(argv, "--dump-sab");
     var path = argv
         .Select((a, i) => (arg: a, idx: i))
-        .Where(t => !t.arg.StartsWith("--") && t.idx != repeatIdx + 1)
+        .Where(t => !t.arg.StartsWith("--") && t.idx != repeatIdx + 1 && t.idx != dumpSabIdx + 1)
         .Select(t => t.arg)
         .FirstOrDefault() ?? @"D:\Downloads\测试图.dwg";
     if (!File.Exists(path)) { Log($"FAIL: 找不到 {path}"); return 1; }
@@ -91,6 +92,9 @@ int Run(string[] argv)
         var texts = list.Entities.Count(e => e.Text is not null);
         Log($"   文本实体 {texts} 个；点/文本 = {(texts > 0 ? (double)marks.Count / texts : 0):F2}");
     }
+
+    if (argv.Contains("--types"))
+        DumpEntityTypes(path);
 
     // 视口裁剪有效性：按文件大小估算全图查询规模
     var allHit = list.Index.Query(list.Extents);
@@ -260,6 +264,148 @@ int Run(string[] argv)
     Log("");
     Log("--- 阶段 C 结束 ---");
     return 0;
+
+    // ---------------------------------------------------------------- 诊断：实体类型与 ACIS
+    /// <summary>
+    /// 实体类型直方图 + REGION/3DSOLID 一类「模型器几何」的 ACIS 数据概览。
+    ///
+    /// <para>为什么要这个：这类实体在当前渲染器里完全不画（P2-7），排查第一步是搞清楚
+    /// 图纸里到底有多少、ACadSharp 有没有把 ACIS 载荷读出来、载荷是 SAT 文本还是 SAB 二进制
+    /// —— 三者决定后续是「解析 SAT 画真实轮廓」「扫 SAB 拿顶点」还是「只能降级虚线框」。</para>
+    /// </summary>
+    void DumpEntityTypes(string file)
+    {
+        ACadSharp.CadDocument doc;
+        var ext = Path.GetExtension(file).ToLowerInvariant();
+        if (ext == ".dwg") { using var r = new ACadSharp.IO.DwgReader(file); doc = r.Read(); }
+        else { using var r = new ACadSharp.IO.DxfReader(file); doc = r.Read(); }
+
+        var counts = new Dictionary<string, int>();
+        void Tally(IEnumerable<ACadSharp.Entities.Entity> ents)
+        {
+            foreach (var e in ents)
+            {
+                var n = e.GetType().Name;
+                counts[n] = counts.GetValueOrDefault(n) + 1;
+            }
+        }
+
+        var blockEnts = doc.BlockRecords.SelectMany(b => b.Entities).ToList();
+        Tally(doc.Entities);
+        Tally(blockEnts);
+
+        Log("");
+        Log($"--- 诊断：实体类型（模型空间 {doc.Entities.Count()} + 块定义 {blockEnts.Count}）---");
+        foreach (var kv in counts.OrderByDescending(k => k.Value).Take(30))
+            Log($"   {kv.Key,-26} {kv.Value,8:N0}");
+
+        var modelers = doc.Entities.Concat(blockEnts)
+                          .OfType<ACadSharp.Entities.ModelerGeometry>().ToList();
+        int withData = modelers.Count(g => g.AcisData is { Length: > 0 });
+        int binary = modelers.Count(g => g.AcisData is { Length: > 0 } && g.IsBinaryAcisData);
+        int withText = modelers.Count(g => g.GetAcisText() is { Length: > 0 });
+        Log($"--- 模型器几何（REGION / 3DSOLID / BODY / SURFACE）：{modelers.Count} 条 ---");
+        Log($"   ACIS 非空 {withData}，其中 SAB 二进制 {binary}，可取 SAT 文本 {withText}");
+
+        var first = modelers.FirstOrDefault(g => g.GetAcisText() is { Length: > 0 });
+        if (first is not null)
+        {
+            var text = first.GetAcisText()!;
+            Log($"   首条 SAT 长度 {text.Length} 字符（前 24 行，注意记录类型与字段顺序）：");
+            foreach (var line in text.Replace("\r\n", "\n").Split('\n').Take(24))
+                Log($"      | {line.TrimEnd()}");
+        }
+        else
+        {
+            var sab = modelers.FirstOrDefault(g => g.AcisData is { Length: > 0 })?.AcisData;
+            if (sab is not null)
+            {
+                Log($"   首条 SAB {sab.Length} 字节，ASCII 片段（判断有哪些记录标签）：");
+                var sb = new System.Text.StringBuilder();
+                foreach (var b in sab)
+                    sb.Append(b >= 32 && b < 127 ? (char)b : '.');
+                var ascii = sb.ToString();
+                var tags = System.Text.RegularExpressions.Regex.Matches(ascii, "[a-z_]{3,24}")
+                                    .Select(m => m.Value).Where(s => s.Length >= 3).ToList();
+                Log($"      {string.Join(" ", tags.Take(60))}");
+                var recs = AcisSab.Parse(sab);
+                if (recs is null) { Log("   SAB 解析失败（未知标记或截断）"); return; }
+                var byName = recs.GroupBy(r => r.TypeName).OrderByDescending(g => g.Count()).Take(14)
+                                 .Select(g => $"{g.Key}={g.Count()}");
+                Log($"   解析成功：{recs.Count} 条记录 —— {string.Join(", ", byName)}");
+                // --dump-sab <path>：把首条模型器实体的 ACIS 载荷存成样例（回归用例用真数据最靠谱）
+                int sabOutIdx = argv.ToList().IndexOf("--dump-sab");
+                if (sabOutIdx >= 0 && sabOutIdx + 1 < argv.Length)
+                {
+                    var dumper = modelers.FirstOrDefault(g => g.AcisData is { Length: > 0 });
+                    if (dumper is not null)
+                    {
+                        File.WriteAllBytes(argv[sabOutIdx + 1], dumper.AcisData!);
+                        Log($"   已导出 ACIS 载荷 → {argv[sabOutIdx + 1]}（{dumper.AcisData!.Length} 字节）");
+                    }
+                }
+
+                Log($"   ---- RegionOutline 重建 ----");
+                int okReg = 0, failReg = 0, paths = 0, pts = 0;
+                var reasons = new Dictionary<string, int>();
+                foreach (var g in modelers)
+                {
+                    var loops = RegionOutline.TryBuild(g.AcisData, out var why);
+                    if (loops is null)
+                    {
+                        failReg++;
+                        reasons[why ?? "?"] = reasons.GetValueOrDefault(why ?? "?") + 1;
+                        continue;
+                    }
+                    okReg++; paths += loops.Count;
+                    foreach (var lp in loops) pts += lp.PointCount;
+                    if (okReg <= 3)
+                    {
+                        var b = loops[0].Bounds;
+                        Log($"   REGION#{okReg}: {loops.Count} 环, 首环 {loops[0].PointCount} 点, "
+                            + $"bbox {b.Left:F2},{b.Top:F2} → {b.Right:F2},{b.Bottom:F2}");
+                    }
+                }
+                // 失败个例解剖：第一条失败的 REGION 的 loop/coedge/edge 记录长什么样
+                var bad = modelers.FirstOrDefault(g => RegionOutline.TryBuild(g.AcisData, out _) is null);
+                var badRecs = bad is null ? null : AcisSab.Parse(bad.AcisData);
+                if (badRecs is not null)
+                {
+                    Log($"   --- 失败个例解剖（{badRecs.Count} 条记录）---");
+                    foreach (var (r, idx) in badRecs.Select((r, i) => (r, i))
+                             .Where(t => t.r.TypeName is "loop" or "coedge" or "edge" or "vertex" or "point")
+                             .Take(16))
+                    {
+                        var parts = r.Values.Select(v => v.Kind == AcisKind.Pointer
+                            ? $"@{v.I}{{( {(v.I >= 0 && v.I < badRecs.Count ? badRecs[(int)v.I].TypeName : "?")} )}}"
+                            : v.ToString());
+                        Log($"      [{idx,3}] {r.TypeName,-8}: {string.Join(" ", parts)}");
+                    }
+                }
+
+                Log($"   成功 {okReg} / 失败 {failReg}，共 {paths} 环 {pts} 点"
+                    + (reasons.Count > 0 ? $"，失败原因：{string.Join(", ", reasons.Select(kv => $"{kv.Key}={kv.Value}"))}" : ""));
+
+                Log($"   记录表（索引: 名字: 属性；指针后注明目标类型）：");
+                for (int ri = 0; ri < Math.Min(14, recs.Count); ri++)
+                {
+                    var r = recs[ri];
+                    var parts = new List<string>();
+                    foreach (var v in r.Values)
+                    {
+                        if (v.Kind == AcisKind.Pointer)
+                        {
+                            var tgt = v.I >= 0 && v.I < recs.Count ? recs[(int)v.I].TypeName : "?";
+                            parts.Add($"@{v.I}{{{tgt}}}");
+                        }
+                        else parts.Add(v.ToString());
+                    }
+                    Log($"      [{ri,3}] {r.TypeName,-9}: {string.Join(" ", parts)}");
+                }
+            }
+        }
+    }
+
 }
 
 /// <summary>

@@ -18,7 +18,7 @@
 ```
 src/DrawingView.Core/   核心库：解析、几何转换、空间索引、视口、文本度量、烘焙批次
 src/DrawingView/        Avalonia 应用：DrawingView 渲染控件 + 主窗口
-tools/SmokeTest/      冒烟测试（解析→转换→索引全链路，不经过渲染管线，262 项精确断言）
+tools/SmokeTest/      冒烟测试（解析→转换→索引全链路，不经过渲染管线，289 项精确断言）
 tools/UiSmokeTest/    UI 冒烟测试（无头 Avalonia 真实跑渲染管线，拦截"渲染期非法操作"类缺陷，40 项断言含像素级校验）
 tools/PerfProbe/      性能基准（加载分段耗时 / 内存 / 逐缩放帧耗时 / LOD 扫描 / 墨迹覆盖率 / 泄漏验证）
 tools/SampleGen/      生成 samples/sample_features.dxf（覆盖全部实体类型与边界情况）
@@ -40,14 +40,22 @@ dotnet run --project src/DrawingView     # 启动 GUI
 dotnet run --project tools/SmokeTest   # 核心链路冒烟（不要加 --nologo，会被当应用参数）
 dotnet run --project tools/UiSmokeTest # UI 渲染冒烟（无头，不弹窗口）
 dotnet run --project tools/PerfProbe -- "D:\path\to.dwg"   # 性能基准（--load-only 只测加载，--repeat 8 验泄漏）
-dotnet run --project tools/SampleGen   # 重新生成 samples/sample_features.dxf
+dotnet run --project tools/SampleGen   # 重新生成 samples/ 下的样例图纸（含 sample_far.dxf 大坐标样例）
 dotnet run --project tools/BlockExport -- "D:\src.dwg" "D:\out" --referenced  # 块导出为独立 DWG
 dotnet run --project tools/ShapeExport -- "D:\src.dwg" "D:\out"               # 相交分组导出为独立 DWG
 dotnet run --project tools/DwgCapture -- "D:\src.dwg" "D:\out\shot.png"      # 无头渲染 PNG（--report 可落 JSON）
 ```
 
-**改完代码先跑一键回归**（省掉手敲上面四条，且构建失败会 fail-fast）：
+**渲染对照 / 实体诊断开关**（P2-7、P2-8 就是这么量出来的）：
 
+- `DwgCapture --rect <left,top,right,bottom>`：只渲染指定世界坐标窗口（内部先 `ZoomTo`），
+  用于"同一定点区域"的开/关像素对照；`--report` 的 JSON 多出
+  `regionEntities / regionLoops / regionUnresolved / pointMarkEntities`
+- `PerfProbe --types`：实体类型直方图 + ACIS 载荷概览（前 14 条 SAB 记录，指针后标目标类型）；
+  `--dump-sab <out>` 导出首条载荷（就是这么落的 `samples/sample_region.sab`）；`--points` 列点实体
+- `DrawingView_NO_REGION=1`：关掉 REGION 轮廓重建，与默认渲染做像素级 A/B
+
+**改完代码先跑一键回归**（省掉手敲上面四条，且构建失败会 fail-fast）：
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\regress.ps1   # 明细写仓库根 .regress.log
 ```
@@ -140,7 +148,7 @@ Avalonia 的渲染管线，所以像"渲染期调用 InvalidateVisual"这类缺�
 - 测量方法论（教训）：无预热/不隔离 GC 的帧测量，同一配置两次能差 25%——
   必须预热 3 帧 + `GC.Collect` + ≥12 帧 + 中位数；对比配置看"绘制耗时"而非墙钟。
 
-## 显示保真与资源释放（2026-09-16 修复；断言数实测 2026-10-21：262 项核心 + 40 项 UI）
+## 显示保真与资源释放（2026-09-16 修复；断言数实测 2026-10-21：289 项核心 + 40 项 UI）
 
 ### 1. `Arc.Sweep` 在 ACadSharp 3.4.9 里是**负值**（最隐蔽的真缺陷）
 `Arc.Sweep` 返回的是 `startAngle - endAngle`（正常逆时针弧为负），原实现写
@@ -447,11 +455,13 @@ view.ClearOverlay();
 
 ## 后续路线
 
-**已完成（2026-10-21，回归 PASS=302 FAIL=0）**：线型虚线、非实心填充图案（含孤岛）、
+**已完成（2026-10-21，回归 PASS=329 FAIL=0 = 289 核心 + 40 UI）**：线型虚线、非实心填充图案（含孤岛）、
 TEXT 组码 72/73 对齐、实体 `Normal` 的通用 OCS→WCS（任意轴算法）、线宽显示（`LineWeightMetrics`，
 模型空间固定像素 / 图纸空间真实单位）、变宽多段线轮廓填充、布局空间渲染、块属性 ATTRIB、
-MTEXT 断行 / 行距 / 逐行对齐、POINT 按 PDMODE/PDSIZE、SPLINE 权重与闭合、不打印图层默认隐藏。
-详见 `docs/渲染保真对照与整改方案-2026-10-20.md`（其中 P2-7 REGION、P2-8 大坐标仍待办）。
+MTEXT 断行 / 行距 / 逐行对齐、POINT 按 PDMODE/PDSIZE、SPLINE 权重与闭合、
+REGION 轮廓重建（`AcisSab` 解 SAB + `RegionOutline` 走 B-rep 链）、不打印图层默认隐藏。
+详见 `docs/渲染保真对照与整改方案-2026-10-20.md`（只剩 P2-8 大坐标：已量化未修，
+1e6 处顶点误差 0.025 单位、zoom=1000 时屏幕误差 39px，样例 `samples/sample_far.dxf`）。
 
 P1：SKPicture 静态缓存、SHX / 单线字体；
 P2：拾取选择、属性面板、测量、GUI 内 PNG 导出（命令行 `tools/DwgCapture` 已提供无头 PNG）；

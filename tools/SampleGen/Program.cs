@@ -188,6 +188,7 @@ WritePointSample(Path.Combine(Path.GetDirectoryName(outPath)!, "sample_point.dxf
 WriteOcsSample(Path.Combine(Path.GetDirectoryName(outPath)!, "sample_ocs.dxf"));
 WriteSplineSample(Path.Combine(Path.GetDirectoryName(outPath)!, "sample_spline.dxf"));
 WriteNonPlotSample(Path.Combine(Path.GetDirectoryName(outPath)!, "sample_nonplot.dxf"));
+WriteFarSample(Path.Combine(Path.GetDirectoryName(outPath)!, "sample_far.dxf"));
 
 // ACadSharp 的 DXF 写出端把 HATCH 边界弧角度按弧度原样写进度字段（普通 ARC 实体写得对），
 // 而读入端已按规范把度换弧度 → 整圆边界读回来变成 2π° ≈ 0.11 rad 的一小段，实心填充塌成缝。
@@ -563,6 +564,41 @@ void WriteNonPlotSample(string path)
     using var w = new DxfWriter(path, d, false);
     w.Write();
     Console.WriteLine($"已生成不打印图层样例: {path}（{d.Entities.Count()} 个实体）");
+}
+
+/// <summary>
+/// 大坐标样例（sample_far.dxf）—— 量化 float32 精度损失（P2-8）。
+///
+/// <para>同一组几何写两份：一份在原点，一份平移到 (±1e6, 1e6)。渲染器里几何按 float 存，
+/// 1e6 处 float 的 ulp = 0.0625 单位 —— 放大到 0.01 单位/像素时就是 6 像素的台阶。
+/// 有了这份样例，"±1e6 会不会抖"就变成可量化、可回归的问题，而不是凭感觉。</para>
+/// </summary>
+void WriteFarSample(string path)
+{
+    var d = new CadDocument();
+    // 故意用非整数：1e6 附近的 float ulp = 0.0625，整数坐标恰好能精确表示，
+    // 只有带小数的坐标才能把量化误差暴露出来。
+    const double far = 1_000_000.3;
+
+    void Draw(double ox, double oy, string layer)
+    {
+        var lay = new Layer(layer);
+        d.Layers.Add(lay);
+        // 10×10 的方框 + 内接圆 + 一条斜线（斜线能把台阶暴露得最清楚）
+        d.Entities.Add(new Line(new XYZ(ox, oy, 0), new XYZ(ox + 10, oy, 0)) { Layer = lay });
+        d.Entities.Add(new Line(new XYZ(ox + 10, oy, 0), new XYZ(ox + 10, oy + 10, 0)) { Layer = lay });
+        d.Entities.Add(new Line(new XYZ(ox + 10, oy + 10, 0), new XYZ(ox, oy + 10, 0)) { Layer = lay });
+        d.Entities.Add(new Line(new XYZ(ox, oy + 10, 0), new XYZ(ox, oy, 0)) { Layer = lay });
+        d.Entities.Add(new Circle { Center = new XYZ(ox + 5, oy + 5, 0), Radius = 4, Layer = lay });
+        d.Entities.Add(new Line(new XYZ(ox + 1, oy + 1, 0), new XYZ(ox + 9, oy + 9, 0)) { Layer = lay });
+    }
+
+    Draw(0, 0, "NEAR");
+    Draw(far, far, "FAR");
+
+    using var w = new DxfWriter(path, d, false);
+    w.Write();
+    Console.WriteLine($"已生成大坐标样例: {path}（原点组 + 1e6 组，各 6 个实体）");
 }
 
 static string DefaultOutputPath()

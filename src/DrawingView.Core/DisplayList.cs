@@ -83,6 +83,15 @@ public sealed class DisplayList : IDisposable
     /// <summary>POINT 点标记实体数（按 PDMODE/PDSIZE 在屏幕空间绘制）。</summary>
     public int PointMarkEntities { get; init; }
 
+    /// <summary>从 ACIS 载荷重建出轮廓的 REGION 数（P2-7）。</summary>
+    public int RegionEntities { get; init; }
+
+    /// <summary>REGION 重建出的环总数（外环 + 内环）。</summary>
+    public int RegionLoops { get; init; }
+
+    /// <summary>ACIS 载荷无法解析、只能跳过的 REGION 数。</summary>
+    public int RegionUnresolved { get; init; }
+
     /// <summary>是否图纸空间（布局）。线宽显示口径按空间区分，渲染期要用。</summary>
     public bool IsPaperSpace => !string.Equals(ActiveSpace, "Model", StringComparison.OrdinalIgnoreCase);
 

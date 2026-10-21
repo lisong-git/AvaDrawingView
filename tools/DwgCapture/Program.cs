@@ -107,9 +107,13 @@ internal static class Program
             list = CadDocumentLoader.LoadAsync(input, null, default, convertOptions).GetAwaiter().GetResult();
             view.SetDisplay(list);
             window.CaptureRenderedFrame(); // 完成布局并触达首帧
-            view.FitToContent(coreOnly: !options.AllExtents);
-            // 适应窗口后再按倍数缩放：线宽这类"屏幕口径"的东西必须放大到 1px 以上才看得见
-            if (Math.Abs(options.Zoom - 1f) > 1e-6f) view.ZoomBy(options.Zoom);
+            if (options.Rect is { } focus) view.ZoomTo(focus);
+            else
+            {
+                view.FitToContent(coreOnly: !options.AllExtents);
+                // 适应窗口后再按倍数缩放：线宽这类"屏幕口径"的东西必须放大到 1px 以上才看得见
+                if (Math.Abs(options.Zoom - 1f) > 1e-6f) view.ZoomBy(options.Zoom);
+            }
             window.CaptureRenderedFrame();
             window.CaptureRenderedFrame();
 
@@ -159,6 +163,9 @@ internal static class Program
             },
             widePolylineEntities = list.WidePolylineEntities,
             pointMarkEntities = list.PointMarkEntities,
+            regionEntities = list.RegionEntities,
+            regionLoops = list.RegionLoops,
+            regionUnresolved = list.RegionUnresolved,
             extents = Rect(list.Extents),
             coreExtents = Rect(list.CoreExtents),
             pngBytes = bytes,
@@ -230,6 +237,7 @@ internal static class Program
         DwgCapture --in <dwg path> --out <png path> [--report <json path>]
                    [--width 1600] [--height 900] [--background white|black]
                    [--all] [--lod 0] [--layout <布局名>] [--lineweights] [--zoom 1]
+                     [--rect left,top,right,bottom]
 
         Exit codes: 0 success, 2 bad arguments, 3 input missing, 4 parse failure,
         5 render/write failure. The report (if requested) is written for failures too.
@@ -274,6 +282,17 @@ internal static class Program
                     options.Zoom = zoom;
                     break;
                 case "--layout": options.Layout = Next(); break;
+                case "--rect":
+                {
+                    // 世界矩形 l,t,r,b —— 定点放大对照用（ODA 只能出整图，本工具可以只出某一块）
+                    var parts = Next().Split(',');
+                    if (parts.Length != 4
+                        || !float.TryParse(parts[0], out var l) || !float.TryParse(parts[1], out var t)
+                        || !float.TryParse(parts[2], out var r2) || !float.TryParse(parts[3], out var b2))
+                        throw new ArgumentException("--rect needs 'left,top,right,bottom'");
+                    options.Rect = SKRect.Create(l, t, MathF.Abs(r2 - l), MathF.Abs(b2 - t));
+                    break;
+                }
                 case "--lod":
                     if (!float.TryParse(Next(), out var lod) || lod < 0 || lod > 10000)
                         throw new ArgumentException("--lod must be a number in 0..10000");
@@ -295,6 +314,7 @@ internal static class Program
         public int Width = 1600;
         public int Height = 900;
         public SKColor Background = SKColors.White;
+        public SKRect? Rect;
         public bool AllExtents;
         public float Lod;
         public string? Layout;

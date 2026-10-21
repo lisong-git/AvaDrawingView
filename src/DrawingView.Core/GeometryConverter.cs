@@ -74,6 +74,15 @@ public sealed class GeometryConverter
     public int NonPlottingLayers { get; private set; }
     /// <summary>产出点标记的实体数。</summary>
     public int PointMarkEntities { get; private set; }
+
+    /// <summary>成功重建出轮廓的 REGION 实体数。</summary>
+    public int RegionEntities { get; private set; }
+
+    /// <summary>REGION 重建出的环总数（外环 + 内环）。</summary>
+    public int RegionLoops { get; private set; }
+
+    /// <summary>ACIS 载荷无法重建轮廓、只能跳过的 REGION 数。</summary>
+    public int RegionUnresolved { get; private set; }
     /// <summary>文件头的 PDMODE（诊断用：0 点 / 1 不画 / 2 十字 / 3 叉 / 4 竖线，+32 圆 +64 方）。</summary>
     public int PointDisplayMode => _pointDisplayMode;
     /// <summary>文件头的 PDSIZE（诊断用：&gt;0 世界单位 / &lt;0 视高百分比 / =0 默认 5%）。</summary>
@@ -148,6 +157,12 @@ public sealed class GeometryConverter
 
     private static readonly bool ConvTrace = Environment.GetEnvironmentVariable("DrawingView_CONV_TRACE") == "1";
     private static readonly bool ShowInvisible = Environment.GetEnvironmentVariable("DrawingView_SHOW_INVISIBLE") == "1";
+
+    /// <summary>
+    /// REGION 轮廓重建开关（默认开）。置 <c>DrawingView_NO_REGION=1</c> 可关掉，
+    /// 用于「有/无 REGION」的像素对照 —— 判断渲染差异到底来自 REGION 还是别的东西。
+    /// </summary>
+    private static readonly bool ShowRegions = Environment.GetEnvironmentVariable("DrawingView_NO_REGION") != "1";
     private static readonly string TracePath = Path.Combine(Path.GetTempPath(), "conv_trace.log");
     private static int _traceSeq;
 
@@ -184,6 +199,9 @@ public sealed class GeometryConverter
         PointMarkEntities = 0;
         RationalSplineEntities = 0;
         NonPlottingLayers = 0;
+        RegionEntities = 0;
+        RegionLoops = 0;
+        RegionUnresolved = 0;
         _pointDisplayMode = 0;
         _pointDisplaySize = 0f;
 
@@ -481,6 +499,10 @@ public sealed class GeometryConverter
                 case Leader ld: AddLeader(ld, parent, color); break;
                 case Dimension dim: AddDimensionBlock(dim, parent, depth, inheritedColor); break;
                 case ACadSharp.Entities.Point pt: AddPointCross(pt, parent, color); break;
+                // REGION：ACadSharp 只给 ACIS 载荷（R2013+ 是二进制 SAB），几何要从 B-rep 拓扑重建，
+                // 见 RegionOutline（P2-7）。3DSOLID/BODY/SURFACE 同为 ModelerGeometry，暂不处理：
+                // 三维实体的线框投影到 XY 会得到一堆互相穿插的边，反而干扰识图。
+                case Region rg: AddRegion(rg, parent, color); break;
                 default: Skipped++; break;
             }
         }
@@ -648,6 +670,33 @@ public sealed class GeometryConverter
 
     /// <summary>按有理（带权重）求值的样条条数。</summary>
     public int RationalSplineEntities { get; private set; }
+
+    /// <summary>
+    /// REGION → 轮廓路径（P2-7）。
+    ///
+    /// <para>REGION 的几何不在实体字段里，而在 ACIS 的 B-rep 载荷中；ACadSharp 只把载荷原样
+    /// 交出（R2013+ 是二进制 SAB，<c>GetAcisText()</c> 返回 null）。所以这里走
+    /// <see cref="RegionOutline"/>，把 loop→coedge→edge→vertex→point 的链走一遍重建闭合轮廓。</para>
+    ///
+    /// <para>只描边、不填充：AutoCAD 在二维线框下就是这样显示 REGION 的，内环（洞）也天然正确。</para>
+    /// </summary>
+    private void AddRegion(Region rg, in SKMatrix m, uint color)
+    {
+        if (!ShowRegions) { Skipped++; return; }
+        var loops = RegionOutline.TryBuild(rg.AcisData, out _);
+        if (loops is null) { RegionUnresolved++; Skipped++; return; }
+
+        int drawn = 0;
+        foreach (var loop in loops)
+        {
+            if (loop.PointCount < 2) { loop.Dispose(); continue; }
+            AddStroke(loop, rg, color, m);
+            drawn++;
+        }
+        if (drawn == 0) { RegionUnresolved++; Skipped++; return; }
+        RegionEntities++;
+        RegionLoops += drawn;
+    }
 
     private void AddLeader(Leader ld, in SKMatrix m, uint color)
     {
