@@ -1,5 +1,6 @@
 using ACadSharp;
 using ACadSharp.Entities;
+using ACadSharp.Objects;
 using ACadSharp.Tables;
 using CSMath;
 using SkiaSharp;
@@ -9,6 +10,20 @@ namespace DrawingView.Core;
 public sealed class GeometryConvertOptions
 {
     public bool SkipRootAnnotations { get; init; }
+
+    /// <summary>
+    /// 要渲染的布局名（大小写不敏感）。null = 模型空间。
+    /// 指定布局时按图纸空间渲染：先画布局自身几何（图框/标题栏），
+    /// 再按每个视口的「视口中心/视高/扭转角」把模型空间几何变换到图纸坐标并裁剪到视口矩形。
+    /// </summary>
+    public string? LayoutName { get; init; }
+
+    /// <summary>
+    /// 模型空间为空时自动切到第一个有内容的布局。
+    /// Inventor / SolidWorks 导出的机械图模型空间本来就是空的（几何全在布局的视图块里），
+    /// 不开这个开关的表现是"整张白屏"，比"渲染了布局"更容易被误判成打不开。
+    /// </summary>
+    public bool AutoPaperSpaceWhenModelEmpty { get; init; } = true;
 }
 
 /// <summary>
@@ -29,6 +44,7 @@ public sealed class GeometryConverter
 
     private readonly List<CadEntity> _entities = new();
     private readonly Dictionary<string, uint> _layerColors = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _layerWeights = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<string> _layerOrder = new();
     private readonly HashSet<string> _initiallyHidden = new(StringComparer.OrdinalIgnoreCase);
 
@@ -44,17 +60,88 @@ public sealed class GeometryConverter
     /// <summary>全局线型比例（LTSCALE，文件头）；<=0 时按 1。</summary>
     private double _globalLtScale = 1.0;
 
+    /// <summary>
+    /// POINT 的显示模式与尺寸（文件头变量 PDMODE / PDSIZE）。
+    /// 二者都是**整张图**级别的设置，实体本身不带（DXF 里 POINT 没有自己的模式字段）。
+    /// </summary>
+    private int _pointDisplayMode;
+    private float _pointDisplaySize;
+
+    /// <summary>因 PDMODE=1 而画不出来的点数。</summary>
+    public int PointMarksHidden { get; private set; }
+
+    /// <summary>标记为"不打印"的图层数（DEFPOINTS 一类；默认隐藏，见 <see cref="CacheLayerColors"/>）。</summary>
+    public int NonPlottingLayers { get; private set; }
+    /// <summary>产出点标记的实体数。</summary>
+    public int PointMarkEntities { get; private set; }
+    /// <summary>文件头的 PDMODE（诊断用：0 点 / 1 不画 / 2 十字 / 3 叉 / 4 竖线，+32 圆 +64 方）。</summary>
+    public int PointDisplayMode => _pointDisplayMode;
+    /// <summary>文件头的 PDSIZE（诊断用：&gt;0 世界单位 / &lt;0 视高百分比 / =0 默认 5%）。</summary>
+    public float PointDisplaySize => _pointDisplaySize;
+
     /// <summary>虚线间隔数组池：等值的线型共用同一实例，便于烘焙按引用分桶。</summary>
     private readonly Dictionary<string, float[]> _dashPool = new(StringComparer.Ordinal);
 
     /// <summary>转换失败 / 有意跳过的实体数（含隐藏实体）。</summary>
     public int Skipped { get; private set; }
 
+    /// <summary>视口裁剪掉的实体数（布局渲染诊断用）。</summary>
+    public int ClippedAway { get; private set; }
+
+    /// <summary>实际渲染的空间名（"Model" 或布局名）。</summary>
+    public string ActiveSpace { get; private set; } = "Model";
+
+    /// <summary>图纸里可切换的布局名（按 TabOrder 排序，不含模型空间）。</summary>
+    public IReadOnlyList<string> LayoutNames { get; private set; } = Array.Empty<string>();
+
+    /// <summary>视口内容的裁剪矩形（图纸坐标）；null = 不裁剪（模型空间或布局自身几何）。</summary>
+    private SKRect? _clipRect;
+
+    /// <summary>当前视口冻结的图层（AutoCAD：视口冻结只影响该视口）。</summary>
+    private HashSet<string>? _clipFrozenLayers;
+
+    /// <summary>
+    /// 布局里的视口（先收集，最后统一按视口画模型内容）。
+    /// 带上「视口所在坐标系 → 图纸」的矩阵：图框成块时视口藏在 INSERT 里，
+    /// 只认顶层 Viewport 会漏掉绝大多数视口（实测一张 47 视口的图只认出 1 个）。
+    /// </summary>
+    private readonly List<(Viewport Vp, SKMatrix ToPaper)> _viewports = new();
+
+    private readonly List<string> _spaceNotes = new();
+
+    /// <summary>布局/视口诊断（仅在 DrawingView_CONV_TRACE=1 时填充）。</summary>
+    public IReadOnlyList<string> SpaceNotes => _spaceNotes;
+
     // 块引用展开的丢弃原因计数（诊断用：定位「块内容整片消失」）
     public int DroppedNoBlock { get; private set; }
     public int DroppedByDepth { get; private set; }
     public int DroppedByMatrix { get; private set; }
     public int DroppedByMInsert { get; private set; }
+
+    // 块属性（ATTRIB）计数（诊断用：区分「块里没文字」与「属性没画出来」）
+    /// <summary>已绘制的属性值条数。</summary>
+    public int AttributeDrawn { get; private set; }
+    /// <summary>因不可见（实体 60 / 属性标志位 1）而跳过的属性条数。</summary>
+    public int AttributeInvisible { get; private set; }
+    /// <summary>块定义里的占位符（AttributeDefinition）条数——这些**不应该**出现在图面上。</summary>
+    public int AttributeDefsSkipped { get; private set; }
+
+    /// <summary>填充里被判定为非法（未闭合）而忽略的边界环数。</summary>
+    public int HatchBadLoops { get; private set; }
+    /// <summary>填充里完全重合、被去重掉的边界环数。</summary>
+    public int HatchDuplicateLoops { get; private set; }
+
+    /// <summary>
+    /// 当前块引用上下文里的「随块（ByBlock）」线宽（1/100 mm，&gt;0 才算有值）。
+    /// 块内实体写 BYBLOCK 时继承它，与 <c>_inheritedColor</c> 的语义完全对称。
+    /// </summary>
+    private int _inheritedLineWeight;
+
+    /// <summary>解析出非零线宽的实体数（诊断用：判断线宽开关到底有没有东西可画）。</summary>
+    public int LineWeightEntities { get; private set; }
+
+    /// <summary>带宽度（几何宽度，不是线宽）的多段线实体数——这些画成填充轮廓。</summary>
+    public int WidePolylineEntities { get; private set; }
 
     /// <summary>图纸里被关闭或冻结的图层：打开时应默认隐藏。</summary>
     public IReadOnlyCollection<string> InitiallyHiddenLayers => _initiallyHidden;
@@ -80,13 +167,40 @@ public sealed class GeometryConverter
         _layerColors.Clear();
         _layerOrder.Clear();
         _initiallyHidden.Clear();
+        _viewports.Clear();
+        _clipRect = null;
+        _clipFrozenLayers = null;
+        ClippedAway = 0;
         Skipped = 0;
+        AttributeDrawn = 0;
+        AttributeInvisible = 0;
+        AttributeDefsSkipped = 0;
+        HatchBadLoops = 0;
+        HatchDuplicateLoops = 0;
+        LineWeightEntities = 0;
+        WidePolylineEntities = 0;
+        _inheritedLineWeight = 0;
+        PointMarksHidden = 0;
+        PointMarkEntities = 0;
+        RationalSplineEntities = 0;
+        NonPlottingLayers = 0;
+        _pointDisplayMode = 0;
+        _pointDisplaySize = 0f;
 
         CacheLayerColors(doc);
         try
         {
             double lts = doc.Header.LineTypeScale;
             if (lts > 0 && !double.IsNaN(lts) && !double.IsInfinity(lts)) _globalLtScale = lts;
+        }
+        catch { }
+        try
+        {
+            // PDMODE / PDSIZE：不读的后果是"点全按同一个固定十字画"，
+            // 缩放后要么看不见要么糊满屏（见 PointMarkStyle 的说明）。
+            _pointDisplayMode = (int)doc.Header.PointDisplayMode;
+            _pointDisplaySize = (float)doc.Header.PointDisplaySize;
+            if (!float.IsFinite(_pointDisplaySize)) _pointDisplaySize = 0f;
         }
         catch { }
 
@@ -96,13 +210,26 @@ public sealed class GeometryConverter
             _traceSeq = 0;
         }
 
-        int n = 0;
-        foreach (var e in EnumerateModelSpace(doc))
+        var layouts = EnumerateLayouts(doc);
+        LayoutNames = layouts.Select(l => l.Name ?? string.Empty).Where(n => n.Length > 0).ToArray();
+
+        var target = ResolveLayout(doc, layouts, options);
+        if (target is not null)
         {
-            // 大图解析后仍有十几万实体要转换，必须让取消能真正中断（原来只在阶段之间检查）
-            if ((++n % CancellationCheckInterval) == 0) ct.ThrowIfCancellationRequested();
-            if (options?.SkipRootAnnotations == true && IsRootAnnotation(e)) { Skipped++; continue; }
-            ConvertEntity(e, SKMatrix.Identity, 0, inheritedColor: null);
+            ActiveSpace = target.Name ?? "Layout";
+            ConvertLayout(doc, target, ct, options);
+        }
+        else
+        {
+            ActiveSpace = "Model";
+            int n = 0;
+            foreach (var e in EnumerateModelSpace(doc))
+            {
+                // 大图解析后仍有十几万实体要转换，必须让取消能真正中断（原来只在阶段之间检查）
+                if ((++n % CancellationCheckInterval) == 0) ct.ThrowIfCancellationRequested();
+                if (options?.SkipRootAnnotations == true && IsRootAnnotation(e)) { Skipped++; continue; }
+                ConvertEntity(e, SKMatrix.Identity, 0, inheritedColor: null);
+            }
         }
 
         DropUnreferencedPlaceholderLayers();
@@ -112,6 +239,157 @@ public sealed class GeometryConverter
 
     /// <summary>本图出现的图层名（保持图纸中的出现顺序）。</summary>
     public IReadOnlyList<string> LayerNames => _layerOrder.ToArray();
+
+    // ---------- 布局（图纸空间） ----------
+
+    /// <summary>图纸里的布局（按 TabOrder 排序，排除模型空间布局）。</summary>
+    private static List<Layout> EnumerateLayouts(CadDocument doc)
+    {
+        var result = new List<Layout>();
+        try
+        {
+            foreach (var l in doc.Layouts)
+            {
+                if (l is null) continue;
+                // 模型空间也是一个 Layout 对象（名字通常叫 "Model"），不要当成可切换的图纸
+                if (!l.IsPaperSpace) continue;
+                result.Add(l);
+            }
+        }
+        catch { /* 个别文件布局表损坏：当作没有布局，退回模型空间 */ }
+        return result.OrderBy(l => l.TabOrder).ToList();
+    }
+
+    /// <summary>
+    /// 选目标空间：显式指定的布局 &gt; 模型空间（非空）&gt; 第一个有视口内容的布局。
+    /// 最后这一条是"整张白屏"的解药：Inventor 导出的机械图模型空间 0 实体，
+    /// 几何全在布局的视图块里，不自动切过去就什么都看不见。
+    /// </summary>
+    private static Layout? ResolveLayout(CadDocument doc, List<Layout> layouts, GeometryConvertOptions? options)
+    {
+        if (!string.IsNullOrWhiteSpace(options?.LayoutName))
+        {
+            var wanted = options!.LayoutName!;
+            return layouts.FirstOrDefault(l => string.Equals(l.Name, wanted, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (options?.AutoPaperSpaceWhenModelEmpty == false) return null;
+
+        bool modelEmpty;
+        try { modelEmpty = doc.ModelSpace?.Entities is null || !doc.ModelSpace.Entities.Any(); }
+        catch { modelEmpty = true; }
+        if (!modelEmpty) return null;
+
+        // 有视口（Id != 1 且尺寸有效）= 该布局确实"看得见东西"
+        return layouts.FirstOrDefault(l =>
+        {
+            try
+            {
+                return l.Viewports.Any(v => v is not null && v.Id != 1 && v.Width > 1e-6 && v.Height > 1e-6);
+            }
+            catch { return false; }
+        });
+    }
+
+    /// <summary>
+    /// 图纸空间转换：先画布局自身几何（图框、标题栏、视图块引用），
+    /// 再逐个视口把模型空间几何变换到图纸坐标并裁剪。
+    /// </summary>
+    private void ConvertLayout(CadDocument doc, Layout layout, CancellationToken ct, GeometryConvertOptions? options)
+    {
+        _viewports.Clear();
+        _spaceNotes.Clear();
+
+        var block = layout.AssociatedBlock;
+        if (block?.Entities is not null)
+        {
+            int n = 0;
+            foreach (var e in block.Entities)
+            {
+                if ((++n % CancellationCheckInterval) == 0) ct.ThrowIfCancellationRequested();
+                // 视口自身不画边框：AutoCAD 里视口边框属于非打印的 Defpoints 语义，
+                // 打印/出图看不到；画出来反而在图纸四周多出一圈不该有的矩形。
+                if (e is Viewport vp) { if (vp.Id != 1) _viewports.Add((vp, SKMatrix.Identity)); continue; }
+                if (options?.SkipRootAnnotations == true && IsRootAnnotation(e)) { Skipped++; continue; }
+                ConvertEntity(e, SKMatrix.Identity, 0, inheritedColor: null);
+            }
+        }
+
+        var model = doc.ModelSpace;
+        if (model?.Entities is null) return;
+
+        foreach (var (vp, toPaper) in _viewports)
+            ConvertViewport(model, vp, toPaper, ct);
+    }
+
+    /// <summary>
+    /// 单个视口：模型空间几何 → 图纸坐标。
+    ///
+    /// 变换链（世界→图纸）：先平移到视口视图中心，按 <c>视高/视口高</c> 缩放，
+    /// 按扭转角旋转，再平移到视口中心；最后裁剪到视口矩形。
+    /// <para>视口中心是图纸坐标（mm），视高是模型单位，二者之比就是出图比例。</para>
+    /// </summary>
+    private void ConvertViewport(BlockRecord model, Viewport vp, in SKMatrix toPaper, CancellationToken ct)
+    {
+        if (!LayoutProjection.IsDrawable(vp)) return;
+
+        // 模型 → 视口所在坐标系 → 图纸（视口可能挂在图框块里）
+        var m = Mul(LayoutProjection.ModelToPaper(vp), toPaper);
+        var clip = LayoutProjection.TransformRect(LayoutProjection.PaperRect(vp), toPaper);
+
+        HashSet<string>? frozen = null;
+        try
+        {
+            if (vp.FrozenLayers is { Count: > 0 })
+                frozen = new HashSet<string>(vp.FrozenLayers.Select(l => l.Name ?? string.Empty),
+                                             StringComparer.OrdinalIgnoreCase);
+        }
+        catch { }
+
+        _clipRect = clip;
+        _clipFrozenLayers = frozen;
+        int before = _entities.Count;
+        try
+        {
+            int n = 0;
+            foreach (var e in model.Entities)
+            {
+                if ((++n % CancellationCheckInterval) == 0) ct.ThrowIfCancellationRequested();
+                ConvertEntity(e, m, 0, inheritedColor: null);
+            }
+        }
+        finally
+        {
+            _clipRect = null;
+            _clipFrozenLayers = null;
+        }
+        _spaceNotes.Add($"vp id={vp.Id} paper={LayoutProjection.PaperRect(vp)} " +
+                            $"viewH={vp.ViewHeight:F1} scale={LayoutProjection.Scale(vp):F4} " +
+                            $"clip={clip} kept={_entities.Count - before}");
+    }
+
+    /// <summary>把路径裁到当前视口矩形；返回 null 表示被裁没了。</summary>
+    private SKPath? ApplyViewportClip(SKPath path)
+    {
+        if (_clipRect is not { } rect) return path;
+        using var rectPath = new SKPath();
+        rectPath.AddRect(rect);
+        var clipped = path.Op(rectPath, SKPathOp.Intersect);
+        path.Dispose();
+        if (clipped is null || clipped.IsEmpty)
+        {
+            clipped?.Dispose();
+            ClippedAway++;
+            return null;
+        }
+        return clipped;
+    }
+
+    private bool InsideClip(SKRect bounds)
+        => _clipRect is not { } rect || bounds.IntersectsWith(rect);
+
+    private bool IsFrozenInViewport(Entity e)
+        => _clipFrozenLayers is { Count: > 0 } set && set.Contains(LayerName(e));
 
     // ---------- 入口 ----------
 
@@ -140,7 +418,17 @@ public sealed class GeometryConverter
         // 实测测试图.dwg：7836 个源实体带此标记（其中 1734 个 INSERT），展开约 5 万个显示实体；
         // 过滤后全图墨迹覆盖率 3.06% → 2.03%，经与 AutoCAD 语义核对属于正确行为而非内容丢失。
         // DrawingView_SHOW_INVISIBLE=1 可关闭过滤（仅供与第三方渲染器对照基准用）。
-        if (e.IsInvisible && !ShowInvisible) { Skipped++; return; }
+        if (e.IsInvisible && !ShowInvisible)
+        {
+            // 属性有独立的不可见标志（组码 70 bit 1 或实体 60），单独计数便于诊断
+            // "块里属性没显示"到底是不可见、还是没画。
+            if (e is AttributeEntity) AttributeInvisible++;
+            Skipped++;
+            return;
+        }
+
+        // 视口冻结（VPFREEZE）：只在该视口内不显示，与全局图层冻结不同
+        if (IsFrozenInViewport(e)) { Skipped++; return; }
 
         var prevHandle = _currentHandle;
         var prevOwnHandle = _currentOwnHandle;
@@ -166,11 +454,28 @@ public sealed class GeometryConverter
                 {
                     // MText 与 TextEntity 是兄弟类型（is TextEntity 匹配不到 MText，2026-09-25 SmokeTest 实证）
                     var raw = !string.IsNullOrEmpty(mt.PlainText) ? mt.PlainText : CleanMText(mt.Value);
-                    AddTextEntity(raw, mt.InsertPoint, mt.Height, mt.Rotation, mt, parent, color);
+                    AddMText(mt, raw, parent, color);
                     break;
                 }
-                case TextEntity t: AddTextEntity(t.Value, t.InsertPoint, t.Height, t.Rotation, t, parent, color); break;
+                // 块定义里的属性**占位符**（AttributeDefinition）不画：块参照显示的是 ATTRIB 的值，
+                // 占位符（TAG）只在块编辑器里可见。它继承自 TextEntity，不拦住会被当成正文画出来。
+                case AttributeDefinition:
+                    AttributeDefsSkipped++;
+                    break;
+                // 属性值（ATTRIB）：ConvertInsert 会把 Insert.Attributes 按实例送进来，
+                // 位置/字高随 INSERT 变换，与块内正文走同一条文本管线。
+                case AttributeEntity att:
+                    if (att.Flags.HasFlag(AttributeFlags.Hidden)) { AttributeInvisible++; break; }
+                    AddText(att, parent, color);
+                    AttributeDrawn++;
+                    break;
+                case TextEntity t: AddText(t, parent, color); break;
                 case Insert ins: ConvertInsert(ins, parent, depth, inheritedColor); break;
+                case Viewport vp:
+                    // 图框常被做成块，视口就藏在块里：记下「视口坐标系→图纸」的矩阵，
+                    // 布局收尾时统一展开。视口本身不画边框（同顶层视口）。
+                    if (vp.Id != 1) _viewports.Add((vp, parent));
+                    break;
                 case Hatch h: AddHatch(h, parent, color); break;
                 case Solid sol: AddSolid(sol, parent, color); break;
                 case Leader ld: AddLeader(ld, parent, color); break;
@@ -219,30 +524,107 @@ public sealed class GeometryConverter
     private void AddEllipse(Ellipse el, in SKMatrix m, uint color)
     {
         // p(t) = center + A·cos(t) + B·sin(t)，A = 长轴端点向量，B = 左法线 × 半径比
-        var path = new SKPath();
-        CadGeometry.AppendEllipticalArc(path, el.Center.X, el.Center.Y,
+        var path = CadGeometry.BuildEllipticalArc(el.Center.X, el.Center.Y,
             el.MajorAxisEndPoint.X, el.MajorAxisEndPoint.Y,
             -el.MajorAxisEndPoint.Y * el.RadiusRatio,
             el.MajorAxisEndPoint.X * el.RadiusRatio,
-            el.StartParameter, el.EndParameter, 128);
+            el.StartParameter, el.EndParameter);
+        if (path is null) { Skipped++; return; }
         AddStroke(path, el, color, m);
     }
 
+    /// <summary>
+    /// LWPOLYLINE，带**宽度轮廓**（B4）。
+    ///
+    /// <para>宽度是几何不是线宽：有宽度时生成闭合轮廓交给填充（并与 AutoCAD 一致地忽略线宽），
+    /// 全段宽度为 0 时才退回描边。宽度取值遵循 DXF 口径——组码 40/41 挂在**起点顶点**上，
+    /// 描述"从该顶点出发那一段"的起/终宽度；两者都为 0 时回落到组码 43（ConstantWidth）。</para>
+    /// </summary>
     private void AddLwPolyline(LwPolyline lw, in SKMatrix m, uint color)
     {
         if (lw.Vertices == null || lw.Vertices.Count == 0) { Skipped++; return; }
+        float constant = (float)lw.ConstantWidth;
+
+        if (TryAddWidePolyline(lw.Vertices.Count, lw.IsClosed, i =>
+            {
+                var v = lw.Vertices[i];
+                var next = lw.Vertices[(i + 1) % lw.Vertices.Count];
+                var (w0, w1) = ResolveSegmentWidths((float)v.StartWidth, (float)v.EndWidth, constant);
+                return new WidePolyline.Piece(
+                    new SKPoint((float)v.Location.X, (float)v.Location.Y),
+                    new SKPoint((float)next.Location.X, (float)next.Location.Y),
+                    w0, w1, v.Bulge);
+            }, lw, color, m))
+            return;
+
         var path = new SKPath();
         CadGeometry.AppendLwPolyline(path, lw);
-        float lineWidth = lw.ConstantWidth > 0 ? (float)lw.ConstantWidth : 0f;
-        AddStroke(path, lw, color, m, lineWidth);
+        AddStroke(path, lw, color, m);
     }
 
+    /// <summary>POLYLINE2D（老式折线），宽度口径同 <see cref="AddLwPolyline"/>。</summary>
     private void AddPolyline2D(Polyline2D p2, in SKMatrix m, uint color)
     {
         if (p2.Vertices == null || p2.Vertices.Count == 0) { Skipped++; return; }
+
+        if (TryAddWidePolyline(p2.Vertices.Count, p2.IsClosed, i =>
+            {
+                var v = p2.Vertices[i];
+                var next = p2.Vertices[(i + 1) % p2.Vertices.Count];
+                var (w0, w1) = ResolveSegmentWidths((float)v.StartWidth, (float)v.EndWidth, 0f);
+                return new WidePolyline.Piece(
+                    new SKPoint((float)v.Location.X, (float)v.Location.Y),
+                    new SKPoint((float)next.Location.X, (float)next.Location.Y),
+                    w0, w1, v.Bulge);
+            }, p2, color, m))
+            return;
+
         var path = new SKPath();
         CadGeometry.AppendPolyline2D(path, p2);
         AddStroke(path, p2, color, m);
+    }
+
+    /// <summary>
+    /// 每段的起/终宽度（世界单位）。DXF 组码 40/41 挂在起点顶点上；
+    /// 只给了起点宽度（41=0）时按等宽处理，两者都 0 时用 ConstantWidth。
+    /// </summary>
+    private static (float Start, float End) ResolveSegmentWidths(float startWidth, float endWidth, float constantWidth)
+    {
+        if (startWidth <= 0f && endWidth <= 0f) return (constantWidth, constantWidth);
+        if (endWidth <= 0f) return (startWidth, startWidth);
+        return (startWidth, endWidth);
+    }
+
+    /// <summary>
+    /// 有宽度就生成轮廓填充并计数；返回 false = 所有段宽度都是 0（调用方按普通折线描边）。
+    /// </summary>
+    private bool TryAddWidePolyline(int vertexCount, bool closed,
+                                    Func<int, WidePolyline.Piece> pieceOf, Entity e, uint color, in SKMatrix m)
+    {
+        int segs = CadGeometry.VertexSegmentCount(vertexCount, closed);
+        if (segs <= 0) return false;
+
+        var pieces = new List<WidePolyline.Piece>(segs);
+        bool anyWidth = false;
+        for (int i = 0; i < segs; i++)
+        {
+            var pc = pieceOf(i);
+            if (pc.StartWidth > 0f || pc.EndWidth > 0f) anyWidth = true;
+            pieces.Add(pc);
+        }
+        if (!anyWidth) return false;
+
+        var fill = WidePolyline.Build(pieces, closed);
+        if (fill is null)
+        {
+            // 顶点太少/退化：仍然算"有宽度"，但画不出来，记一次跳过便于定位
+            Skipped++;
+            WidePolylineEntities++;
+            return true;
+        }
+        AddFill(fill, e, color, m);
+        WidePolylineEntities++;
+        return true;
     }
 
     private void AddSpline(Spline sp, in SKMatrix m, uint color)
@@ -251,10 +633,21 @@ public sealed class GeometryConverter
         var cx = sp.ControlPoints.Select(p => p.X).ToArray();
         var cy = sp.ControlPoints.Select(p => p.Y).ToArray();
         var knots = sp.Knots?.ToArray() ?? Array.Empty<double>();
-        var path = SplineFlattener.Flatten(cx, cy, knots, sp.Degree);
+
+        // 权重（组码 41）与闭合标志（组码 70 的 bit1）都必须吃进来（P2-6）：
+        //   有理权重是"精确画圆/椭圆"的唯一途径，忽略它形状会鼓/瘪；
+        //   闭合样条不 Close 会少最后一段，看起来像"描边缺个口"。
+        double[]? weights = sp.Weights is { Count: > 0 } w ? w.ToArray() : null;
+        bool closed = sp.IsClosed;
+
+        var path = SplineFlattener.Flatten(cx, cy, knots, sp.Degree, weights: weights, closed: closed);
         if (path is null) { Skipped++; return; }
+        if (weights is not null) RationalSplineEntities++;
         AddStroke(path, sp, color, m);
     }
+
+    /// <summary>按有理（带权重）求值的样条条数。</summary>
+    public int RationalSplineEntities { get; private set; }
 
     private void AddLeader(Leader ld, in SKMatrix m, uint color)
     {
@@ -269,15 +662,40 @@ public sealed class GeometryConverter
         AddStroke(path, ld, color, m);
     }
 
+    /// <summary>
+    /// POINT → 点标记（P2-3）。
+    ///
+    /// <para>原实现画固定 ±1 世界单位的十字：在 1:100 的图纸里那是 0.02mm，屏幕上永远看不见；
+    /// 深放大时又变成糊满屏的巨大十字。根因是点符号的尺寸本质上是**屏幕尺寸**
+    /// （PDSIZE 的两种主要口径都是视高百分比），世界坐标里没有唯一答案。</para>
+    ///
+    /// <para>所以这里只存 PDMODE/PDSIZE 原值（<see cref="PointMark"/>），
+    /// 由渲染端按当前视口换算成像素再画。包围盒退化为一个点（AutoCAD 的 POINT
+    /// 也不撑大图面范围），因此它不参与批次合并。</para>
+    /// </summary>
     private void AddPointCross(ACadSharp.Entities.Point pt, in SKMatrix m, uint color)
     {
-        const float s = 1.0f;
-        var path = new SKPath();
-        path.MoveTo((float)pt.Location.X - s, (float)pt.Location.Y);
-        path.LineTo((float)pt.Location.X + s, (float)pt.Location.Y);
-        path.MoveTo((float)pt.Location.X, (float)pt.Location.Y - s);
-        path.LineTo((float)pt.Location.X, (float)pt.Location.Y + s);
-        AddStroke(path, pt, color, m);
+        int mode = _pointDisplayMode;
+        if (mode == PointMarkStyle.ModeInvisible) { PointMarksHidden++; return; }
+
+        // 与其它实体走同一条 OCS → 块/布局变换链（顺序与 AddStroke 一致：先 OCS、后块矩阵）
+        var ocs = CadGeometry.OcsToWcs(pt);
+        var local = new SKPoint((float)pt.Location.X, (float)pt.Location.Y);
+        if (!ocs.IsIdentity) local = ocs.MapPoint(local);
+        var world = TransformPoint(m, local);
+
+        if (!InsideClip(SKRect.Create(world.X, world.Y, 0, 0))) { ClippedAway++; return; }
+
+        PointMarkEntities++;
+        _entities.Add(new CadEntity
+        {
+            Layer = LayerName(pt),
+            ColorArgb = color,
+            Handle = _currentHandle,
+            OwnHandle = _currentOwnHandle,
+            Mark = new PointMark { Position = world, Mode = mode, SizeSpec = _pointDisplaySize },
+            Bounds = SKRect.Create(world.X, world.Y, 0f, 0f),
+        });
     }
 
     private void AddSolid(Solid sol, in SKMatrix m, uint color)
@@ -322,16 +740,44 @@ public sealed class GeometryConverter
             return;
         }
 
-        for (int r = 0; r < rows; r++)
+        // 随块线宽：块内写 BYBLOCK 的实体继承本 INSERT 的有效线宽（与上方随块颜色同构）。
+        // INSERT 自己是 BYLAYER → 解析出图层线宽；自己是 BYBLOCK → 继承外层块引用，层层上溯。
+        int outerWeight = _inheritedLineWeight;
+        int blockWeight = ResolveLineWeight(ins, outerWeight);
+        _inheritedLineWeight = blockWeight;
+        try
         {
-            for (int c = 0; c < cols; c++)
+            for (int r = 0; r < rows; r++)
             {
-                // 阵列偏移在父坐标系内生效（与 insert 点同层），故夹在块变换与父变换之间
-                var mm = CadTransform.Mul(m, CadTransform.ArrayOffset(ins, r, c));
-                var totalM = CadTransform.Mul(mm, parent);
-                foreach (var child in ins.Block.Entities)
-                    ConvertEntity(child, totalM, depth + 1, blockColor, handleOverride: _currentHandle);
+                for (int c = 0; c < cols; c++)
+                {
+                    // 阵列偏移在父坐标系内生效（与 insert 点同层），故夹在块变换与父变换之间
+                    var mm = CadTransform.Mul(m, CadTransform.ArrayOffset(ins, r, c));
+                    var totalM = CadTransform.Mul(mm, parent);
+                    foreach (var child in ins.Block.Entities)
+                        ConvertEntity(child, totalM, depth + 1, blockColor, handleOverride: _currentHandle);
+                }
             }
+
+            // 属性值（ATTRIB）：值存在 ATTRIB 上（块定义里同名的是 AttributeDefinition 占位符）。
+            //
+            // **关键**：DWG/DXF 里 ATTRIB 的插入点与字高**已经过本插入的变换**，不能再乘一次。
+            // 实测（01 1#1层平面.dwg 的 DYC-A1 图框）：块内 ATTDEF 项目名称 (781.77, 76.09) 高 5，
+            // 插入点 (-23173.3,-30200.3) 比例 64 → ATTRIB 存的是 (26054.58,-25330.69)、高 320，
+            // 与 (-23173.3 + 781.77×64, -30200.3 + 76.09×64) 分毫不差。再乘一次会飞到 1.6e6 外。
+            // 因此这里只叠加**外层**矩阵（本插入若在别的块里，属性坐标仍在那一层的空间里）。
+            if (ins.Attributes is { Count: > 0 })
+            {
+                foreach (var att in ins.Attributes)
+                {
+                    if (att is null) continue;
+                    ConvertEntity(att, parent, depth + 1, blockColor, handleOverride: _currentHandle);
+                }
+            }
+        }
+        finally
+        {
+            _inheritedLineWeight = outerWeight;
         }
     }
 
@@ -341,35 +787,145 @@ public sealed class GeometryConverter
         var block = dim.Block;
         if (block is null) { Skipped++; return; }
         uint color = ResolveColor(dim, inheritedColor);
-        foreach (var child in block.Entities)
-            ConvertEntity(child, parent, depth + 1, color, handleOverride: _currentHandle);
+        // 标注块里的几何几乎全是 BYBLOCK：继承标注自身的线宽，否则会掉回 0.25mm 默认值
+        int outerWeight = _inheritedLineWeight;
+        _inheritedLineWeight = ResolveLineWeight(dim, outerWeight);
+        try
+        {
+            foreach (var child in block.Entities)
+                ConvertEntity(child, parent, depth + 1, color, handleOverride: _currentHandle);
+        }
+        finally
+        {
+            _inheritedLineWeight = outerWeight;
+        }
     }
 
+    /// <summary>
+    /// HATCH → 填充/图案线。
+    ///
+    /// <para><b>孤岛语义（CAD 口径）</b>：<see cref="Hatch.Paths"/> 是"外边界 + 若干孤岛"的
+    /// **环集合**，不是一个环一段独立填充。全部环必须合并成一个路径按**奇偶规则**填充：
+    /// 第 1/3/5… 层实心、第 2/4/6… 层是洞（洞中洞又实心），这才是 AutoCAD/ODA 的显示。
+    /// 图案线同样要对**全部环**求奇偶，否则图案会穿过孤岛。</para>
+    ///
+    /// <para>旧实现逐环独立填充 + 逐环独立生成图案，导致孤岛被填实、图案线穿洞；
+    /// 且边界路径是"每条边一个子路径"（<see cref="CadGeometry.AppendHatchLoop"/>），
+    /// 用 Fill 画多段直线环会退化成零面积 → 正方形实心填充整块不显示。
+    /// 这里改用压平后的**闭合点列**重建轮廓，实心与图案两条路径都正确。</para>
+    /// </summary>
     private void AddHatch(Hatch h, in SKMatrix m, uint color)
     {
         if (h.Paths == null) { Skipped++; return; }
+
+        var boundary = new SKPath { FillType = SKPathFillType.EvenOdd };
+        var segs = new List<(SKPoint a, SKPoint b)>();
+        var seenContours = new HashSet<string>(StringComparer.Ordinal);
+        int contours = 0;
+
         foreach (var bp in h.Paths)
         {
             if (bp?.Edges == null || bp.Edges.Count == 0) continue;
-            var path = new SKPath();
-            // 边界边（Line/Arc/Ellipse/Polyline）→ 路径，实现与标注分解共用（CadGeometry）
-            CadGeometry.AppendHatchLoop(path, bp);
-            if (h.IsSolid)
+
+            // 非法/重复边界不是"可填充的环"，AutoCAD 也不拿它们参与填充：
+            //   NotClosed —— 边界没闭合（实测剪力墙填充里有个覆盖全图的 4 边环带此标志，
+            //                当外边界用会把整层楼填成一片灰，墙反而变成洞）；
+            //   Duplicate —— 同一轮廓出现两次，进奇偶计数会把这块直接变成洞。
+            if (bp.Flags.HasFlag(BoundaryPathFlags.NotClosed)) { HatchBadLoops++; continue; }
+
+            foreach (var poly in FlattenHatchContours(bp))
             {
-                // 实心填充用 Fill 而非 Stroke（原实现把实心 HATCH 画成了一圈轮廓线）
-                path.Close();
-                AddFill(path, h, color, m);
-            }
-            else if (AddHatchPatternLines(path, bp, h, color, m))
-            {
-                // 图案已生成；边界不描边（AutoCAD/ODA 语义：非实心填充只显示图案线）
-                path.Dispose();
-            }
-            else
-            {
-                AddStroke(path, h, color, m);
+                if (poly.Count < 3) continue;
+                // 完全重合的环只保留一份（SameContour 用点序+"规格化"后的坐标串比对）
+                if (!seenContours.Add(ContourKey(poly))) { HatchDuplicateLoops++; continue; }
+                contours++;
+                boundary.MoveTo(poly[0]);
+                for (int i = 1; i < poly.Count; i++) boundary.LineTo(poly[i]);
+                boundary.Close();
+                for (int i = 0; i < poly.Count; i++)
+                {
+                    var a = poly[i];
+                    var b = poly[(i + 1) % poly.Count];
+                    if (a != b) segs.Add((a, b));
+                }
             }
         }
+
+        if (contours == 0 || boundary.IsEmpty) { boundary.Dispose(); Skipped++; return; }
+
+        // 渐变填充没有图案定义，AutoCAD/ODA 按渐变色铺满整个边界；
+        // 这里至少用渐变首色做实心填充（完整双向渐变留待 P2）。
+        if (h.IsSolid || IsGradientHatch(h))
+        {
+            AddFill(boundary, h, IsGradientHatch(h) ? GradientFillColor(h, color) : color, m);
+            return;
+        }
+
+        if (AddHatchPatternLines(segs, boundary.Bounds, h, color, m))
+        {
+            // 图案已生成；边界不描边（AutoCAD/ODA 语义：非实心填充只显示图案线）
+            boundary.Dispose();
+            return;
+        }
+        AddStroke(boundary, h, color, m);
+    }
+
+    /// <summary>是否渐变 HATCH（ACadSharp 没有 IsGradient 属性，看 GradientColor.Enabled）。</summary>
+    private static bool IsGradientHatch(Hatch h)
+    {
+        try { return h.GradientColor is { Enabled: true }; }
+        catch { return false; }
+    }
+
+    /// <summary>渐变 HATCH 的填充色：取渐变首色，取不到时退回实体/图层色。</summary>
+    private static uint GradientFillColor(Hatch h, uint fallback)
+    {
+        try
+        {
+            var colors = h.GradientColor?.Colors;
+            if (colors is { Count: > 0 })
+            {
+                var c = colors[0].Color;
+                if (!c.IsByLayer && !c.IsByBlock) return ToArgb(c, 7);
+            }
+        }
+        catch { }
+        return fallback;
+    }
+
+    /// <summary>轮廓的"规格化"键：从最小点开始按原方向排列，用于剔除完全重合的重复环。</summary>
+    private static string ContourKey(List<SKPoint> poly)
+    {
+        int n = poly.Count, best = 0;
+        for (int i = 1; i < n; i++)
+        {
+            var a = poly[i];
+            var b = poly[best];
+            if (a.X < b.X - 1e-3f || (MathF.Abs(a.X - b.X) <= 1e-3f && a.Y < b.Y - 1e-3f)) best = i;
+        }
+        var sb = new System.Text.StringBuilder(n * 14);
+        for (int k = 0; k < n; k++)
+        {
+            var p = poly[(best + k) % n];
+            sb.Append(MathF.Round(p.X, 2).ToString("F2", System.Globalization.CultureInfo.InvariantCulture)).Append(',')
+              .Append(MathF.Round(p.Y, 2).ToString("F2", System.Globalization.CultureInfo.InvariantCulture)).Append(';');
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 把一个边界环压平成若干**闭合多边形点列**（通常 1 条）。
+    /// 优先用边源数据（<see cref="CadGeometry.FlattenHatchLoopPoints"/>，顶点精确共享，
+    /// 图案行扫描的奇偶计数才可靠）；含 Spline 边时回退 SKPath 压平。
+    /// </summary>
+    private static List<List<SKPoint>> FlattenHatchContours(Hatch.BoundaryPath bp)
+    {
+        var direct = CadGeometry.FlattenHatchLoopPoints(bp);
+        if (direct is { Count: >= 3 }) return new List<List<SKPoint>> { direct };
+
+        using var loopPath = new SKPath();
+        CadGeometry.AppendHatchLoop(loopPath, bp);
+        return loopPath.IsEmpty ? new List<List<SKPoint>>() : FlattenContours(loopPath);
     }
 
     private const int MaxHatchPatternRows = 4096;
@@ -391,23 +947,18 @@ public sealed class GeometryConverter
     /// 不能从 0 起步遍历）；行线与边界压平线段求交，按奇偶规则取内部区间，
     /// 再按虚线表切段（相位锚定图案基点）。全部坐标在实体空间生成，经 AddStroke
     /// 统一施加 OCS 镜像与父矩阵，与边界路径同一变换链。
-    /// 返回 false = 无法生成（渐变填充 / 无图案定义 / 行数或线段数超限），调用方回退边界轮廓。
+    ///
+    /// <para><paramref name="segs"/> 是**全部环**（外边界 + 孤岛）的闭合线段表：
+    /// 一次穿越计数就把孤岛算成"外部"，图案线不会穿洞。</para>
+    /// 返回 false = 无法生成（无图案定义 / 行数或线段数超限），调用方回退边界轮廓。
     /// </summary>
-    private bool AddHatchPatternLines(SKPath boundary, Hatch.BoundaryPath bp, Hatch h, uint color, in SKMatrix m)
+    private bool AddHatchPatternLines(List<(SKPoint a, SKPoint b)> segs, SKRect bbox, Hatch h, uint color, in SKMatrix m)
     {
         var defs = h.Pattern?.Lines;
         if (defs == null || defs.Count == 0) { DiagHatchPatternFallback++; DiagHatchLastReason = "no-defs"; return false; }
 
-        // 首选闭合点列（顶点精确共享 → 行交点奇偶守恒）；
-        // 含 Spline 等不支持边时回退 SKPath 压平（奇偶可能被弧端点浮点差破坏）。
-        var loop = CadGeometry.FlattenHatchLoopPoints(bp);
-        var segs = loop != null
-            ? loop.Zip(loop.Skip(1).Append(loop[0]), (a, b) => (a, b)).Take(loop.Count)
-                  .Where(s => s.a != s.b).ToList()
-            : FlattenForHatch(boundary);
         if (segs.Count == 0) { DiagHatchPatternFallback++; DiagHatchLastReason = "no-segs"; return false; }
 
-        var bbox = boundary.Bounds;
         float pad = MathF.Max(bbox.Width, bbox.Height) * 0.05f + 1f;
         float minX = bbox.Left - pad, maxX = bbox.Right + pad;
         float minY = bbox.Bottom - pad, maxY = bbox.Top + pad;
@@ -575,114 +1126,356 @@ public sealed class GeometryConverter
         return emitted;
     }
 
-    /// <summary>路径 → 线段表（曲线按固定密度取样），供图案求交使用。</summary>
-    private static List<(SKPoint a, SKPoint b)> FlattenForHatch(SKPath path)
+    /// <summary>
+    /// 路径 → 每条子路径的压平点列（曲线按固定密度取样）。
+    /// 与"线段表"版本的区别：保留子路径边界，调用方可以重建闭合轮廓
+    /// （填充需要真正的多边形，一堆独立线段填不出面积）。
+    /// </summary>
+    private static List<List<SKPoint>> FlattenContours(SKPath path)
     {
-        var result = new List<(SKPoint, SKPoint)>();
+        var result = new List<List<SKPoint>>();
         using var it = path.CreateRawIterator();
         var pts = new SKPoint[4];
         SKPoint current = default, start = default;
+        var cur = new List<SKPoint>();
         SKPathVerb verb;
+
+        void Flush()
+        {
+            if (cur.Count >= 3)
+            {
+                // 与起点重合的收尾点去掉（后续按环形取边）
+                if (cur.Count > 3 && MathF.Abs(cur[^1].X - cur[0].X) < 1e-4f && MathF.Abs(cur[^1].Y - cur[0].Y) < 1e-4f)
+                    cur.RemoveAt(cur.Count - 1);
+                result.Add(cur);
+            }
+            cur = new List<SKPoint>();
+        }
+
+        void Poly(params SKPoint[] p)
+        {
+            foreach (var q in p)
+            {
+                if (cur.Count > 0)
+                {
+                    var l = cur[^1];
+                    if (MathF.Abs(l.X - q.X) < 1e-6f && MathF.Abs(l.Y - q.Y) < 1e-6f) continue;
+                }
+                cur.Add(q);
+            }
+        }
+
         while ((verb = it.Next(pts)) != SKPathVerb.Done)
         {
             switch (verb)
             {
                 case SKPathVerb.Move:
+                    Flush();
                     current = start = pts[0];
+                    cur.Add(current);
                     break;
                 case SKPathVerb.Line:
-                    result.Add((current, pts[1]));
+                    Poly(pts[1]);
                     current = pts[1];
                     break;
                 case SKPathVerb.Quad:
-                    FlattenQuad(current, pts[1], pts[2], 12, result);
+                {
+                    var t = new List<SKPoint>();
+                    SampleQuad(current, pts[1], pts[2], 12, t);
+                    Poly(t.ToArray());
                     current = pts[2];
                     break;
+                }
                 case SKPathVerb.Conic:
-                    FlattenConic(current, pts[1], pts[2], it.ConicWeight(), 16, result);
+                {
+                    var t = new List<SKPoint>();
+                    SampleConic(current, pts[1], pts[2], it.ConicWeight(), 16, t);
+                    Poly(t.ToArray());
                     current = pts[2];
                     break;
+                }
                 case SKPathVerb.Cubic:
-                    FlattenCubic(current, pts[1], pts[2], pts[3], 16, result);
+                {
+                    var t = new List<SKPoint>();
+                    SampleCubic(current, pts[1], pts[2], pts[3], 16, t);
+                    Poly(t.ToArray());
                     current = pts[3];
                     break;
+                }
                 case SKPathVerb.Close:
-                    result.Add((current, start));
+                    if (cur.Count > 0) Poly(start);
+                    Flush();
                     current = start;
                     break;
             }
         }
+        Flush();
         return result;
     }
 
-    private static void FlattenQuad(SKPoint p0, SKPoint p1, SKPoint p2, int n, List<(SKPoint, SKPoint)> outSegs)
+    private static void SampleQuad(SKPoint p0, SKPoint p1, SKPoint p2, int n, List<SKPoint> outp)
     {
-        var prev = p0;
         for (int j = 1; j <= n; j++)
         {
             float t = (float)j / n, mt = 1f - t;
-            var p = new SKPoint(
+            outp.Add(new SKPoint(
                 mt * mt * p0.X + 2 * mt * t * p1.X + t * t * p2.X,
-                mt * mt * p0.Y + 2 * mt * t * p1.Y + t * t * p2.Y);
-            outSegs.Add((prev, p));
-            prev = p;
+                mt * mt * p0.Y + 2 * mt * t * p1.Y + t * t * p2.Y));
         }
     }
 
-    private static void FlattenConic(SKPoint p0, SKPoint p1, SKPoint p2, float w, int n, List<(SKPoint, SKPoint)> outSegs)
+    private static void SampleConic(SKPoint p0, SKPoint p1, SKPoint p2, float w, int n, List<SKPoint> outp)
     {
-        var prev = p0;
         for (int j = 1; j <= n; j++)
         {
             float t = (float)j / n, mt = 1f - t;
             float u0 = mt * mt, u1 = 2 * mt * t * w, u2 = t * t;
             float sum = u0 + u1 + u2;
-            var p = new SKPoint((u0 * p0.X + u1 * p1.X + u2 * p2.X) / sum, (u0 * p0.Y + u1 * p1.Y + u2 * p2.Y) / sum);
-            outSegs.Add((prev, p));
-            prev = p;
+            outp.Add(new SKPoint((u0 * p0.X + u1 * p1.X + u2 * p2.X) / sum,
+                                 (u0 * p0.Y + u1 * p1.Y + u2 * p2.Y) / sum));
         }
     }
 
-    private static void FlattenCubic(SKPoint p0, SKPoint p1, SKPoint p2, SKPoint p3, int n, List<(SKPoint, SKPoint)> outSegs)
+    private static void SampleCubic(SKPoint p0, SKPoint p1, SKPoint p2, SKPoint p3, int n, List<SKPoint> outp)
     {
-        var prev = p0;
         for (int j = 1; j <= n; j++)
         {
             float t = (float)j / n, mt = 1f - t;
-            var p = new SKPoint(
+            outp.Add(new SKPoint(
                 mt * mt * mt * p0.X + 3 * mt * mt * t * p1.X + 3 * mt * t * t * p2.X + t * t * t * p3.X,
-                mt * mt * mt * p0.Y + 3 * mt * mt * t * p1.Y + 3 * mt * t * t * p2.Y + t * t * t * p3.Y);
-            outSegs.Add((prev, p));
-            prev = p;
+                mt * mt * mt * p0.Y + 3 * mt * mt * t * p1.Y + 3 * mt * t * t * p2.Y + t * t * t * p3.Y));
         }
     }
 
     // ---------- 文本 ----------
 
     /// <summary>
-    /// 文本实体 → <see cref="TextDraw"/>。
+    /// TEXT（单行）→ <see cref="TextDraw"/>。
     ///
-    /// 包围盒用 <see cref="TextMetrics"/> 的真实字体度量（原实现用
-    /// <c>raw.Length * height * 0.7</c> 粗估，样例里把整图范围左边界从 0 撑到 -53）。
-    /// 插入点按 CAD 惯例是基线左端，与渲染端 <c>DrawText(text, 0, 0)</c> 一致。
+    /// 与 ODA/AutoCAD 对齐的口径（2026-10-20 定标）：
+    /// <list type="bullet">
+    ///   <item>字高 = **大写字高**（cap height），不是字体 em 尺寸 —— 见 <see cref="TextMetrics"/>；</item>
+    ///   <item>宽度因子 = 组码 41（实体有效值，样式仅兜底）；</item>
+    ///   <item>倾斜 = 组码 51（弧度，样式仅兜底）；</item>
+    ///   <item>72/73 对齐：非「左 + 基线」时以组码 11 的定位点为锚，按 9 宫格算局部偏移。</item>
+    /// </list>
     /// </summary>
-    private void AddTextEntity(string? raw, XYZ pos, double height, double rotationRad, Entity e, in SKMatrix m, uint color)
+    private void AddText(TextEntity t, in SKMatrix m, uint color)
+    {
+        double height = t.Height;
+
+        // **字高/宽度因子/倾斜一律以实体值为准，样式参数不参与渲染** ——
+        // 受控基准图 .compare/fixture_style.dxf 五组对照实证（同一张图两路渲染）：
+        //   样式宽 0.5 + 实体 1.0 → ODA 按 1.0 画（293.2）；实体 0.5 → 147.6 ✔ 只有实体生效
+        //   样式倾斜 30° + 实体 0 → ODA 不倾斜；实体倾斜 30° → bbox 变宽 339.9 ✔ 同上
+        //   样式固定字高 40 + 实体 80 → ODA 按 80 画 ✔ 同上
+        // 原因：AutoCAD 在创建文字时就把样式值抄进实体，DXF 的 40/41/51 是**有效值**；
+        // 再乘/叠加样式值会双重压缩（0.7×0.7=0.49），字距与表格排版会整体错位。
+        double widthFactor = t.WidthFactor > 0 ? t.WidthFactor : 1.0;
+        double oblique = t.ObliqueAngle;   // ACadSharp 读出即为弧度
+
+        AddTextEntity(t.Value, t.InsertPoint, t.AlignmentPoint, height, t.Rotation,
+            widthFactor, oblique, t.HorizontalAlignment, t.VerticalAlignment, t, m, color);
+    }
+
+    /// <summary>
+    /// MTEXT → <see cref="TextDraw"/>。
+    /// 锚点按 <c>AttachmentPoint</c> 的 9 宫格换算成「基线左端」，与 TEXT 走同一条对齐管线。
+    /// （换行/断行见 P2-4，本步不做宽度断行。）
+    /// </summary>
+    private void AddMText(MText mt, string? raw, in SKMatrix m, uint color)
+    {
+        // MText 没有宽度因子字段（宽度由 RectangleWidth 决定，见下方断行）；
+        // 样式参数同样不参与渲染，理由见 AddText 的实测说明。
+        double widthFactor = 1.0;
+        double oblique = 0;
+        double height = mt.Height;
+
+        // ---- 断行：组码 41（RectangleWidth）是 AutoCAD 的排版栏宽，超过就折行 ----
+        var text = raw ?? string.Empty;
+        float rectWidth = (float)mt.RectangleWidth;
+        if (rectWidth > 0 && height > 0 && text.Length > 0)
+            text = TextWrap.Wrap(text, (float)height, rectWidth);
+
+        // 行距：AutoCAD 单倍 = 1.667 × 字高；组码 44（LineSpacing）是倍数，默认 1.0
+        float spacingFactor = TextMetrics.LineSpacingFactor
+                              * (mt.LineSpacing > 0 ? (float)mt.LineSpacing : 1f);
+        int lineCount = 1;
+        foreach (char ch in text) if (ch == '\n') lineCount++;
+
+        // 1..9 = 左上→右下；列决定水平对齐，行决定垂直对齐
+        int ap = (int)mt.AttachmentPoint;
+        if (ap < 1 || ap > 9) ap = 1;
+        int col = (ap - 1) % 3, row = (ap - 1) / 3;
+        var h = col switch
+        {
+            1 => TextHorizontalAlignment.Center,
+            2 => TextHorizontalAlignment.Right,
+            _ => TextHorizontalAlignment.Left,
+        };
+        var v = row switch
+        {
+            1 => TextVerticalAlignmentType.Middle,
+            2 => TextVerticalAlignmentType.Bottom,
+            _ => TextVerticalAlignmentType.Top,   // MTEXT 默认左上 = 首行顶部，不是基线
+        };
+
+        // MTEXT 的水平对齐作用于**每一行**（AutoCAD 行为），因此交给渲染端逐行对齐，
+        // 锚点偏移不再承担水平量；垂直方向仍按整块高度算首行基线。
+        var lineAlign = h switch
+        {
+            ACadSharp.Entities.TextHorizontalAlignment.Center => TextLineAlign.Center,
+            ACadSharp.Entities.TextHorizontalAlignment.Right => TextLineAlign.Right,
+            _ => TextLineAlign.Left,
+        };
+
+        // 注意：MTEXT 的组码 11 是「X 轴方向向量」而不是对齐点（ACadSharp 也照此映射到
+        // AlignmentPoint），因此锚点恒为 InsertPoint，垂直/水平对齐由 9 宫格偏移表达。
+        AddTextEntity(text, mt.InsertPoint, mt.InsertPoint, height, mt.Rotation,
+            widthFactor, oblique, h, v, mt, m, color,
+            lineCount: lineCount, lineSpacingFactor: spacingFactor,
+            lineAlign: lineAlign, alignPerLine: true);
+    }
+
+    /// <summary>
+    /// 文本实体 → <see cref="TextDraw"/>。转换阶段完成全部布局计算（对齐偏移、两点定宽），
+    /// 渲染端只负责「从 Position 按 Rotation 画、套 WidthFactor 与 Oblique」。
+    /// </summary>
+    private void AddTextEntity(string? raw, XYZ insert, XYZ align, double height, double rotation,
+        double widthFactor, double obliqueRadians,
+        ACadSharp.Entities.TextHorizontalAlignment h, TextVerticalAlignmentType v,
+        Entity e, in SKMatrix m, uint color,
+        int lineCount = 1, float lineSpacingFactor = TextMetrics.LineSpacingFactor,
+        TextLineAlign lineAlign = TextLineAlign.Left, bool alignPerLine = false)
     {
         if (string.IsNullOrWhiteSpace(raw) || height <= 0) { Skipped++; return; }
 
-        var p = TransformPoint(m, new SKPoint((float)pos.X, (float)pos.Y));
+        // 统一换行符，供测量与渲染共用（MTEXT 的 \P 已在 CleanMText 中转为 \n）
+        var text = raw.Replace("\r\n", "\n").Replace('\r', '\n');
+        if (text.TrimEnd('\n').Length == 0) { Skipped++; return; }
+
+        float wf = (float)(widthFactor > 0 ? widthFactor : 1.0);
+        float obl = (float)obliqueRadians;
+
+        var basePt = new SKPoint((float)insert.X, (float)insert.Y);
+        var alignPt = new SKPoint((float)align.X, (float)align.Y);
+
+        // 需要定位点（组码 11）的对齐方式：中心/右/中/两点式
+        bool needsAlignPoint = h != ACadSharp.Entities.TextHorizontalAlignment.Left
+                               || v != TextVerticalAlignmentType.Baseline;
+
+        // 老图纸常常写了 72/73 却漏写组码 11（读到 0,0），此时若直接用会把文字甩到原点。
+        // 判据：定位点在原点而插入点不在 → 视为缺失，退回插入点并把对齐降级为左/基线。
+        if (needsAlignPoint && IsOrigin(alignPt) && !IsOrigin(basePt))
+        {
+            needsAlignPoint = false;
+            h = ACadSharp.Entities.TextHorizontalAlignment.Left;
+            v = TextVerticalAlignmentType.Baseline;
+        }
+
+        // ---- 两点定宽（Aligned / Fit）：方向与宽度都由「插入点 → 定位点」决定 ----
+        float extraRot = 0f;
+        float alignWidth = -1f;
+        if (h is ACadSharp.Entities.TextHorizontalAlignment.Aligned
+              or ACadSharp.Entities.TextHorizontalAlignment.Fit)
+        {
+            float dx0 = alignPt.X - basePt.X, dy0 = alignPt.Y - basePt.Y;
+            float dist = MathF.Sqrt(dx0 * dx0 + dy0 * dy0);
+            if (dist > 1e-6f)
+            {
+                extraRot = MathF.Atan2(dy0, dx0) - (float)rotation;
+                alignWidth = dist;
+            }
+        }
+
+        float capE = (float)height;
+        float measured = TextMetrics.MeasureWidth(text, capE) * wf;
+        if (alignWidth > 0 && measured > 1e-6f)
+        {
+            float ratio = alignWidth / measured;
+            if (h == ACadSharp.Entities.TextHorizontalAlignment.Aligned)
+            {
+                // 两点对齐：字高等比缩放，宽度因子保持
+                capE *= ratio;
+                measured = alignWidth;
+            }
+            else
+            {
+                // 布满两点：只改宽度因子
+                wf *= ratio;
+                measured = alignWidth;
+            }
+        }
+
+        float desc = TextMetrics.DescenderDepth(text, capE);
+
+        // ---- 9 宫格局部偏移（世界坐标，y 向上；文本从基线左端向右上延伸）----
+        // 逐行对齐时水平量由渲染端按行分配（MTEXT），这里不再偏移，
+        // 否则"块居中"与"行居中"会叠加成二次偏移。
+        float offX = alignPerLine ? 0f : h switch
+        {
+            ACadSharp.Entities.TextHorizontalAlignment.Center => -measured * 0.5f,
+            ACadSharp.Entities.TextHorizontalAlignment.Middle => -measured * 0.5f,
+            ACadSharp.Entities.TextHorizontalAlignment.Right => -measured,
+            _ => 0f,
+        };
+
+        // 多行文本的垂直对齐按**整块**算（AutoCAD MTEXT 的 Middle/Bottom 指整个文字块）：
+        //   块高 = 字高 + (n-1)×行距 + 降部
+        //   Top    → 首行基线 = 锚点 − 字高（首行 cap 顶端贴锚点）
+        //   Middle → 首行基线 = 锚点 − 字高 + 块高/2
+        //   Bottom → 首行基线 = 锚点 + (n-1)×行距 + 降部
+        float lineH = capE * lineSpacingFactor;
+        float blockH = capE + (lineCount - 1) * lineH + desc;
+        float offY = v switch
+        {
+            TextVerticalAlignmentType.Top => -capE,                 // 顶部对齐 → 基线在锚点下方一个字高
+            TextVerticalAlignmentType.Middle => -capE + blockH * 0.5f,
+            TextVerticalAlignmentType.Bottom => (lineCount - 1) * lineH + desc,
+            _ => 0f,                                                // 基线对齐
+        };
+
+        var anchor = needsAlignPoint ? alignPt : basePt;
+        float rotEntity = (float)rotation + extraRot;
+        float cos = MathF.Cos(rotEntity), sin = MathF.Sin(rotEntity);
+        var entityPos = new SKPoint(
+            anchor.X + offX * cos - offY * sin,
+            anchor.Y + offX * sin + offY * cos);
+
+        // ---- 块变换 ----
         float det = m.ScaleX * m.ScaleY - m.SkewX * m.SkewY;
         float scale = MathF.Sqrt(MathF.Abs(det));
         if (float.IsNaN(scale) || scale <= 0) scale = 1f;
-        float rot = MathF.Atan2(m.SkewY, m.ScaleX);
-        float worldHeight = (float)height * scale;
-        float rotTotal = rot + (float)rotationRad;
+        float blockRot = MathF.Atan2(m.SkewY, m.ScaleX);
 
-        // 统一换行符，供测量与渲染共用（MTEXT 的 \P 已在 CleanMText 中转为 \n）
-        var text = raw.Replace("\r\n", "\n").Replace('\r', '\n');
+        var worldPos = TransformPoint(m, entityPos);
+        float worldCap = capE * scale;
+        float rotTotal = blockRot + rotEntity;
 
-        var local = TextMetrics.MeasureLocalBounds(text, worldHeight);
-        var bounds = TextMetrics.ToWorldBounds(local, p, rotTotal);
+        // 逐行对齐时包围盒按"整块矩形"算（各行首尾落在 ±块宽/2 或 −块宽 上）；
+        // 否则沿用字形级精确包围盒（TEXT 的口径不变，历史断言依赖它）。
+        SKRect local;
+        if (alignPerLine)
+        {
+            float left = lineAlign switch
+            {
+                TextLineAlign.Center => -measured * 0.5f,
+                TextLineAlign.Right => -measured,
+                _ => 0f,
+            };
+            float bottomLocal = -(lineCount - 1) * (worldCap * lineSpacingFactor)
+                                - TextMetrics.DescenderDepth(text, worldCap);
+            local = new SKRect(left, bottomLocal, left + measured, worldCap);
+        }
+        else
+        {
+            local = TextMetrics.MeasureLocalBounds(text, worldCap, wf, obl);
+        }
+        var bounds = TextMetrics.ToWorldBounds(local, worldPos, rotTotal);
+
+        // 视口裁剪：文字不在裁剪区内就整条跳过（压边的少量溢出可接受，
+        // 逐字裁剪要拆字形，代价远高于收益）
+        if (!InsideClip(bounds)) { ClippedAway++; return; }
 
         _entities.Add(new CadEntity
         {
@@ -690,10 +1483,22 @@ public sealed class GeometryConverter
             ColorArgb = color,
             Handle = _currentHandle,
             OwnHandle = _currentOwnHandle,
-            Text = new TextDraw { Text = text, Position = p, Height = worldHeight, RotationRadians = rotTotal },
+            Text = new TextDraw
+            {
+                Text = text,
+                Position = worldPos,
+                Height = worldCap,
+                RotationRadians = rotTotal,
+                WidthFactor = wf,
+                ObliqueRadians = obl,
+                LineSpacingFactor = lineSpacingFactor,
+                LineAlign = lineAlign,
+            },
             Bounds = bounds,
         });
     }
+
+    private static bool IsOrigin(SKPoint p) => MathF.Abs(p.X) < 1e-9f && MathF.Abs(p.Y) < 1e-9f;
 
     public static string CleanMText(string? s)
     {
@@ -714,9 +1519,63 @@ public sealed class GeometryConverter
             _layerColors[name] = ToArgb(layer.Color, 7);
             _layerOrder.Add(name);
 
+            // 图层线宽（1/100 mm）：图层的线宽也可能是 ByLayer/Default，此时用默认 0.25mm
+            int lw = Mm100(layer.LineWeight);
+            _layerWeights[name] = lw > 0 ? lw : DefaultLineWeightMm100;
+
             // 图层被关闭（IsOn=false）或冻结 → 打开图纸时默认隐藏
             if (!layer.IsOn || layer.Flags.HasFlag(LayerFlags.Frozen))
                 _initiallyHidden.Add(name);
+            else if (!layer.PlotFlag)
+            {
+                // 不打印图层（AutoCAD 的 DEFPOINTS 就是这一类）→ 也默认隐藏。
+                //
+                // 判据来自 ODA 对照（2026-10-21，3、幕墙横方总汇.dwg）：该图 15,992 个 POINT
+                // 全部落在 DEFPOINTS 上，Teigha 出图里一个都看不到，而我们按 PDMODE/PDSIZE
+                // 画出来是满屏的点阵 —— 说明参照实现走的是**打印语义**。
+                // 处理成"默认隐藏、可在图层面板打开"，比直接丢弃更保守：
+                // 编辑器里核对时仍能看到，也能随时对比有无。
+                _initiallyHidden.Add(name);
+                NonPlottingLayers++;
+            }
+        }
+    }
+
+    /// <summary>autoCAD 默认线宽 0.25mm（头变量 LWDEFAULT；ACadSharp 未暴露，用行业默认值）。</summary>
+    private const int DefaultLineWeightMm100 = 25;
+
+    /// <summary>
+    /// <see cref="LineWeightType"/> → 1/100 mm。
+    /// 枚举名直接编码了线宽（W25 = 0.25mm、W211 = 2.11mm），负值那几种是"随层/随块/默认/设备像素"。
+    /// </summary>
+    private static int Mm100(LineWeightType lw) => lw switch
+    {
+        LineWeightType.ByLayer => -1,
+        LineWeightType.ByBlock => -2,
+        LineWeightType.Default => -3,
+        LineWeightType.ByDIPs => -4,
+        _ => int.TryParse(lw.ToString().AsSpan(1), out var v) ? v : -3,
+    };
+
+    /// <summary>
+    /// 解析实体线宽（1/100 mm）。ByBlock 继承块引用线宽，ByLayer 取图层线宽，
+    /// Default 用 0.25mm。返回 0 = 不显示线宽（按细线画）。
+    /// </summary>
+    private int ResolveLineWeight(Entity e, int inheritedMm100)
+    {
+        int lw = Mm100(e.LineWeight);
+        switch (lw)
+        {
+            case -2: return inheritedMm100 > 0 ? inheritedMm100 : DefaultLineWeightMm100;   // ByBlock
+            case -4: return 0;                                                              // ByDIPs：按像素，不参与
+            case -1:
+            {
+                var name = LayerName(e);
+                if (_layerWeights.TryGetValue(name, out var v)) return v;
+                return DefaultLineWeightMm100;
+            }
+            case -3: return DefaultLineWeightMm100;
+            default: return lw;
         }
     }
 
@@ -780,13 +1639,22 @@ public sealed class GeometryConverter
     // 轮廓每处圆角断开、Extents 被撑大近 20 倍）。2D 图纸法向只有 ±Z 两种。
     // Normal 不在 Entity 基类上（ACadSharp 3.4.9 各具体类自行声明），只能逐类型取。
 
-    private void AddStroke(SKPath path, Entity e, uint color, in SKMatrix m, float lineWidth = 0)
+    private void AddStroke(SKPath path, Entity e, uint color, in SKMatrix m)
     {
-        var ocs = CadGeometry.OcsMirrorMatrix(e);
+        var ocs = CadGeometry.OcsToWcs(e);
         if (!ocs.IsIdentity) path.Transform(ocs);
         path.Transform(m);
+        var clipped = ApplyViewportClip(path);
+        if (clipped is null) return;
+        path = clipped;
         var bounds = path.Bounds;
         if (float.IsNaN(bounds.Left)) { path.Dispose(); Skipped++; return; }
+
+        // 线宽：实体/图层/块的解析结果（1/100 mm），换算成屏幕像素留给渲染期
+        // （模型空间是固定像素、图纸空间按真实单位，见 CadEntity.LineWeightMm100）。
+        int lw100 = ResolveLineWeight(e, _inheritedLineWeight);
+        if (lw100 > 0) LineWeightEntities++;
+
         _entities.Add(new CadEntity
         {
             Layer = LayerName(e),
@@ -794,11 +1662,17 @@ public sealed class GeometryConverter
             Handle = _currentHandle,
             OwnHandle = _currentOwnHandle,
             Path = path,
-            LineWidth = lineWidth,
+            LineWeightMm100 = lw100,
             DashPattern = ResolveDashPattern(e, m),
             Bounds = bounds,
         });
     }
+
+    /// <summary>
+    /// 图纸空间里「1 mm = 多少图纸单位」。按 1:1 mm 出图时取 1；英制或缩放图纸可调。
+    /// 只影响**布局**里的线宽显示（那里线宽按真实单位画）；模型空间是固定像素宽，用不到它。
+    /// </summary>
+    public float WorldUnitsPerMm { get; set; } = 1f;
 
     /// <summary>
     /// 解析实体的显示线型为 Skia 虚线间隔（on/off 交替，世界单位）。
@@ -852,9 +1726,12 @@ public sealed class GeometryConverter
 
     private void AddFill(SKPath path, Entity e, uint color, in SKMatrix m)
     {
-        var ocs = CadGeometry.OcsMirrorMatrix(e);
+        var ocs = CadGeometry.OcsToWcs(e);
         if (!ocs.IsIdentity) path.Transform(ocs);
         path.Transform(m);
+        var clipped = ApplyViewportClip(path);
+        if (clipped is null) return;
+        path = clipped;
         var bounds = path.Bounds;
         if (float.IsNaN(bounds.Left)) { path.Dispose(); Skipped++; return; }
         _entities.Add(new CadEntity

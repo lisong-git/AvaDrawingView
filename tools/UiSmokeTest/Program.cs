@@ -255,6 +255,181 @@ int Run(string[] argv)
     view.MinEntityPixelSize = 1.5f;
     view.MinTextPixelSize = DrawingView.Controls.DrawingView.DefaultMinTextPixelSize;
 
+    // ---------- 12. 线宽显示（B3）：像素级口径 ----------
+    // 判据全部落在"屏幕上多少像素"，因为线宽的两种显示口径的差别**只**体现在像素上：
+    //   模型空间 = 固定像素宽（不随缩放变化）；图纸空间 = 真实单位（随缩放变化）。
+    // 样例 sample_lineweight.dxf 是 5 条等长水平线，从下往上 0.13 / 0.50 / 2.11 / 1.00 / 0.50(BYBLOCK) mm。
+    var lwPath = FindSampleFile("sample_lineweight.dxf");
+    if (lwPath is null)
+    {
+        Check(false, "找得到线宽样例 sample_lineweight.dxf（先跑 tools/SampleGen）");
+    }
+    else
+    {
+        var lwList = CadDocumentLoader.LoadAsync(lwPath).GetAwaiter().GetResult();
+        view.ShowLineWeights = false;
+        view.SetDisplay(lwList);
+        view.FitToContent();
+        window.CaptureRenderedFrame();
+        var offA = CrossSection(window.CaptureRenderedFrame());
+        Log($"       线宽关：各线像素宽 {Str(offA)}");
+        Check(offA.Count == 5 && offA.All(t => t is > 0.6f and < 1.6f),
+              $"线宽关 → 5 条线全部约 1px（实际 [{Str(offA)}]）");
+
+        view.ShowLineWeights = true;
+        window.CaptureRenderedFrame();
+        var onA = CrossSection(window.CaptureRenderedFrame());
+        Log($"       线宽开（适应窗口, zoom={view.Viewport.Zoom:F3}）：各线像素宽 {Str(onA)}");
+        // 自上而下：y=160(BYBLOCK 0.50) / 120(1.00) / 80(2.11) / 40(0.50) / 0(0.13)
+        // 期望 ≈ 0.50→1.9 / 1.00→3.8 / 2.11→8.0 / 0.50→1.9 / 0.13→1.0（0.13mm 不足 1px，退回 1px）
+        Check(onA.Count == 5, $"线宽开 → 仍是 5 条（实际 {onA.Count}）");
+        if (onA.Count == 5)
+        {
+            Check(Near(onA[0], 1.89f, 0.6f), $"BYBLOCK 0.50mm → 1.9px（实际 {onA[0]:F2}）");
+            Check(Near(onA[1], 3.78f, 0.8f), $"实体 1.00mm → 3.8px（实际 {onA[1]:F2}）");
+            Check(Near(onA[2], 7.97f, 1.0f), $"图层 2.11mm → 8.0px（实际 {onA[2]:F2}）");
+            Check(Near(onA[3], 1.89f, 0.6f), $"图层 0.50mm → 1.9px（实际 {onA[3]:F2}）");
+            Check(Near(onA[4], 1.0f, 0.5f), $"0.13mm 不足 1px → 退回 1px（实际 {onA[4]:F2}）");
+            Check(onA[2] > onA[1] && onA[1] > onA[0],
+                  $"线宽序关系 0.13 ≈ 0.50 &lt; 1.00 &lt; 2.11 成立（[{Str(onA)}]）");
+        }
+
+        // 关键口径：模型空间线宽是**固定像素**，缩小视角后像素宽不变
+        // （这正是 AutoCAD 里"缩小看线宽相对更粗"的成因）。这里缩到 0.6 倍，
+        // 保持 5 条线都还在视口内（放大到 2 倍会把上下两条推出画面）。
+        view.ZoomBy(0.6f);
+        window.CaptureRenderedFrame();
+        var onB = CrossSection(window.CaptureRenderedFrame());
+        Log($"       线宽开（缩小 0.6x, zoom={view.Viewport.Zoom:F3}）：各线像素宽 {Str(onB)}");
+        bool stable = onB.Count == 5 && onA.Count == 5
+                      && Enumerable.Range(0, 5).All(i => Near(onB[i], onA[i], 0.35f));
+        Check(stable, $"模型空间线宽不随缩放变化（0.6x 前后 [{Str(onA)}] vs [{Str(onB)}]）");
+
+        // lwList 是本次新建的实例，SetDisplay 会接管它；上面那张 r12 的 list 早已被释放，
+        // 不能再塞回去（已释放的 SKPath 再画会 AccessViolation，这是刻意留的注释）。
+        view.ShowLineWeights = false;
+        window.CaptureRenderedFrame();
+    }
+
+    // ---------- 13. MTEXT 排版（P2-4）：逐行对齐与行距只能在像素上验证 ----------
+    // 转换端只负责把「行距系数 / 逐行对齐方式」记进 TextDraw，真正决定观感的是渲染端
+    // 每一行的 x 偏移与 y 间距。数值断言（tools/SmokeTest）看不到这两件事，
+    // 所以这里把 sample_mtext.dxf 画出来，直接量每行墨迹的水平中心与行距。
+    var mtPath = FindSampleFile("sample_mtext.dxf");
+    if (mtPath is null)
+    {
+        Check(false, "找得到 MTEXT 样例 sample_mtext.dxf（先跑 tools/SampleGen）");
+    }
+    else
+    {
+        var mtList = CadDocumentLoader.LoadAsync(mtPath).GetAwaiter().GetResult();
+        view.SetDisplay(mtList);
+        view.FitToContent();
+        window.CaptureRenderedFrame();
+        var frame = window.CaptureRenderedFrame();
+        Log($"       MTEXT 样例 zoom={view.Viewport.Zoom:F3}");
+
+        var textEnts = mtList.Entities.Where(e => e.Text is not null).ToList();
+        var centeredEnt = textEnts.FirstOrDefault(e => Near(e.Text!.Position.X, 200f, 1f));
+        var doubledEnt = textEnts.FirstOrDefault(e => e.Text!.LineSpacingFactor > 3f);
+        var wrappedEnt = textEnts.FirstOrDefault(e => e.Text!.Text.Count(c => c == '\n') >= 3);
+
+        // 居中块：3 行、"AAAA…/A/AAAAAA"，逐行居中后各行的墨迹中心必须重合在锚点 x=200 上。
+        // 若渲染端只做整块居中（不逐行），短行的中心会偏到与块中心相当的位置 —— 差得足够大。
+        if (centeredEnt is null) Check(false, "找到居中 MTEXT 实体");
+        else
+        {
+            float anchorX = view.Viewport.WorldToScreen(new SKPoint(200f, 0f)).X;
+            var bands = InkBands(frame, centeredEnt.Bounds, 4, view);
+            Log($"       居中块各行墨迹（锚点屏幕 x={anchorX:F1}）：{BandsStr(bands)}");
+            Check(bands.Count == 3, $"居中块画出 3 行（实际 {bands.Count}）");
+            if (bands.Count == 3)
+            {
+                bool allCentered = bands.All(b => Near(b.MidX, anchorX, 3f));
+                Check(allCentered,
+                      $"三行各自居中于锚点（各中心 {string.Join(",", bands.Select(b => b.MidX.ToString("F1")))} vs {anchorX:F1}）");
+                // 行宽差异要真的存在，否则"逐行居中"与"整块居中"无从区分
+                float wMax = bands.Max(b => b.Width), wMin = bands.Min(b => b.Width);
+                Check(wMax / MathF.Max(wMin, 1e-3f) > 3f,
+                      $"各行宽度差异明显（{wMax:F1}px vs {wMin:F1}px）");
+            }
+        }
+
+        // 双倍行距块：两行 "AAAA/AAAA"，行距 = 2 × 1.667 × 字高 = 33.3 世界单位。
+        // 单倍会是 16.67 → 屏幕上差一倍，用像素间距即可判定组码 44 是否生效。
+        if (doubledEnt is null) Check(false, "找到双倍行距 MTEXT 实体");
+        else
+        {
+            var bands = InkBands(frame, doubledEnt.Bounds, 4, view);
+            Log($"       双倍行距块：{BandsStr(bands)}");
+            Check(bands.Count == 2, $"双倍行距块画出 2 行（实际 {bands.Count}）");
+            if (bands.Count == 2)
+            {
+                float pitch = MathF.Abs(bands[1].MidY - bands[0].MidY) / view.Viewport.Zoom;
+                Check(Near(pitch, 10f * 2f * TextMetrics.LineSpacingFactor, 1.2f),
+                      $"基线间距 ≈ 33.34 世界单位（实际 {pitch:F2}，单倍会是 16.67）");
+            }
+        }
+
+        // 栏宽断行块：每行墨迹宽度不得超过栏宽 60（世界单位）
+        if (wrappedEnt is null) Check(false, "找到栏宽断行 MTEXT 实体");
+        else
+        {
+            var bands = InkBands(frame, wrappedEnt.Bounds, 4, view);
+            Log($"       断行块 {bands.Count} 行：{BandsStr(bands)}");
+            Check(bands.Count >= 3, $"栏宽 60 的长文本被折成多行（实际 {bands.Count} 行）");
+            float limitPx = 60f * view.Viewport.Zoom;
+            float widest = bands.Count == 0 ? 0f : bands.Max(b => b.Width);
+            Check(widest <= limitPx + 2f,
+                  $"没有一行溢出栏宽（最宽 {widest:F1}px，栏宽 {limitPx:F1}px）");
+        }
+
+        // mtList 同样由 SetDisplay 接管，不再回填旧列表（见线宽段注释）
+    }
+
+    // ---------- 14. 点标记（P2-3）：尺寸是屏幕口径，不随缩放变化 ----------
+    // PDSIZE=0 的语义是"视口高度的 5%"，所以判据只能是像素：两个缩放级别下
+    // 同一个点的符号直径必须相等（世界坐标几何做不到这件事，这正是原实现的问题）。
+    var ptPath = FindSampleFile("sample_point.dxf");
+    if (ptPath is null)
+    {
+        Check(false, "找得到点样式样例 sample_point.dxf（先跑 tools/SampleGen）");
+    }
+    else
+    {
+        var ptList = CadDocumentLoader.LoadAsync(ptPath).GetAwaiter().GetResult();
+        view.SetDisplay(ptList);
+        view.FitToContent();
+        // FitToContent 是"下一次渲染时生效"的挂起状态：必须先吃一帧，否则紧随其后的
+        // ZoomBy 会被这一帧的 fit 结果覆盖（logs 里表现为 zoom 停在适应窗口值）。
+        window.CaptureRenderedFrame();
+        // 适应窗口后三个点正好落在视口四角，量尺寸会被边界裁剪干扰（点符号有半径）。
+        // 缩到 0.75 留出边距，之后再放大/缩小各量一次。
+        view.ZoomBy(0.75f);
+        window.CaptureRenderedFrame();
+        Log($"       点样例 zoom={view.Viewport.Zoom:F3}，PDMODE={ptList.Entities.First(e => e.Mark is not null).Mark!.Mode}");
+
+        float expect = h * PointMarkStyle.DefaultViewportPercent * 0.01f;
+        float first = MeasureMarkSize(window, view, 0f, 0f);
+        Check(Near(first, expect, 3f),
+              $"PDSIZE=0 → 符号直径 ≈ 视高 5%（期望 {expect:F1}px，实际 {first:F1}px）");
+
+        // 缩小视角：屏幕口径的尺寸必须不变（世界口径会跟着缩）
+        view.ZoomBy(0.6f);
+        window.CaptureRenderedFrame();
+        float second = MeasureMarkSize(window, view, 0f, 0f);
+        Check(Near(second, first, 1.5f),
+              $"缩小 0.6x 后点符号直径不变（{first:F1}px → {second:F1}px）");
+
+        // 放大视角再验一次（世界口径会跟着放大，屏幕口径不变）。
+        // 只放大到 1.2x：三个点都在内容四角，再放大就把被量的那个点推出视口了。
+        view.ZoomBy(1.2f / 0.6f);
+        window.CaptureRenderedFrame();
+        float third = MeasureMarkSize(window, view, 0f, 0f);
+        Check(Near(third, first, 1.5f),
+              $"放大到 1.2x 后点符号直径仍不变（{first:F1}px → {third:F1}px）");
+    }
+
     if (fails == 0)
     {
         Log("UI SMOKE TEST PASSED");
@@ -321,6 +496,150 @@ static void DumpFrame(Window window, Action<string> log)
     }
 }
 
+/// <summary>
+/// 沿画面中间一列量各条水平线的**有效像素宽度**。
+///
+/// <para>为什么不直接数连续亮像素的行数：1px 的线正好落在像素边界时会被抗锯齿摊到相邻两行、
+/// 每行只有约 50% 覆盖度，按"亮度 &gt; 128"数会得到 0 行或 2 行，断言随子像素位置抖动。
+/// 这里改用覆盖率积分：每行取 luma/255 当覆盖率，把相邻有覆盖的行合并成一段，段内求和
+/// 就是这条线的有效像素宽度（白线黑底，1px 线积分 ≈ 1.0，2px ≈ 2.0）。</para>
+///
+/// 返回自上而下的各段宽度（float，未取整）。
+/// </summary>
+static List<float> CrossSection(WriteableBitmap? frame)
+{
+    var bands = new List<float>();
+    if (frame is null) return bands;
+    using var fb = frame.Lock();
+    bool bgra = fb.Format == PixelFormat.Bgra8888;
+    int w = fb.Size.Width, h = fb.Size.Height, stride = fb.RowBytes;
+    var row = new byte[stride];
+    int x = w / 2;
+    var cover = new float[h];
+    for (int y = 0; y < h; y++)
+    {
+        Marshal.Copy(IntPtr.Add(fb.Address, y * stride), row, 0, stride);
+        int o = x * 4;
+        byte c0 = row[o], c1 = row[o + 1], c2 = row[o + 2];
+        byte r = bgra ? c2 : c0, g = c1, b = bgra ? c0 : c2;
+        cover[y] = (r * 0.299f + g * 0.587f + b * 0.114f) / 255f;
+    }
+
+    int i = 0;
+    while (i < h)
+    {
+        if (cover[i] < 0.05f) { i++; continue; }
+        int startIdx = i;
+        float sum = 0f;
+        while (i < h && cover[i] >= 0.05f) { sum += cover[i]; i++; }
+        // 丢掉贴着画面上下边缘的段（跨屏实体，高度不可信）
+        if (startIdx > 0 && i < h) bands.Add(sum);
+    }
+    return bands;
+}
+
+/// <summary>像素宽度列表 → "1.00,3.78,..." 便于日志比对。</summary>
+static string Str(List<float> values) => string.Join(" ", values.Select(v => v.ToString("F2")));
+
+/// <summary>
+/// 把给定**世界矩形**范围内的墨迹按行带切出来（验证多行文本的行数、行中心、行距）。
+///
+/// <para>行带判据是"该行有任一像素够亮"，再合并相邻行 —— 字母上下半之间的空隙会被并进
+/// 同一行带，正是我们要的"一行文字"粒度。每行的左右边界取该行带内墨迹像素的最小/最大 x，
+/// 于是"这行是否居中""行宽多少"都能直接量出来，不必关心字体内部度量。</para>
+///
+/// <paramref name="marginPx"/> 沿四周外扩，避免抗锯齿边缘压界被切掉。
+/// </summary>
+static List<InkBand> InkBands(WriteableBitmap? frame, SKRect world, int marginPx,
+                               DrawingView.Controls.DrawingView view)
+{
+    var bands = new List<InkBand>();
+    if (frame is null) return bands;
+
+    // 世界 Y 向上、屏幕 Y 向下：SKRect.Top 是较小 y（世界里的**下方**），故各自取 min/max
+    var a = view.Viewport.WorldToScreen(new SKPoint(world.Left, world.Top));
+    var b = view.Viewport.WorldToScreen(new SKPoint(world.Right, world.Bottom));
+    int x0 = (int)MathF.Floor(MathF.Min(a.X, b.X)) - marginPx;
+    int x1 = (int)MathF.Ceiling(MathF.Max(a.X, b.X)) + marginPx;
+    int y0 = (int)MathF.Floor(MathF.Min(a.Y, b.Y)) - marginPx;
+    int y1 = (int)MathF.Ceiling(MathF.Max(a.Y, b.Y)) + marginPx;
+
+    using var fb = frame.Lock();
+    bool bgra = fb.Format == PixelFormat.Bgra8888;
+    int w = fb.Size.Width, h = fb.Size.Height, stride = fb.RowBytes;
+    var row = new byte[stride];
+
+    x0 = Math.Clamp(x0, 0, w - 1); x1 = Math.Clamp(x1, 0, w - 1);
+    y0 = Math.Clamp(y0, 0, h - 1); y1 = Math.Clamp(y1, 0, h - 1);
+    if (x1 <= x0 || y1 <= y0) return bands;
+
+    int bandTop = -1, bandLeft = int.MaxValue, bandRight = int.MinValue;
+
+    void Flush(int bottom)
+    {
+        if (bandTop < 0) return;
+        bands.Add(new InkBand(bandTop, bottom, bandLeft, bandRight));
+        bandTop = -1; bandLeft = int.MaxValue; bandRight = int.MinValue;
+    }
+
+    for (int y = y0; y <= y1; y++)
+    {
+        Marshal.Copy(IntPtr.Add(fb.Address, y * stride), row, 0, stride);
+        bool any = false;
+        for (int x = x0; x <= x1; x++)
+        {
+            int o = x * 4;
+            byte c0 = row[o], c1 = row[o + 1], c2 = row[o + 2];
+            byte r = bgra ? c2 : c0, g = c1, bl = bgra ? c0 : c2;
+            if (r * 0.299f + g * 0.587f + bl * 0.114f < 64f) continue;   // 白字黑底：暗像素不是墨迹
+            any = true;
+            if (x < bandLeft) bandLeft = x;
+            if (x > bandRight) bandRight = x;
+        }
+        if (any) { if (bandTop < 0) bandTop = y; }
+        else Flush(y - 1);
+    }
+    Flush(y1);
+
+    // 贴着窗口上下边缘的行带宽度不可信（被裁掉了），剔除
+    bands.RemoveAll(bd => bd.Top <= y0 || bd.Bottom >= y1);
+    return bands;
+}
+
+/// <summary>
+/// 量某个世界坐标处点标记的**符号直径**（像素）。做法是用方圆 ±60px 的窗口取行带，
+/// 取唯一那条行带的高度：PDMODE=34 是"十字 + 套圆"，圆的上下沿就是符号的上下沿。
+/// 窗口内没有墨迹（或压到别的实体）时返回 -1，让断言直接失败而不是巧合通过。
+/// </summary>
+static float MeasureMarkSize(Window window, DrawingView.Controls.DrawingView view, float wx, float wy)
+{
+    var frame = window.CaptureRenderedFrame();
+    float half = 60f / MathF.Max(view.Viewport.Zoom, 1e-6f);
+    var region = SKRect.Create(wx - half, wy - half, half * 2, half * 2);
+    var bands = InkBands(frame, region, 0, view);
+    if (bands.Count != 1) return -1f;
+    return bands[0].Bottom - bands[0].Top + 1;
+}
+
+/// <summary>行带列表 → "top-bottom[cx,w]" 便于日志比对。</summary>
+static string BandsStr(List<InkBand> bands)
+    => string.Join(" ", bands.Select(b => $"{b.Top}-{b.Bottom}[{b.MidX:F1},w{b.Width:F0}]"));
+
+/// <summary>浮点近似比较（像素量测用，容差以像素为单位）。</summary>
+static bool Near(float actual, float expected, float tolerance) => MathF.Abs(actual - expected) <= tolerance;
+
+static string? FindSampleFile(string fileName)
+{
+    var dir = new DirectoryInfo(AppContext.BaseDirectory);
+    while (dir is not null)
+    {
+        var candidate = Path.Combine(dir.FullName, "samples", fileName);
+        if (File.Exists(candidate)) return candidate;
+        dir = dir.Parent;
+    }
+    return null;
+}
+
 static string? FindSample()
 {
     // 从输出目录向上找 samples/，避免写死盘符（与 SmokeTest 硬编码路径的区别）
@@ -332,4 +651,12 @@ static string? FindSample()
         dir = dir.Parent;
     }
     return null;
+}
+
+/// <summary>一行墨迹：垂直范围、水平范围与中心。</summary>
+record InkBand(int Top, int Bottom, int Left, int Right)
+{
+    public float MidX => (Left + Right) / 2f;
+    public float MidY => (Top + Bottom) / 2f;
+    public float Width => Right - Left;
 }

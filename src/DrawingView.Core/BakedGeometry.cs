@@ -21,6 +21,16 @@ public sealed class BakedBucket
     public int EntityCount { get; init; }
     /// <summary>线型虚线间隔（世界单位）；null = 实线。同一批次内线型相同。</summary>
     public float[]? DashPattern { get; init; }
+    /// <summary>
+    /// 本批次的描边宽度（世界单位，0 = 细线）。
+    ///
+    /// <para>线宽必须进批次键：一批只用一个 SKPaint，混宽会串线。
+    /// 早期实现把"有线宽实体"整批剔到 <c>WideStrokeEntities</c> 里逐条画，
+    /// 但 AutoCAD 图纸里 0.25mm 是**默认线宽**——按 ByLayer 解析后几乎每个实体都有线宽，
+    /// 那样等于把全部几何踢出批次路径（13.5 万实体 → 13.5 万次 DrawPath），
+    /// 实测帧时间从 5ms 退回 137ms。改为按线宽分桶后批次数量只增加"线宽种类数"倍（通常 2~5）。</para>
+    /// </summary>
+    public int LineWidthMm100 { get; init; }
 }
 
 /// <summary>
@@ -61,10 +71,14 @@ public sealed class BakedGeometry : IDisposable
 {
     /// <summary>世界尺寸档，由小到大。</summary>
     public required IReadOnlyList<BakedBucketSet> Classes { get; init; }
-    /// <summary>线宽 &gt; 0 的实体不参与合并（paint 状态不同），单独保留逐实体绘制。</summary>
-    public required IReadOnlyList<CadEntity> WideStrokeEntities { get; init; }
-    /// <summary>文本实体：尺寸随缩放变化，不合并，走 LOD 逐条绘制。</summary>
-    public required IReadOnlyList<CadEntity> TextEntities { get; init; }
+    /// <summary>
+    /// 不合并的实体：文本与点标记。
+    ///
+    /// <para>共同点是**屏幕尺寸不受世界坐标约束**：文字按像素高度做 LOD 与字体取整，
+    /// 点标记（POINT）按 PDSIZE 的视高百分比定尺寸。烘焙成世界坐标几何就只能二选一错，
+    /// 所以它们留在原列表里，渲染期逐条在屏幕空间绘制。</para>
+    /// </summary>
+    public required IReadOnlyList<CadEntity> UnbatchedEntities { get; init; }
     public required int SourceEntityCount { get; init; }
     public required double BakeMs { get; init; }
     /// <summary>合并后的总批次数（各档合计）。</summary>
@@ -75,7 +89,7 @@ public sealed class BakedGeometry : IDisposable
     /// <summary>
     /// 释放批次内的合并路径（原生内存）。
     ///
-    /// 注意：<see cref="WideStrokeEntities"/> / <see cref="TextEntities"/> 里的实体与
+    /// 注意：<see cref="UnbatchedEntities"/> 里的实体与
     /// <c>DisplayList.Entities</c> 是**同一批对象**（烘焙只是过滤，没有复制），
     /// 它们的路径由 <c>DisplayList</c> 统一释放，此处绝不能重复释放。
     /// 本类只负责自己新建的合并路径。
@@ -123,26 +137,29 @@ public static class GeometryBaker
 
         var sw = Stopwatch.StartNew();
         var map = new Dictionary<Key, Accum>(entities.Count / 8 + 16);
-        var wide = new List<CadEntity>();
-        var texts = new List<CadEntity>();
+        var unbatched = new List<CadEntity>();
 
         int n = 0;
         foreach (var e in entities)
         {
             if ((++n % 4096) == 0) ct.ThrowIfCancellationRequested();
-            if (e.Text is not null) { texts.Add(e); continue; }
+            // 文本与点标记都不进批次（屏幕空间绘制），见 UnbatchedEntities 的说明
+            if (e.Text is not null || e.Mark is not null) { unbatched.Add(e); continue; }
             if (e.Path is not null)
             {
-                if (e.LineWidth > 0f) { wide.Add(e); continue; }
-                var acc = Get(map, SizeClassOf(e.Bounds), e.Layer, e.ColorArgb, e.DashPattern);
+                var acc = Get(map, SizeClassOf(e.Bounds), e.Layer, e.ColorArgb, e.DashPattern, evenOdd: false, e.LineWeightMm100);
                 acc.Stroke ??= new SKPath();
                 acc.Stroke.AddPath(e.Path, 0f, 0f);
                 acc.AddBounds(e.Bounds);
             }
             if (e.FillPath is not null)
             {
-                var acc = Get(map, SizeClassOf(e.Bounds), e.Layer, e.ColorArgb, e.DashPattern);
+                // 填充规则必须进分桶键：HATCH 孤岛靠 EvenOdd 才是"洞"，
+                // 与普通 Winding 填充合并到同一批次会让洞被填实。
+                bool evenOdd = e.FillPath.FillType == SKPathFillType.EvenOdd;
+                var acc = Get(map, SizeClassOf(e.Bounds), e.Layer, e.ColorArgb, e.DashPattern, evenOdd, lineWidthMm100: 0);
                 acc.Fill ??= new SKPath();
+                if (evenOdd) acc.Fill.FillType = SKPathFillType.EvenOdd;
                 acc.Fill.AddPath(e.FillPath, 0f, 0f);
                 acc.AddBounds(e.Bounds);
             }
@@ -165,6 +182,7 @@ public static class GeometryBaker
                     Bounds = kv.Value.HasBounds ? kv.Value.Bounds : SKRect.Empty,
                     EntityCount = kv.Value.Count,
                     DashPattern = kv.Key.Dash,
+                    LineWidthMm100 = kv.Key.LineWidthMm100,
                 })
                 .ToArray();
 
@@ -183,8 +201,7 @@ public static class GeometryBaker
         return new BakedGeometry
         {
             Classes = classes,
-            WideStrokeEntities = wide,
-            TextEntities = texts,
+            UnbatchedEntities = unbatched,
             SourceEntityCount = entities.Count,
             BakeMs = sw.Elapsed.TotalMilliseconds,
             BucketCount = totalBuckets,
@@ -201,9 +218,10 @@ public static class GeometryBaker
         return SizeEdges.Length - 2;
     }
 
-    private static Accum Get(Dictionary<Key, Accum> map, int cls, string layer, uint color, float[]? dash)
+    private static Accum Get(Dictionary<Key, Accum> map, int cls, string layer, uint color,
+                             float[]? dash, bool evenOdd, int lineWidthMm100)
     {
-        var key = new Key(cls, layer, color, dash);
+        var key = new Key(cls, layer, color, dash, evenOdd, lineWidthMm100);
         if (!map.TryGetValue(key, out var acc))
         {
             acc = new Accum();
@@ -213,7 +231,7 @@ public static class GeometryBaker
         return acc;
     }
 
-    private readonly record struct Key(int Class, string Layer, uint Color, float[]? Dash);
+    private readonly record struct Key(int Class, string Layer, uint Color, float[]? Dash, bool EvenOdd, int LineWidthMm100);
 
     private sealed class Accum
     {

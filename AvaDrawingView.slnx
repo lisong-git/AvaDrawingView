@@ -10,5 +10,7 @@
     <Project Path="tools/SampleGen/SampleGen.csproj" />
     <Project Path="tools/BlockExport/BlockExport.csproj" />
     <Project Path="tools/ShapeExport/ShapeExport.csproj" />
+    <Project Path="tools/DwgCapture/DwgCapture.csproj" />
+    <Project Path="tools/FidelityProbe/FidelityProbe.csproj" />
   </Folder>
 </Solution>

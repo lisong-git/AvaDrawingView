@@ -80,6 +80,18 @@ int Run(string[] argv)
     Log($"范围尺寸:      {list.Extents.Width:F1} x {list.Extents.Height:F1} 世界单位");
     Log($"是否为空:      {list.Entities.Count == 0}");
 
+    if (argv.Contains("--points"))
+    {
+        var marks = list.Entities.Where(e => e.Mark is not null).ToList();
+        Log($"点标记明细（共 {marks.Count} 个，前 12 条）：");
+        foreach (var m in marks.Take(12))
+            Log($"   layer={m.Layer} handle=0x{m.Handle:X} own=0x{m.OwnHandle:X} "
+                + $"at=({m.Mark!.Position.X:F2},{m.Mark.Position.Y:F2}) mode={m.Mark.Mode} size={m.Mark.SizeSpec}");
+        Log($"   分层分布：{string.Join(", ", marks.GroupBy(m => m.Layer).OrderByDescending(g => g.Count()).Take(8).Select(g => $"{g.Key}={g.Count()}"))}");
+        var texts = list.Entities.Count(e => e.Text is not null);
+        Log($"   文本实体 {texts} 个；点/文本 = {(texts > 0 ? (double)marks.Count / texts : 0):F2}");
+    }
+
     // 视口裁剪有效性：按文件大小估算全图查询规模
     var allHit = list.Index.Query(list.Extents);
     Log($"全图查询命中:  {allHit.Count}");
@@ -96,8 +108,8 @@ int Run(string[] argv)
     {
         Log($"总批次数:      {baked.BucketCount}（{baked.SourceEntityCount} 实体 → 压缩 {baked.SourceEntityCount / Math.Max(1, baked.BucketCount)} 倍）");
         Log($"烘焙耗时:      {baked.BakeMs:F0} ms");
-        Log($"有线宽实体:    {baked.WideStrokeEntities.Count}（不合并，走逐实体）");
-        Log($"文本实体:      {baked.TextEntities.Count}（不合并，走 LOD）");
+        Log($"线宽种类:      {baked.Classes.SelectMany(c => c.Buckets).Select(b => b.LineWidthMm100).Distinct().Count()}（每批只用一个描边宽度，见 BakedBucket.LineWidthMm100）");
+        Log($"不合并实体:    {baked.UnbatchedEntities.Count}（文本 + 点标记，屏幕空间绘制）");
         Log($"尺寸档数:      {baked.Classes.Count}");
         Log("档位世界尺寸区间          实体数    批次数    路径点数");
         foreach (var c in baked.Classes)

@@ -17,24 +17,81 @@ namespace DrawingView.Core;
 /// </summary>
 public static class CadGeometry
 {
-    // ---------- OCS 镜像 ----------
+    // ---------- OCS（对象坐标系）→ WCS ----------
 
     /// <summary>
-    /// 法线 Z 为负的实体由 OCS 转到 WCS 所需的镜像（x→−x）。
-    /// <para>ACadSharp 3.7.1 对类型处理不一致（100 张 --nzfit 实证）：Arc/Circle/IPolyline
-    /// 的坐标仍是 OCS 必须镜像；Line/Ellipse 已归一化为 WCS 再镜像会画反（096/091 实证）。</para>
-    /// <para>显示层与本类型的段/环几何必须施加同一份，否则标注高亮会落在 X 镜像位置。</para>
+    /// 实体的 OCS → WCS 变换矩阵（P2-5）。
+    ///
+    /// <para>DXF 里一批实体的坐标是写在**对象坐标系**里的：Arc/Circle 的圆心、二维多段线的顶点、
+    /// POINT 的位置……它们都带一个法向（组码 210），法向不是 (0,0,1) 时整段几何要按
+    /// 「任意轴算法」（Arbitrary Axis Algorithm）转到世界坐标系，否则画出来是错的朝向甚至镜像。</para>
+    ///
+    /// <para><b>为什么不是所有实体统一施加</b>：ACadSharp 3.7.1 对不同类型的归一化不一致 ——
+    /// 100 张 <c>--nzfit</c> 实测：Arc/Circle/IPolyline 读出来仍是 OCS 坐标（必须变换），
+    /// Line/Ellipse 已经被换算成 WCS（再变换就画反，096/091 实证）。
+    /// 所以这里按"ACadSharp 到底给了哪套坐标"来决定，而不是按 AutoCAD 规范上该是什么。</para>
+    ///
+    /// <para>显示层与段/环几何必须用同一份矩阵，否则标注高亮会落在镜像/旋转后的位置。</para>
     /// </summary>
-    public static SKMatrix OcsMirrorMatrix(Entity e) => e switch
+    public static SKMatrix OcsToWcs(Entity e) => e switch
     {
-        Arc a => MirrorMatrix(a.Normal),
-        Circle c => MirrorMatrix(c.Normal),
-        IPolyline pl => MirrorMatrix(pl.Normal),
+        Arc a => OcsMatrix(a.Normal, a.Center.Z),
+        Circle c => OcsMatrix(c.Normal, c.Center.Z),
+        IPolyline pl => OcsMatrix(pl.Normal, pl.Elevation),
+        ACadSharp.Entities.Point p => OcsMatrix(p.Normal, p.Location.Z),
         _ => SKMatrix.Identity,
     };
 
-    private static SKMatrix MirrorMatrix(XYZ n)
-        => n != null && n.Z < 0 ? SKMatrix.CreateScale(-1, 1) : SKMatrix.Identity;
+    /// <summary>
+    /// 任意轴算法（AutoCAD 规范）：由法向求 OCS 的 X/Y 轴，组成 OCS → WCS 的 2D 投影矩阵。
+    ///
+    /// <code>
+    /// 若 |Nx| &lt; 1/64 且 |Ny| &lt; 1/64:  Ax = Wy × N     （Wy = 世界 Y 轴）
+    /// 否则:                            Ax = Wz × N     （Wz = 世界 Z 轴）
+    /// Ay = N × Ax
+    /// </code>
+    ///
+    /// <para>高程（<paramref name="elevation"/>，沿法向的偏移）投影到 XY 平面是
+    /// <c>e·(Nx, Ny)</c>：法向为 ±Z 时它落进 Z 分量、二维画面上看不见（这正是老实现
+    /// 只做 x→−x 镜像也能对的原因）；法向倾斜时它会真实地平移图元。</para>
+    /// </summary>
+    public static SKMatrix OcsMatrix(XYZ n, double elevation = 0)
+    {
+        // 注意 XYZ 是结构体（CSMath），"null 法向"在类型上不存在，只能靠零长度判定退化
+        double len = Math.Sqrt(n.X * n.X + n.Y * n.Y + n.Z * n.Z);
+        if (!(len > 1e-12)) return SKMatrix.Identity;
+        double nx = n.X / len, ny = n.Y / len, nz = n.Z / len;
+
+        // 轴对齐法向（±Z）：无需旋转，只是 -Z 时 OCS 的 x 轴方向相反 → x 取反。
+        // 单独走这一支是为了让最常见的图纸**一个矩阵乘法都不多做**（占全部实体的 99.9%）。
+        if (Math.Abs(nx) < 1e-12 && Math.Abs(ny) < 1e-12)
+            return nz < 0 ? SKMatrix.CreateScale(-1, 1) : SKMatrix.Identity;
+
+        double axx, axy, axz;
+        if (Math.Abs(nx) < 1.0 / 64 && Math.Abs(ny) < 1.0 / 64)
+        {
+            // Ax = Wy × N = (nz, 0, -nx)
+            axx = nz; axy = 0; axz = -nx;
+        }
+        else
+        {
+            // Ax = Wz × N = (-ny, nx, 0)
+            axx = -ny; axy = nx; axz = 0;
+        }
+        double al = Math.Sqrt(axx * axx + axy * axy + axz * axz);
+        if (!(al > 1e-12)) return SKMatrix.Identity;
+        axx /= al; axy /= al; axz /= al;
+
+        // Ay = N × Ax
+        double ayx = ny * axz - nz * axy;
+        double ayy = nz * axx - nx * axz;
+        double ayz = nx * axy - ny * axx;
+
+        return new SKMatrix(
+            (float)axx, (float)ayx, (float)(elevation * nx),
+            (float)axy, (float)ayy, (float)(elevation * ny),
+            0f, 0f, 1f);
+    }
 
     // ---------- 几何基础 ----------
     // ---------- 圆弧 / 凸度 ----------
@@ -82,16 +139,8 @@ public static class CadGeometry
             path.LineTo(p2);
             return;
         }
-        if (theta < 0)
-        {
-            int n = Math.Max(8, (int)Math.Ceiling(Math.Abs(theta) * 180 / Math.PI / 5));
-            for (int s = 1; s <= n; s++)
-            {
-                double a = a1 + theta * s / n;
-                path.LineTo((float)(cx + r * Math.Cos(a)), (float)(cy + r * Math.Sin(a)));
-            }
-            return;
-        }
+        // 顺时针（凸度为负）与逆时针同一套：Skia 的 ArcTo 支持负扫角，
+        // 旧实现把顺时针弧按 5° 压平成折线（深放大露折角、路径长度偏短 0.09%）。
         var oval = OvalRect(cx, cy, r);
         AppendArcTo(path, oval, a1, theta);
     }
@@ -159,12 +208,51 @@ public static class CadGeometry
     private static SKPoint P(double x, double y) => new((float)x, (float)y);
 
     /// <summary>
-    /// 椭圆（弧）参数方程采样：<c>p(t) = center + A·cos t + B·sin t</c>，
-    /// <c>A</c> = 长轴端点向量，<c>B</c> = 长轴左法线 × 半径比。整椭圆传 t0=0 / t1=2π。
+    /// 椭圆（弧）—— **精确构造**，不采样。
+    ///
+    /// <para>参数方程 <c>p(t) = center + A·cos t + B·sin t</c>（A = 长轴端点向量，
+    /// B = 长轴左法线 × 半径比）恰好是"单位圆 → 椭圆"的仿射映射，而 Skia 的
+    /// <c>AddArc</c> 在单位圆上给出真正的圆锥曲线段，因此：
+    /// 在单位圆上取 [t0, t1] 的弧，再用 <c>[A B; center]</c> 做仿射变换，得到的就是精确椭圆弧。</para>
+    ///
+    /// <para>旧实现固定 128 段折线：小椭圆浪费点数，大椭圆（放大到几万像素）露折角，
+    /// 而且半径比越小折角越明显。改法对点数与精度都是白赚。</para>
     /// </summary>
-    public static void AppendEllipticalArc(SKPath path, double cx, double cy,
-                                           double ax, double ay, double bx, double by,
-                                           double t0, double t1, int segments)
+    public static SKPath? BuildEllipticalArc(double cx, double cy,
+                                             double ax, double ay, double bx, double by,
+                                             double t0, double t1)
+    {
+        double sweep = t1 - t0;
+        if (Math.Abs(sweep) < 1e-9) sweep = 2 * Math.PI;   // 起止参数相同 = 整椭圆
+        if (sweep > 2 * Math.PI) sweep = 2 * Math.PI;
+        else if (sweep < -2 * Math.PI) sweep = -2 * Math.PI;
+
+        var tmp = new SKPath();
+        var unit = new SKRect(-1f, -1f, 1f, 1f);
+        double startDeg = t0 * 180.0 / Math.PI;
+        double sweepDeg = sweep * 180.0 / Math.PI;
+        tmp.AddArc(unit, (float)startDeg, (float)sweepDeg);
+        // AddArc 与 ArcTo 不是一回事：整圆用 360° 就行（AddArc 会走 AddOval 路径）。
+        // 万一某些 Skia 版本在 ±360° 上返回空路径，退回 359.999°（缺口 0.001°，屏幕上不可见）。
+        if (tmp.IsEmpty && Math.Abs(sweepDeg) >= 360.0 - 1e-6)
+        {
+            tmp.Dispose();
+            tmp = new SKPath();
+            tmp.AddArc(unit, (float)startDeg, (float)(Math.Sign(sweepDeg) * 359.999));
+        }
+
+        // x' = ax·x + bx·y + cx，y' = ay·x + by·y + cy
+        tmp.Transform(new SKMatrix(
+            (float)ax, (float)bx, (float)cx,
+            (float)ay, (float)by, (float)cy,
+            0f, 0f, 1f));
+        return tmp.IsEmpty ? null : tmp;
+    }
+
+    /// <summary>旧签名（采样版）保留给单测对照：按段数采样参数方程，仅用于"精确 vs 折线"的差值断言。</summary>
+    public static void AppendEllipticalArcSampled(SKPath path, double cx, double cy,
+                                                  double ax, double ay, double bx, double by,
+                                                  double t0, double t1, int segments)
     {
         if (segments < 1) segments = 1;
         if (t1 <= t0) t1 += 2 * Math.PI;
@@ -567,8 +655,11 @@ public static class CadGeometry
                 var ax = (float)ee.MajorAxisEndPoint.X; var ay = (float)ee.MajorAxisEndPoint.Y;
                 var bx = (float)(-ee.MajorAxisEndPoint.Y * ee.RadiusRatio);
                 var by = (float)(ee.MajorAxisEndPoint.X * ee.RadiusRatio);
-                AppendEllipticalArc(path, ee.Center.X, ee.Center.Y, ax, ay, bx, by,
-                                    ee.StartAngle, ee.EndAngle, 48);
+                // 填充边界仍用采样版：这里要往**已有路径**续接（保持子路径连续），
+                // 而 HATCH 的填充与图案线本来就会把边界压平成点列，精确度由段数决定。
+                // 96 段（原 48）在常见边界尺度下误差 < 0.1 世界单位。
+                AppendEllipticalArcSampled(path, ee.Center.X, ee.Center.Y, ax, ay, bx, by,
+                                           ee.StartAngle, ee.EndAngle, 96);
                 return true;
             }
 

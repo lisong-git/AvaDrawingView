@@ -51,6 +51,47 @@ public sealed class DisplayList : IDisposable
     /// </summary>
     public IReadOnlyCollection<string> InitiallyHiddenLayers { get; init; } = Array.Empty<string>();
 
+    /// <summary>
+    /// 图纸里可切换的布局名（按 TabOrder；不含模型空间）。
+    /// 模型空间为空时加载器会自动切到第一个有内容的布局，此时
+    /// <see cref="ActiveSpace"/> 就是这里的某一项。
+    /// </summary>
+    public IReadOnlyList<string> LayoutNames { get; init; } = Array.Empty<string>();
+
+    /// <summary>本实例实际渲染的空间："Model" 或某个布局名。</summary>
+    public string ActiveSpace { get; init; } = "Model";
+
+    /// <summary>
+    /// 布局/视口诊断（每个参与投影的视口一行：矩形、视高、出图比例）。
+    /// 供 <c>DwgCapture --report</c> 与测试定位"布局渲染空白 / 取景离谱"等问题。
+    /// </summary>
+    public IReadOnlyList<string> SpaceNotes { get; init; } = Array.Empty<string>();
+
+    /// <summary>已绘制的块属性（ATTRIB）条数。</summary>
+    public int AttributesDrawn { get; init; }
+    /// <summary>因不可见而跳过的属性条数。</summary>
+    public int AttributesInvisible { get; init; }
+    /// <summary>块定义里的属性占位符（不渲染）条数。</summary>
+    public int AttributeDefsSkipped { get; init; }
+
+    /// <summary>解析出非零线宽的实体数（线宽开关打开后才影响画面，此处只做统计）。</summary>
+    public int LineWeightEntities { get; init; }
+
+    /// <summary>带几何宽度（多段线全局宽度，不是线宽）的实体数——这些画成填充轮廓。</summary>
+    public int WidePolylineEntities { get; init; }
+
+    /// <summary>POINT 点标记实体数（按 PDMODE/PDSIZE 在屏幕空间绘制）。</summary>
+    public int PointMarkEntities { get; init; }
+
+    /// <summary>是否图纸空间（布局）。线宽显示口径按空间区分，渲染期要用。</summary>
+    public bool IsPaperSpace => !string.Equals(ActiveSpace, "Model", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 图纸空间里「1 mm = 多少图纸单位」。布局内线宽按真实单位显示，需要它换算；
+    /// 模型空间是固定像素宽，与它无关。
+    /// </summary>
+    public float WorldUnitsPerMm { get; init; } = 1f;
+
     /// <summary>共享实例标记（<see cref="Empty"/>）：不参与引用计数与释放。</summary>
     internal bool IsSharedInstance { get; init; }
 

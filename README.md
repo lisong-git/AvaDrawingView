@@ -54,6 +54,7 @@ dotnet run --project tools\PerfProbe -- "D:\path\to.dwg"   # 性能基准（--lo
 dotnet run --project tools\SampleGen        # 重新生成 samples\sample_features.dxf
 dotnet run --project tools\BlockExport -- "D:\path\to.dwg" "D:\out" --referenced   # 按块导出独立 DWG
 dotnet run --project tools\ShapeExport -- "D:\path\to.dwg" "D:\out"               # 按相交分组导出独立 DWG
+dotnet run --project tools\DwgCapture -- "D:\path\to.dwg" "D:\out\shot.png"       # 无头渲染 PNG
 ```
 
 一键跑完构建 + 两项冒烟（结果汇总到 `.regress.log`）：
@@ -107,12 +108,13 @@ dotnet run --project tools\ShapeExport -- "D:\src.dwg" "D:\out"   # 默认输出
 ```
 src/DrawingView.Core      # 无 UI 依赖：解析、几何转换、烘焙批次、显示列表、文本度量、空间索引、视口
 src/DrawingView           # Avalonia 应用：DrawingView、主窗口、图层面板
-tools/SmokeTest         # 样例 DXF 全链路测试（解析→转换→索引，54 项精确断言）
-tools/UiSmokeTest       # 无头 Avalonia 渲染测试（真实跑渲染管线）
+tools/SmokeTest         # 样例 DXF 全链路测试（解析→转换→索引，262 项精确断言）
+tools/UiSmokeTest       # 无头 Avalonia 渲染测试（真实跑渲染管线，40 项像素/几何断言）
 tools/PerfProbe         # 性能基准（加载分段 / 内存 / 帧耗时 / LOD 扫描 / 墨迹覆盖率 / 泄漏验证）
 tools/SampleGen         # 生成 samples\sample_features.dxf（覆盖全部实体类型与边界情况）
 tools/BlockExport       # 把图纸里的块定义逐个导出成独立 DWG（WBLOCK 语义，含嵌套块依赖）
 tools/ShapeExport       # 把模型空间的图元按相交关系分组，每组导出成独立 DWG（连通分量）
+tools/DwgCapture        # 无头 Avalonia + Skia 渲染 DWG/DXF 为 PNG（可被外部插件调用）
 tools/Shared            # 上面两个导出工具共用的读写 / 跨文档拷贝逻辑（CadToolkit.cs，链进各自项目）
 tools/regress.ps1       # 一键回归：Debug/Release 构建 + 核心冒烟 + UI 冒烟（构建失败即中止）
 tools/Probe             # ACadSharp API 反射探针（开发辅助）
@@ -121,12 +123,15 @@ samples/                # 样例图纸
 
 ## 已知限制 / 后续（P1+）
 
+> 2026-10-21 已修完渲染保真整改文档（`docs/渲染保真对照与整改方案-2026-10-20.md`）的
+> P0 / P1 全部与 P2-1…P2-6、P2-9：文字口径、布局空间、HATCH 孤岛、ATTRIB、线宽、
+> 变宽多段线、曲线精度、POINT 点样式、MTEXT 断行/行距/逐行对齐、通用 OCS、
+> SPLINE 权重与闭合、不打印图层默认隐藏。
+
 - 大图纸优化：SKPicture 静态层录制、分块缓存、块实例复用（当前 INSERT 为烘焙克隆）
-- 线型（DASHED 等）、线宽映射、SHX 字体（当前走系统字体回退）
-- 填充图案（当前 HATCH 只做纯色填充，非实心图案降级为描边边界）、布局空间（PaperSpace）
-- TEXT 实体的组码 72/73 对齐方式尚未生效（当前统一按插入点左对齐基线绘制）
-- 实体 `Normal`（OCS→WCS）变换未做
+- SHX / 单线字体未支持：当前统一走系统字体（雅黑）回退，字宽与字形与原图有差异
+- REGION / 3DSOLID 不渲染：ACadSharp 不读 ACIS 实体，需外接 ODA/ACIS 或维持跳过计数
 - 大坐标（图纸范围 ±1e6）下 float32 精度：深度放大时几何可能抖动
   （ReadCAD 用 `EnableGpuFloatingOrigin` 解决）
-- 选择拾取、属性面板、测量、PNG 导出
-- 未知实体/异常实体跳过计数（`GeometryConverter.Skipped`），代理实体未支持
+- 选择拾取、属性面板、测量、GUI 内 PNG 导出（命令行 `tools/DwgCapture` 已提供无头 PNG）
+- 代理实体（ACAD_PROXY_ENTITY）未支持；未知/异常实体跳过计数见 `GeometryConverter.Skipped`

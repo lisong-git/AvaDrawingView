@@ -32,6 +32,8 @@ public static class CadDocumentLoader
 
         var extents = ComputeExtents(entities);
         var coreExtents = ComputeCoreExtents(entities, HeaderModelSpaceRect(doc));
+        if (converter.ActiveSpace != "Model")
+            progress?.Report($"图纸空间：{converter.ActiveSpace}（视口裁剪 {converter.ClippedAway} 条）");
         progress?.Report(baked is null
             ? $"完成：{entities.Count} 个实体，跳过 {converter.Skipped}"
             : $"完成：{entities.Count} 个实体，跳过 {converter.Skipped}，"
@@ -39,6 +41,22 @@ public static class CadDocumentLoader
         if (converter.DroppedNoBlock + converter.DroppedByDepth + converter.DroppedByMatrix + converter.DroppedByMInsert > 0)
             progress?.Report($"块展开丢弃：无块 {converter.DroppedNoBlock}，超深 {converter.DroppedByDepth}，"
                              + $"矩阵失败 {converter.DroppedByMatrix}，阵列超限 {converter.DroppedByMInsert}");
+        if (converter.AttributeDrawn + converter.AttributeInvisible + converter.AttributeDefsSkipped > 0)
+            progress?.Report($"块属性：绘制 {converter.AttributeDrawn}，不可见 {converter.AttributeInvisible}，"
+                             + $"跳过占位符 {converter.AttributeDefsSkipped}");
+        if (converter.LineWeightEntities > 0)
+            progress?.Report($"线宽：{converter.LineWeightEntities} 个实体带线宽（状态栏「显示线宽」打开后生效）");
+        if (converter.NonPlottingLayers > 0)
+            progress?.Report($"不打印图层：{converter.NonPlottingLayers} 个已默认隐藏"
+                             + "（对应 AutoCAD 的 DEFPOINTS，可在图层面板打开）");
+        if (converter.RationalSplineEntities > 0)
+            progress?.Report($"有理样条：{converter.RationalSplineEntities} 条（按权重求值）");
+        if (converter.WidePolylineEntities > 0)
+            progress?.Report($"宽多段线：{converter.WidePolylineEntities} 条（按宽度轮廓填充）");
+        if (converter.PointMarkEntities + converter.PointMarksHidden > 0)
+            progress?.Report($"点标记：{converter.PointMarkEntities} 个"
+                             + $"（PDMODE={converter.PointDisplayMode}, PDSIZE={converter.PointDisplaySize:G4}）"
+                             + (converter.PointMarksHidden > 0 ? $"，PDMODE=1 不画 {converter.PointMarksHidden} 个" : ""));
 
         var handleBounds = new Dictionary<ulong, SKRect>();
         foreach (var ent in entities)
@@ -57,6 +75,16 @@ public static class CadDocumentLoader
             CoreExtents = coreExtents,
             Baked = baked,
             InitiallyHiddenLayers = converter.InitiallyHiddenLayers,
+            LayoutNames = converter.LayoutNames,
+            ActiveSpace = converter.ActiveSpace,
+            SpaceNotes = converter.SpaceNotes,
+            AttributesDrawn = converter.AttributeDrawn,
+            AttributesInvisible = converter.AttributeInvisible,
+            AttributeDefsSkipped = converter.AttributeDefsSkipped,
+            LineWeightEntities = converter.LineWeightEntities,
+            WidePolylineEntities = converter.WidePolylineEntities,
+            PointMarkEntities = converter.PointMarkEntities,
+            WorldUnitsPerMm = converter.WorldUnitsPerMm,
         };
     }
 

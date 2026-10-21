@@ -25,12 +25,6 @@ namespace DrawingView.Controls;
 /// </summary>
 public class DrawingView : Control
 {
-    /// <summary>
-    /// 文本字体。必须与 <see cref="TextMetrics"/> 度量用的是同一个，
-    /// 否则包围盒与实际墨迹会不一致（历史缺陷：粗估宽把整图范围撑大 34%）。
-    /// </summary>
-    private static readonly SKTypeface TextTypeface = TextMetrics.SharedTypeface;
-
     /// <summary>无隐藏图层时的共享空集合，避免每帧分配。</summary>
     private static readonly HashSet<string> NoHiddenLayers = new(StringComparer.OrdinalIgnoreCase);
 
@@ -57,6 +51,35 @@ public class DrawingView : Control
     /// </summary>
     public float MinEntityPixelSize { get; set; } = 1.5f;
 
+    private bool _showLineWeights;
+
+    /// <summary>
+    /// 是否按图纸线宽绘制（对应 AutoCAD 的 LWDISPLAY / 状态栏「显示/隐藏线宽」）。
+    ///
+    /// <para>默认 <c>false</c>：全部按 1px 细线画。这是 AutoCAD 的出厂默认，
+    /// 也是看图更清晰的选择——平面图里 90% 的实体都是 0.25mm 默认线宽，
+    /// 一开线宽整张图会变粗、密集处糊成一片。</para>
+    ///
+    /// <para>显示口径与 AutoCAD 完全一致（两种空间不同，别弄混）：</para>
+    /// <list type="bullet">
+    /// <item><b>模型空间</b>：线宽是**固定像素宽**，不随缩放变化（0 → 1px，其余按 mm 成正比，
+    /// 0.25mm ≈ 1px、0.50mm ≈ 2px、2.11mm ≈ 8px）。所以缩小看时线宽相对图纸会显得更粗。</item>
+    /// <item><b>图纸空间（布局）</b>：线宽按**真实单位**显示，随缩放变化
+    /// （1:1 出图的布局里 0.5mm 线在纸上就是 0.5mm）。</item>
+    /// </list>
+    /// <para>与 <see cref="MinEntityPixelSize"/> 不同，这里不做 LOD，细线永远保持至少 1px。</para>
+    /// </summary>
+    public bool ShowLineWeights
+    {
+        get => _showLineWeights;
+        set
+        {
+            if (_showLineWeights == value) return;
+            _showLineWeights = value;
+            InvalidateVisual();
+        }
+    }
+
     public static readonly StyledProperty<SKColor> BackgroundColorProperty =
         AvaloniaProperty.Register<DrawingView, SKColor>(nameof(BackgroundColor), SKColors.Black);
 
@@ -79,9 +102,6 @@ public class DrawingView : Control
     /// 因此当"可见实体数 &gt; 批次数 × 该比值"时才切到批次路径。
     /// </summary>
     private const int BucketVsEntityCostRatio = 200;
-
-    /// <summary>按像素尺寸缓存的字体（渲染线程使用；尺寸随缩放连续变化，故量化到整数像素）。</summary>
-    private static readonly ConcurrentDictionary<int, SKFont> FontCache = new();
 
     private DisplayList? _display;
 
@@ -957,6 +977,13 @@ public class DrawingView : Control
             }
         }
 
+        /// <summary>
+        /// 线宽的描边宽度（世界单位 —— 画布已 concat 世界→屏幕矩阵，Skia 按世界单位取宽度）。
+        /// 口径（模型空间固定像素 / 图纸空间真实单位）见 <see cref="LineWeightMetrics"/>。
+        /// </summary>
+        private float LineWidthWorld(int mm100)
+            => LineWeightMetrics.ToWorldStroke(mm100, _list.IsPaperSpace, _zoom, _list.WorldUnitsPerMm);
+
         private void RenderCore(ImmediateDrawingContext context)
         {
             var leaseFeature = context.TryGetFeature(typeof(ISkiaSharpApiLeaseFeature)) as ISkiaSharpApiLeaseFeature;
@@ -990,9 +1017,9 @@ public class DrawingView : Control
                 canvas.Save();
                 canvas.Concat(worldToScreen);
                 DrawBuckets(canvas, stroke, fill, baked, worldRect, hairline);
-                DrawLooseEntities(canvas, stroke, baked.WideStrokeEntities, worldRect, worldToScreen, hairline);
                 canvas.Restore();
-                DrawTexts(canvas, textPaint, baked.TextEntities, worldRect);
+                DrawTexts(canvas, textPaint, baked.UnbatchedEntities, worldRect);
+                DrawPointMarks(canvas, baked.UnbatchedEntities, worldRect, h);
             }
             else
             {
@@ -1003,6 +1030,7 @@ public class DrawingView : Control
                 DrawStrokeEntities(canvas, stroke, fill, visible, hairline);
                 canvas.Restore();
                 DrawTexts(canvas, textPaint, visible, worldRect);
+                DrawPointMarks(canvas, visible, worldRect, h);
             }
 
             // ---- 选中高亮 pass：叠加在最上层，不走 LOD（选中了就要看得见）----
@@ -1117,10 +1145,12 @@ public class DrawingView : Control
         private void DrawBuckets(SKCanvas canvas, SKPaint stroke, SKPaint fill,
                                  BakedGeometry baked, SKRect worldRect, float hairline)
         {
+            bool lw = _owner.ShowLineWeights;
             stroke.StrokeWidth = hairline;
             uint current = 0;
             bool hasColor = false;
             float[]? currentDash = null;
+            float currentWidth = -1f;
 
             foreach (var cls in baked.Classes)
             {
@@ -1149,7 +1179,13 @@ public class DrawingView : Control
                         stroke.PathEffect = _owner.DashEffectOf(currentDash, _zoom);
                     }
 
-                    if (b.StrokePath is not null) canvas.DrawPath(b.StrokePath, stroke);
+                    if (b.StrokePath is not null)
+                    {
+                        // 线宽开关关闭 → 一律细线（AutoCAD 的 LWDISPLAY 关）。细线永远不窄于 1px。
+                        float w = lw ? LineWidthWorld(b.LineWidthMm100) : hairline;
+                        if (w != currentWidth) { currentWidth = w; stroke.StrokeWidth = w; }
+                        canvas.DrawPath(b.StrokePath, stroke);
+                    }
                     if (b.FillPath is not null) canvas.DrawPath(b.FillPath, fill);
                 }
             }
@@ -1158,6 +1194,7 @@ public class DrawingView : Control
         private void DrawStrokeEntities(SKCanvas canvas, SKPaint stroke, SKPaint fill,
                                         IList<CadEntity> visible, float hairline)
         {
+            bool lw = _owner.ShowLineWeights;
             stroke.StrokeWidth = hairline;
             foreach (var ent in visible)
             {
@@ -1166,10 +1203,10 @@ public class DrawingView : Control
                 {
                     if (!PassesEntityLod(ent.Bounds)) continue;
                     stroke.Color = new SKColor(ResolveColor(ent.ColorArgb));
-                    if (ent.LineWidth > 0) stroke.StrokeWidth = ent.LineWidth;
+                    float w = lw ? LineWidthWorld(ent.LineWeightMm100) : hairline;
+                    stroke.StrokeWidth = w;
                     stroke.PathEffect = _owner.DashEffectOf(ent.DashPattern, _zoom);
                     canvas.DrawPath(ent.Path, stroke);
-                    if (ent.LineWidth > 0) stroke.StrokeWidth = hairline;
                 }
                 if (ent.FillPath is not null)
                 {
@@ -1178,29 +1215,76 @@ public class DrawingView : Control
                     canvas.DrawPath(ent.FillPath, fill);
                 }
             }
+            stroke.StrokeWidth = hairline;
         }
 
-        /// <summary>批次路径下的有线宽实体（数量远小于几何实体，逐条绘制并做同样的 LOD）。</summary>
-        private void DrawLooseEntities(SKCanvas canvas, SKPaint stroke,
-                                       IReadOnlyList<CadEntity> wide,
-                                       SKRect worldRect, in SKMatrix worldToScreen, float hairline)
+        /// <summary>
+        /// 点标记（POINT）—— 屏幕空间绘制（P2-3）。
+        ///
+        /// <para>尺寸由 PDMODE/PDSIZE 决定：PDSIZE&gt;0 按世界单位（乘当前缩放），
+        /// &lt;0 按视高百分比，=0 取默认 5% 视高。后两种**屏幕尺寸恒定**，
+        /// 所以必须在屏幕坐标里画，不能跟着世界矩阵走 —— 否则缩小后缩成亚像素、
+        /// 放大后糊满屏（原固定 ±1 世界单位十字的两种表现）。详见 <see cref="PointMarkStyle"/>。</para>
+        ///
+        /// <para>不走实体的 LOD 阈值：点符号的可见性本来就由视口高度定义，
+        /// 加一层"世界尺寸不足就丢"会把所有点整批剔掉。</para>
+        /// </summary>
+        private void DrawPointMarks(SKCanvas canvas, IEnumerable<CadEntity> entities, SKRect worldRect, float viewportH)
         {
-            if (wide.Count == 0) return;
-            canvas.Save();
-            canvas.Concat(worldToScreen);
-            stroke.StrokeWidth = hairline;
-            foreach (var ent in wide)
+            using var paint = new SKPaint { IsAntialias = true, StrokeWidth = 1f };
+            using var path = new SKPath();   // 复用同一个原生对象：逐点 new SKPath 会拖慢大图
+
+            foreach (var ent in entities)
             {
+                if (ent.Mark is not { } mk) continue;
                 if (_hidden.Contains(ent.Layer)) continue;
-                if (ent.Path is null) continue;
-                if (!PassesEntityLod(ent.Bounds)) continue;
-                if (!ent.Bounds.IntersectsWith(worldRect)) continue;
-                stroke.Color = new SKColor(ResolveColor(ent.ColorArgb));
-                stroke.StrokeWidth = ent.LineWidth > 0 ? ent.LineWidth : hairline;
-                stroke.PathEffect = _owner.DashEffectOf(ent.DashPattern, _zoom);
-                canvas.DrawPath(ent.Path, stroke);
+
+                int baseShape = PointMarkStyle.BaseShape(mk.Mode);
+                if (baseShape == PointMarkStyle.ModeInvisible) continue;   // 防御：转换期已滤过
+
+                float size = PointMarkStyle.SizePx(mk.SizeSpec, _zoom, viewportH);
+                float h = size * 0.5f;
+
+                // 剔除要按"符号半径"外扩：点的包围盒是零面积，视图边界上的点
+                // (适应窗口后角点正好落在边界)会被严格包含判断丢掉，看起来像实体丢失。
+                float pad = (h + 1f) / MathF.Max(_zoom, 1e-6f);
+                if (mk.Position.X < worldRect.Left - pad || mk.Position.X > worldRect.Right + pad ||
+                    mk.Position.Y < worldRect.Top - pad || mk.Position.Y > worldRect.Bottom + pad) continue;
+
+                var c = new SKPoint(mk.Position.X * _zoom + _offset.X, -mk.Position.Y * _zoom + _offset.Y);
+                paint.Color = new SKColor(ResolveColor(ent.ColorArgb));
+
+                // 基础形状 0 = 实心点（AutoCAD 的 PDMODE 0 就是"一个点"）
+                if (baseShape == 0)
+                {
+                    paint.Style = SKPaintStyle.Fill;
+                    canvas.DrawCircle(c, MathF.Max(0.75f, h * 0.5f), paint);
+                }
+
+                path.Reset();
+                switch (baseShape)
+                {
+                    case 2:   // 十字
+                        path.MoveTo(c.X - h, c.Y); path.LineTo(c.X + h, c.Y);
+                        path.MoveTo(c.X, c.Y - h); path.LineTo(c.X, c.Y + h);
+                        break;
+                    case 3:   // 斜叉
+                        path.MoveTo(c.X - h, c.Y - h); path.LineTo(c.X + h, c.Y + h);
+                        path.MoveTo(c.X + h, c.Y - h); path.LineTo(c.X - h, c.Y + h);
+                        break;
+                    case 4:   // 竖线
+                        path.MoveTo(c.X, c.Y - h); path.LineTo(c.X, c.Y + h);
+                        break;
+                }
+                if (PointMarkStyle.HasCircle(mk.Mode)) path.AddCircle(c.X, c.Y, h);
+                if (PointMarkStyle.HasSquare(mk.Mode)) path.AddRect(SKRect.Create(c.X - h, c.Y - h, size, size));
+
+                if (!path.IsEmpty)
+                {
+                    paint.Style = SKPaintStyle.Stroke;
+                    canvas.DrawPath(path, paint);
+                }
             }
-            canvas.Restore();
         }
 
         private void DrawTexts(SKCanvas canvas, SKPaint paint, IEnumerable<CadEntity> entities, SKRect worldRect)
@@ -1242,19 +1326,26 @@ public class DrawingView : Control
         }
 
         /// <summary>
-        /// 文本：屏幕空间绘制，按像素高度做 LOD（ReadCAD 的 MinTextPixelSize 思路），
-        /// 字体按整数像素尺寸缓存复用（原实现每字都 new SKFont + new SKPaint，后者还从不释放）。
+        /// 文本：屏幕空间绘制，按像素高度做 LOD（ReadCAD 的 MinTextPixelSize 思路）。
+        ///
+        /// 字高换算必须走 <see cref="TextMetrics.FontForCapHeight"/>：CAD 字高是 cap height，
+        /// 直接当 em 尺寸会小 24%（2026-10-20 受控基准图实测 0.744×）。
+        /// 变换顺序固定为 旋转 → 倾斜 → 宽度因子：
+        /// Skia 的 Canvas 是「后调用先生效」的矩阵左乘，写成
+        /// <c>Skew</c> 再 <c>Scale</c> 才是「先横向缩放、再倾斜」——
+        /// 反过来倾斜角会被宽度因子一并缩放，斜体方向随宽度因子乱飘。
+        ///
         /// 多行文本（MTEXT 的 \P 已转成 \n）逐行绘制 —— Skia 的 DrawText 不处理换行符，
-        /// 换行符会被当缺字画成方框。
+        /// 换行符会被当缺字画成方框。行距按实体 <see cref="TextDraw.LineSpacingFactor"/>
+        /// （单倍 = 1.667 × 字高），水平对齐按 <see cref="TextDraw.LineAlign"/> **逐行**处理：
+        /// AutoCAD 的 MTEXT 居中/右对齐作用于每一行而不是整块，块级偏移在转换阶段已按整块算过。
         /// </summary>
         private void DrawText(SKCanvas canvas, SKPaint paint, TextDraw td, uint color)
         {
-            float px = td.Height * _zoom;
-            if (px < _minTextPx) return;
+            float capPx = td.Height * _zoom;
+            if (capPx < _minTextPx) return;
 
-            int key = (int)MathF.Round(Math.Min(px, 512f));
-            if (key < 1) return;
-            var font = FontCache.GetOrAdd(key, k => new SKFont(TextTypeface, k));
+            var font = TextMetrics.FontForCapHeight(capPx, out float fontScale);
 
             paint.Color = new SKColor(color);
             float sx = td.Position.X * _zoom + _offset.X;
@@ -1263,17 +1354,36 @@ public class DrawingView : Control
             canvas.Translate(sx, sy);
             canvas.RotateDegrees(td.RotationRadians * 180f / MathF.PI);
 
+            if (MathF.Abs(td.ObliqueRadians) > 1e-6f)
+                canvas.Skew(-MathF.Tan(td.ObliqueRadians), 0f);
+            if (td.WidthFactor > 0 && MathF.Abs(td.WidthFactor - 1f) > 1e-6f)
+                canvas.Scale(td.WidthFactor, 1f);
+            if (MathF.Abs(fontScale - 1f) > 1e-6f)
+                canvas.Scale(fontScale, fontScale);   // 超大字号走"上限字体 + 画布放大"
+
             if (td.Text.IndexOf('\n') < 0)
             {
                 canvas.DrawText(td.Text, 0, 0, font, paint);
             }
             else
             {
-                // 行距与 TextMetrics 的度量口径一致（同一字体的 Spacing）
-                float spacing = font.Spacing > 0 ? font.Spacing : px * 1.2f;
+                // 行距按实体值（MTEXT 组码 44 已折算进 LineSpacingFactor）。
+                // 注意：这些偏移处在画布**局部**坐标系里，纵向被 fontScale 放大过，
+                // 必须除回去 —— 否则超大字号（> MaxCachedCapHeight）时行距会被连带放大好几倍。
+                float spacing = capPx * td.LineSpacingFactor / fontScale;
                 var lines = td.Text.Split('\n');
                 for (int i = 0; i < lines.Length; i++)
-                    canvas.DrawText(lines[i], 0, i * spacing, font, paint);
+                {
+                    float dx = 0f;
+                    if (td.LineAlign != TextLineAlign.Left && lines[i].Length > 0)
+                    {
+                        // 行宽按**世界单位**量再换到局部：局部 x 同时被宽度因子与 fontScale 缩放。
+                        // 目标屏幕宽度 = W·zoom·wf，局部宽度 = W·zoom/fontScale（wf 两端约掉）。
+                        float w = TextMetrics.MeasureWidth(lines[i], td.Height) * _zoom / fontScale;
+                        dx = td.LineAlign == TextLineAlign.Center ? -w * 0.5f : -w;
+                    }
+                    canvas.DrawText(lines[i], dx, i * spacing, font, paint);
+                }
             }
             canvas.Restore();
         }

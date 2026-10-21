@@ -13,6 +13,11 @@
       <Button x:Name="BtnFit" Content="适应窗口" Click="OnFitClick" />
       <Button x:Name="BtnZoomIn" Content="放大" Click="OnZoomInClick" />
       <Button x:Name="BtnZoomOut" Content="缩小" Click="OnZoomOutClick" />
+      <CheckBox x:Name="ChkLineWeight" Content="显示线宽" VerticalAlignment="Center"
+                IsChecked="False" Click="OnLineWeightClick"
+                ToolTip.Tip="按图纸线宽绘制（对应 AutoCAD 的 LWDISPLAY）。默认关闭：全部按 1px 细线画，看图更清晰。" />
+      <ComboBox x:Name="SpaceBox" MinWidth="120" VerticalAlignment="Center"
+                SelectionChanged="OnSpaceChanged" ToolTip.Tip="模型空间 / 图纸布局" />
       <TextBlock x:Name="StatusText" VerticalAlignment="Center" Margin="16,0,0,0"
                  Opacity="0.75" TextTrimming="CharacterEllipsis" MaxWidth="600" />
     </StackPanel>

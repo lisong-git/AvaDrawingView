@@ -26,6 +26,10 @@ void DumpProps(Type? t, string label)
         Console.WriteLine($"   {p.PropertyType.Name} {p.Name}");
 }
 
+DumpProps(typeof(LwPolyline.Vertex), "LwPolyline.Vertex");
+DumpProps(typeof(Vertex2D), "Vertex2D");
+DumpProps(typeof(LwPolyline), "LwPolyline");
+DumpProps(typeof(Polyline2D), "Polyline2D");
 DumpProps(typeof(Layer), "Layer");
 DumpProps(typeof(Insert), "Insert");
 DumpProps(typeof(Entity), "Entity");
@@ -152,6 +156,8 @@ DumpProps(typeof(ACadSharp.Entities.Ellipse), "Ellipse");
 DumpProps(typeof(Hatch), "Hatch");
 DumpCtors(typeof(Hatch), "Hatch");
 DumpProps(typeof(ACadSharp.Entities.Point), "Point");
+DumpProps(asm.GetType("ACadSharp.Objects.Layout"), "Layout");
+DumpProps(asm.GetType("ACadSharp.Entities.Viewport"), "Viewport");
 
 var entitiesProp = typeof(CadDocument).GetProperty("Entities")?.PropertyType;
 DumpProps(entitiesProp, "CadDocument.Entities 类型");

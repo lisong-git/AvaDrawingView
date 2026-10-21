@@ -107,21 +107,35 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>当前打开的图纸路径（切换模型/布局时重载用）。</summary>
+    private string? _currentPath;
+
+    /// <summary>程序化改 SpaceBox 选中项时抑制事件，避免"切换 → 重载 → 再切换"的回环。</summary>
+    private bool _suppressSpaceChange;
+
     /// <summary>
     /// 加载指定路径的图纸并刷新视图状态（文件对话框与命令行启动共用）。
     /// 加载结果为不可变快照，通过 View.SetDisplay(list) 原子替换。
     /// </summary>
-    private async Task LoadDrawingAsync(string path)
+    /// <param name="layout">要渲染的布局名；null = 模型空间。</param>
+    private async Task LoadDrawingAsync(string path, string? layout = null)
     {
         try
         {
+            _currentPath = path;
             StatusText.Text = $"加载中… {Path.GetFileName(path)}";
             var progress = new Progress<string>(s => StatusText.Text = $"{Path.GetFileName(path)} — {s}");
-            var list = await CadDocumentLoader.LoadAsync(path, progress);
+            var options = string.IsNullOrWhiteSpace(layout) ? null : new GeometryConvertOptions { LayoutName = layout };
+            var list = await CadDocumentLoader.LoadAsync(path, progress, default, options);
             View.SetDisplay(list);
             BuildLayerPanel(list);
-            StatusText.Text = $"{Path.GetFileName(path)} — {list.Entities.Count} 个实体，{list.LayerNames.Count} 个图层";
-            WriteDiag($"load ok: {path} → {list.Entities.Count} entities, {list.LayerNames.Count} layers");
+            SyncSpaceBox(list);
+            StatusText.Text = $"{Path.GetFileName(path)} — {list.Entities.Count} 个实体，{list.LayerNames.Count} 个图层"
+                              + (list.ActiveSpace == "Model" ? "" : $"（图纸空间：{list.ActiveSpace}）");
+            if (list.ActiveSpace != "Model" && list.Entities.Count == 0)
+                StatusText.Text = $"{Path.GetFileName(path)} — 布局「{list.ActiveSpace}」没有可绘制的常规实体"
+                                  + "（几何由 ACIS/代理实体承载时 ACadSharp 读不出来，需 ODA/RealDWG 才能渲染）";
+            WriteDiag($"load ok: {path} → {list.Entities.Count} entities, {list.LayerNames.Count} layers, space={list.ActiveSpace}");
         }
         catch (Exception ex)
         {
@@ -147,9 +161,43 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>模型/布局切换：重新加载同一张图的另一个空间。</summary>
+    private async void OnSpaceChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressSpaceChange) return;
+        if (_currentPath is not { } path) return;
+        var selected = SpaceBox.SelectedItem as string;
+        if (string.IsNullOrEmpty(selected)) return;
+        var layout = selected == ModelSpaceLabel ? null : selected;
+        await LoadDrawingAsync(path, layout);
+    }
+
+    private const string ModelSpaceLabel = "模型";
+
+    /// <summary>把可切换的空间填进下拉框并选中当前项（不触发重载）。</summary>
+    private void SyncSpaceBox(DisplayList list)
+    {
+        _suppressSpaceChange = true;
+        try
+        {
+            SpaceBox.Items.Clear();
+            SpaceBox.Items.Add(ModelSpaceLabel);
+            foreach (var name in list.LayoutNames) SpaceBox.Items.Add(name);
+            SpaceBox.SelectedItem = list.ActiveSpace == "Model" ? ModelSpaceLabel : list.ActiveSpace;
+        }
+        finally
+        {
+            _suppressSpaceChange = false;
+        }
+    }
+
     private void OnFitClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => View.FitToContent();
 
     private void OnZoomInClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => View.ZoomBy(1.25f);
 
     private void OnZoomOutClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => View.ZoomBy(0.8f);
+
+    /// <summary>显示线宽开关（AutoCAD 的 LWDISPLAY）。关闭时全部按 1px 细线画。</summary>
+    private void OnLineWeightClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+        => View.ShowLineWeights = ChkLineWeight.IsChecked == true;
 }

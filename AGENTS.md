@@ -18,12 +18,13 @@
 ```
 src/DrawingView.Core/   核心库：解析、几何转换、空间索引、视口、文本度量、烘焙批次
 src/DrawingView/        Avalonia 应用：DrawingView 渲染控件 + 主窗口
-tools/SmokeTest/      冒烟测试（解析→转换→索引全链路，不经过渲染管线，52 项精确断言）
-tools/UiSmokeTest/    UI 冒烟测试（无头 Avalonia 真实跑渲染管线，拦截"渲染期非法操作"类缺陷，21 项断言含像素级校验）
+tools/SmokeTest/      冒烟测试（解析→转换→索引全链路，不经过渲染管线，262 项精确断言）
+tools/UiSmokeTest/    UI 冒烟测试（无头 Avalonia 真实跑渲染管线，拦截"渲染期非法操作"类缺陷，40 项断言含像素级校验）
 tools/PerfProbe/      性能基准（加载分段耗时 / 内存 / 逐缩放帧耗时 / LOD 扫描 / 墨迹覆盖率 / 泄漏验证）
 tools/SampleGen/      生成 samples/sample_features.dxf（覆盖全部实体类型与边界情况）
 tools/BlockExport/    把图纸里的块定义逐个导出成独立 DWG（WBLOCK 语义，含嵌套块依赖 + 回读校验）
 tools/ShapeExport/    把模型空间图元按相交关系分组（连通分量），每组导出成独立 DWG
+tools/DwgCapture/     无头 Avalonia + Skia 渲染 DWG/DXF 为 PNG（文件交接，可被 DSH 插件调用）
 tools/Shared/         CadToolkit.cs：上面两个导出工具共用的读写 + 跨文档拷贝（<Compile Include> 链进各自项目，不单独建程序集）
 tools/Probe/          ACadSharp API 反射探针（摸 API 用，可删）
 tools/regress.ps1     一键回归：Debug/Release 构建 + 核心冒烟 + UI 冒烟，汇总到 .regress.log
@@ -42,6 +43,7 @@ dotnet run --project tools/PerfProbe -- "D:\path\to.dwg"   # 性能基准（--lo
 dotnet run --project tools/SampleGen   # 重新生成 samples/sample_features.dxf
 dotnet run --project tools/BlockExport -- "D:\src.dwg" "D:\out" --referenced  # 块导出为独立 DWG
 dotnet run --project tools/ShapeExport -- "D:\src.dwg" "D:\out"               # 相交分组导出为独立 DWG
+dotnet run --project tools/DwgCapture -- "D:\src.dwg" "D:\out\shot.png"      # 无头渲染 PNG（--report 可落 JSON）
 ```
 
 **改完代码先跑一键回归**（省掉手敲上面四条，且构建失败会 fail-fast）：
@@ -138,7 +140,7 @@ Avalonia 的渲染管线，所以像"渲染期调用 InvalidateVisual"这类缺�
 - 测量方法论（教训）：无预热/不隔离 GC 的帧测量，同一配置两次能差 25%——
   必须预热 3 帧 + `GC.Collect` + ≥12 帧 + 中位数；对比配置看"绘制耗时"而非墙钟。
 
-## 显示保真与资源释放（2026-09-16 修复；断言数实测 2026-09-25：57 项核心 + 21 项 UI）
+## 显示保真与资源释放（2026-09-16 修复；断言数实测 2026-10-21：262 项核心 + 40 项 UI）
 
 ### 1. `Arc.Sweep` 在 ACadSharp 3.4.9 里是**负值**（最隐蔽的真缺陷）
 `Arc.Sweep` 返回的是 `startAngle - endAngle`（正常逆时针弧为负），原实现写
@@ -445,9 +447,14 @@ view.ClearOverlay();
 
 ## 后续路线
 
-P1：SKPicture 静态缓存、线型（DASHED 等）/ 填充图案、SHX 字体、TEXT 组码 72/73 对齐、
-实体 `Normal` 的 OCS→WCS 变换；
-P2：拾取选择、属性面板、测量、PNG 导出；
+**已完成（2026-10-21，回归 PASS=302 FAIL=0）**：线型虚线、非实心填充图案（含孤岛）、
+TEXT 组码 72/73 对齐、实体 `Normal` 的通用 OCS→WCS（任意轴算法）、线宽显示（`LineWeightMetrics`，
+模型空间固定像素 / 图纸空间真实单位）、变宽多段线轮廓填充、布局空间渲染、块属性 ATTRIB、
+MTEXT 断行 / 行距 / 逐行对齐、POINT 按 PDMODE/PDSIZE、SPLINE 权重与闭合、不打印图层默认隐藏。
+详见 `docs/渲染保真对照与整改方案-2026-10-20.md`（其中 P2-7 REGION、P2-8 大坐标仍待办）。
+
+P1：SKPicture 静态缓存、SHX / 单线字体；
+P2：拾取选择、属性面板、测量、GUI 内 PNG 导出（命令行 `tools/DwgCapture` 已提供无头 PNG）；
 P3：大坐标（±1e6）float32 精度（ReadCAD 用 `EnableGpuFloatingOrigin` 解决）。
 
 **P3 的"10 万实体 ≥45fps"已达成**：85,515 可见实体全图视角 63.6 FPS（绘制 4.5ms）。
