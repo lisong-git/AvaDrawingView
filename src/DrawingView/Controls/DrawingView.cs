@@ -1085,6 +1085,7 @@ public class DrawingView : Control
                 DrawTexts(canvas, textPaint, baked.UnbatchedEntities, worldRect);
                 if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tText = n - tMark; tMark = n; }
                 DrawPointMarks(canvas, baked.UnbatchedEntities, worldRect, h);
+                DrawTextStrokes(canvas, stroke, baked.UnbatchedEntities, worldRect, worldToScreen, hairline);
                 if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tPoint = n - tMark; tMark = n; }
             }
             else
@@ -1099,6 +1100,7 @@ public class DrawingView : Control
                 DrawTexts(canvas, textPaint, visible, worldRect);
                 if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tText = n - tMark; tMark = n; }
                 DrawPointMarks(canvas, visible, worldRect, h);
+                DrawTextStrokes(canvas, stroke, visible, worldRect, worldToScreen, hairline);
                 if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tPoint = n - tMark; tMark = n; }
             }
 
@@ -1301,6 +1303,35 @@ public class DrawingView : Control
                 }
             }
             stroke.StrokeWidth = hairline;
+        }
+
+        /// <summary>
+        /// SHX 文字笔画：走批次外的描边 pass。
+        ///
+        /// <para>与 TTF 文本的区别只是"字由路径构成"，位置/旋转/宽度因子/倾斜在转换期已经折进几何，
+        /// 所以这里只需套世界矩阵直接描。线宽用 1px 细线（AutoCAD 的 SHX 文字就是单线，
+        /// 打开"显示线宽"时文字并不会变粗）。</para>
+        /// </summary>
+        private void DrawTextStrokes(SKCanvas canvas, SKPaint stroke, IEnumerable<CadEntity> entities,
+                                     SKRect worldRect, in SKMatrix worldToScreen, float hairline)
+        {
+            bool any = false;
+            foreach (var e in entities) if (e.TextStrokes) { any = true; break; }
+            if (!any) return;
+
+            canvas.Save();
+            canvas.Concat(worldToScreen);
+            stroke.Style = SKPaintStyle.Stroke;
+            stroke.StrokeWidth = hairline;
+            foreach (var ent in entities)
+            {
+                if (!ent.TextStrokes || ent.Path is null) continue;
+                if (_hidden.Contains(ent.Layer)) continue;
+                if (!ent.Bounds.IntersectsWith(worldRect)) continue;
+                stroke.Color = new SKColor(ResolveColor(ent.ColorArgb));
+                canvas.DrawPath(ent.Path, stroke);
+            }
+            canvas.Restore();
         }
 
         /// <summary>

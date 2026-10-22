@@ -143,8 +143,9 @@ public static class GeometryBaker
         foreach (var e in entities)
         {
             if ((++n % 4096) == 0) ct.ThrowIfCancellationRequested();
-            // 文本与点标记都不进批次（屏幕空间绘制），见 UnbatchedEntities 的说明
-            if (e.Text is not null || e.Mark is not null) { unbatched.Add(e); continue; }
+            // 文本、点标记、SHX 文字笔画都不进批次（前两者屏幕空间绘制，末者豁免 LOD），
+            // 见 UnbatchedEntities 的说明
+            if (e.Text is not null || e.Mark is not null || e.TextStrokes) { unbatched.Add(e); continue; }
             if (e.Path is not null)
             {
                 var acc = Get(map, SizeClassOf(e.Bounds), e.Layer, e.ColorArgb, e.DashPattern, evenOdd: false, e.LineWeightMm100);

@@ -109,6 +109,7 @@ var hatchSample = FindSample("sample_hatch.dxf");
 if (hatchSample is not null) RunHatchFileSample(hatchSample);
 RunRegionChecks();
 RunFarCoordinateChecks();
+RunShxChecks();
 
 Log();
 Log(fails == 0 ? "SMOKE TEST PASSED" : $"SMOKE TEST FAILED ({fails} 项)");
@@ -1668,6 +1669,196 @@ void RunHatchFileSample(string path)
         float xs = segs.Min(s => MathF.Min(s.a.X, s.b.X));
         Check(MathF.Abs(xs - 150f) < 1f, $"图案块左边界 150（实际 {xs:F2}）");
     }
+}
+
+/// <summary>
+/// SHX 单线字体：解析 / 字形 / 子形 / 缺字库回退。
+///
+/// <para>**不依赖系统字库**。本机只装了 9 个 .shx，而且最常用的 simplex / hztxt / tssdeng
+/// 都不在 <c>Windows\Fonts</c> 里；只有现场合成字库，才能把"字头定位、索引自校验、子形引用、
+/// 缺字回退"这几条钉在断言里（真实字库只作人工对照，见 .compare/）。</para>
+///
+/// <para>合成字库刻意复刻了实测到的两个坑：
+/// ① unifont 字形数据前面带 ASCII 名字（<c>"H\0"</c>）；
+/// ② bigfont 每条记录是 <c>内码(2) + 00 07 8e 05 … 07 8f 00</c>，尾部的 0x8F00 是个**不存在的**
+/// 子形引用 —— 按单字节读会命中 0x8F（一个图案块），每个汉字底下就多出一坨乱线。</para>
+/// </summary>
+void RunShxChecks()
+{
+    Log();
+    Log("=== SHX 单线字体（合成字库） ===");
+
+    string dir = Path.Combine(Path.GetTempPath(), "DrawingView_shx_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+    Directory.CreateDirectory(dir);
+
+    try
+    {
+        string ansiPath = Path.Combine(dir, "TESTANSI.SHX");
+        string bigPath = Path.Combine(dir, "TESTBIG.SHX");
+        string dxfPath = Path.Combine(dir, "shx_probe.dxf");
+        File.WriteAllBytes(ansiPath, BuildTestAnsiFont());
+        File.WriteAllBytes(bigPath, BuildTestBigFont());
+        File.WriteAllText(dxfPath, ShxProbeDxf(), new System.Text.UTF8Encoding(false));
+
+        // ---- 1. unifont：字头 / 名字前缀 / 字形 / 前进量 / 字高换算 ----
+        var ansi = ShxFont.TryLoad(ansiPath, out string? ansiErr);
+        Check(ansi is not null, $"unifont 解析成功（{ansiErr ?? "ok"}）");
+        if (ansi is not null)
+        {
+            Check(ansi.Kind == ShxFont.FontKind.Unifont, $"字体类型 unifont（实际 {ansi.Kind}）");
+            Check(ansi.Name == "TESTANSI", $"字体名取自头部（实际 '{ansi.Name}'）");
+            var l = ansi.GetGlyph('L');
+            Check(l is not null, "字形 L 存在");
+            if (l is not null)
+            {
+                Check(l.Polylines.Count == 1, $"L 是 1 段折线（实际 {l.Polylines.Count}）");
+                Check(l.Polylines[0].Length == 3, $"L 有 3 个点（实际 {l.Polylines[0].Length}）");
+                Check(MathF.Abs(l.Polylines[0][2].Y - 20f) < 0.01f, $"L 末点 y=20（实际 {l.Polylines[0][2].Y:F2}）");
+                Check(MathF.Abs(l.Advance - 10f) < 0.01f, $"L 前进量 10（实际 {l.Advance:F2}）");
+            }
+            // 字高换算按实测上沿（H=20），不是头部 above（我们故意写成 30）
+            Check(MathF.Abs(ansi.CapUnits - 20f) < 0.01f, $"字高换算 20 而不是 above=30（实际 {ansi.CapUnits:F2}）");
+            Check(ansi.GetGlyph('Z') is null, "字库里没有 Z 时返回 null（不抛异常）");
+        }
+
+        // ---- 2. bigfont：索引自校验 / 双字节子形 / 空子形不能画 ----
+        var big = ShxFont.TryLoad(bigPath, out string? bigErr);
+        Check(big is not null, $"bigfont 解析成功（{bigErr ?? "ok"}）");
+        if (big is not null)
+        {
+            Check(big.Kind == ShxFont.FontKind.BigFont, $"字体类型 bigfont（实际 {big.Kind}）");
+            var blob = big.GetGlyphByCode(0x8F);
+            Check(blob is not null && blob.Polylines.Count == 3, $"图案块 0x8F 自身可解析（{blob?.Polylines.Count ?? 0} 段）");
+            var tian = big.GetGlyph('田');
+            Check(tian is not null, "汉字 田 存在（按 GBK 内码索引）");
+            if (tian is not null)
+            {
+                Check(tian.Polylines.Count == 2,
+                      $"田 只画出自己的 2 段，尾部 07 8F 00 不当子形（实际 {tian.Polylines.Count} 段）");
+                Check(MathF.Abs(tian.Advance - 40f) < 0.01f, $"田 结束点 x=40（两笔累计，实际 {tian.Advance:F2}）");
+            }
+        }
+
+        // ---- 3. TTF 名字不该当成"缺 SHX 字库" ----
+        Check(!ShxFontLibrary.IsShxName("ARIAL.TTF"), "ARIAL.TTF 不算 SHX 字体名");
+        Check(!ShxFontLibrary.IsShxName("simhei.ttf"), "simhei.ttf 不算 SHX 字体名");
+        Check(ShxFontLibrary.IsShxName("simplex.shx"), "simplex.shx 是 SHX 字体名");
+        Check(ShxFontLibrary.IsShxName("txt"), "无扩展名的 txt 按 SHX 处理（AutoCAD 老习惯）");
+        Check(ShxFontLibrary.Resolve("ARIAL.TTF") is null, "Resolve 不会去找 ARIAL.TTF.shx");
+
+        // ---- 4. 接进管线：能描线、能定宽、缺字库回退 TTF ----
+        var msgs = new List<string>();
+        var list = CadDocumentLoader.Load(dxfPath, new Progress<string>(m => msgs.Add(m)));
+        int strokes = list.Entities.Count(e => e.TextStrokes);
+        int ttf = list.Entities.Count(e => e.Text is not null);
+        Check(strokes == 1, $"只有 SHX 那条被描成笔画（实际 {strokes}）");
+        Check(ttf == 1, $"缺字库那条回退 TTF（实际 {ttf} 条 TTF 文字）");
+        string shxMsg = msgs.FirstOrDefault(m => m.Contains("SHX 文字")) ?? string.Empty;
+        Check(shxMsg.Contains("1 个实体"), $"状态行报告 1 个实体按字库描线（实际：{shxMsg}）");
+        Check(shxMsg.Contains("1 条文字缺字库"), $"状态行报告 1 条缺字库（实际：{shxMsg}）");
+
+        var stroke = list.Entities.FirstOrDefault(e => e.TextStrokes);
+        if (stroke is not null)
+        {
+            // 字高 100、字库里 L 高 20 单位、宽 10 单位 → 缩放 5 倍 → 50 × 100
+            var b = stroke.Bounds;
+            Log($"  描线包围盒 x[{b.Left:F2},{b.Right:F2}] y[{b.Bottom:F2},{b.Top:F2}]");
+            Check(MathF.Abs(b.Width - 50f) < 1f, $"L 宽 50（实际 {b.Width:F2}）");
+            Check(MathF.Abs(b.Height - 100f) < 1f, $"L 高 100（实际 {b.Height:F2}）");
+            Check(MathF.Abs(b.Left) < 1f, $"L 起点 x=0（实际 {b.Left:F2}）");
+        }
+    }
+    finally
+    {
+        try { Directory.Delete(dir, true); } catch { /* 临时目录清不掉不影响断言结果 */ }
+    }
+}
+
+/// <summary>合成一个最小 unifont：'H'（竖，高 20）与 'L'（横+竖，宽 10 高 20）。</summary>
+static byte[] BuildTestAnsiFont()
+{
+    var ms = new MemoryStream();
+    void Raw(params byte[] b) => ms.Write(b, 0, b.Length);
+    void U16(int v) { ms.WriteByte((byte)(v & 0xFF)); ms.WriteByte((byte)((v >> 8) & 0xFF)); }
+    void U32(int v) { for (int k = 0; k < 4; k++) ms.WriteByte((byte)((v >> (8 * k)) & 0xFF)); }
+
+    Raw(System.Text.Encoding.ASCII.GetBytes("AutoCAD-86 unifont 1"));   // 头部以 0x0D 结尾，不能用 index(0)
+    Raw(0x0D, 0x0A, 0x1A);
+    U32(3);                       // count = 记录数 + 1
+    U16(0);                       // 索引区字节数（解析不用）
+    Raw(System.Text.Encoding.ASCII.GetBytes("TESTANSI"));
+    Raw(0x00);
+    Raw(30, 5, 0, 0, 0, 0);       // above=30（故意与真实字高 20 不同）/ below / modes / enc / emb / pad
+
+    // 每条记录：内码 u16（低字节在前）| 数据字节数 u16 | 数据（前面带 ASCII 名字 + 0x00）
+    byte[] h = { (byte)'H', 0x00, 0x02, 0x08, 0x00, 0x00, 0x01, 0x08, 0x00, 0x14, 0x00 };
+    U16('H'); U16(h.Length); Raw(h);
+    byte[] l = { (byte)'L', 0x00, 0x02, 0x08, 0x00, 0x00, 0x01, 0x08, 0x0A, 0x00, 0x08, 0x00, 0x14, 0x00 };
+    U16('L'); U16(l.Length); Raw(l);
+    return ms.ToArray();
+}
+
+/// <summary>
+/// 合成一个最小 bigfont：0xCCEF（田，两笔 + 尾部空子形 07 8F 00）与 0x008F（图案块，三笔）。
+/// 尾部那个 0x8F00 在字库里不存在 —— 这正是"退回单字节就读成图案块"的回归点。
+/// </summary>
+static byte[] BuildTestBigFont()
+{
+    var tian = new List<byte> { 0xCC, 0xEF, 0x00, 0x07, 0x8E, 0x05 };        // 6 字节固定前缀
+    tian.AddRange(new byte[] { 0x02, 0x08, 0x00, 0x00, 0x01, 0x08, 0x14, 0x00 });   // 笔 1：(0,0)→(20,0)
+    tian.AddRange(new byte[] { 0x02, 0x08, 0x00, 0x28, 0x01, 0x08, 0x14, 0x00 });   // 笔 2：(0,40)→(20,40)
+    tian.AddRange(new byte[] { 0x07, 0x8F, 0x00 });                          // 空子形引用
+
+    var blob = new List<byte>();
+    for (int k = 0; k < 3; k++)
+        blob.AddRange(new byte[] { 0x02, 0x08, 0x00, 0x00, 0x01, 0x08, 0x05, 0x00 });
+    blob.Add(0x00);
+
+    int header = "AutoCAD-86 bigfont 1".Length + 3;   // 头 + 0D 0A 1A
+    int indexEnd = header + 2 + 2 + 2 + 4 + 2 * 8;    // 前导 + count + nChange + 1 条变更区间 + 2 条索引
+    int offTian = indexEnd;
+    int offBlob = offTian + tian.Count;
+
+    var ms = new MemoryStream();
+    void Raw(params byte[] b) => ms.Write(b, 0, b.Length);
+    void U16(int v) { ms.WriteByte((byte)(v & 0xFF)); ms.WriteByte((byte)((v >> 8) & 0xFF)); }
+    void U32(int v) { for (int k = 0; k < 4; k++) ms.WriteByte((byte)((v >> (8 * k)) & 0xFF)); }
+
+    Raw(System.Text.Encoding.ASCII.GetBytes("AutoCAD-86 bigfont 1"));
+    Raw(0x0D, 0x0A, 0x1A);
+    U16(8);            // 前导（实测恒 8，用途未知）
+    U16(2);            // count：两条索引记录
+    U16(1);            // nChange
+    U16(0x0000); U16(0xFFFF);
+    // 索引：内码 u16（低字节在前）| 字节数 u16 | 文件内偏移 u32
+    U16(0xCCEF); U16(tian.Count); U32(offTian);
+    U16(0x008F); U16(blob.Count); U32(offBlob);
+    foreach (byte b in tian) ms.WriteByte(b);
+    foreach (byte b in blob) ms.WriteByte(b);
+    return ms.ToArray();
+}
+
+/// <summary>两条 TEXT：一条用合成 SHX 样式，一条指向不存在的字库（验证回退）。</summary>
+static string ShxProbeDxf()
+{
+    string Style(string name, string font) =>
+        $"0\nSTYLE\n2\n{name}\n70\n0\n40\n0.0\n41\n1.0\n50\n0.0\n71\n0\n42\n2.5\n3\n{font}\n4\n\n";
+    string Text(string style, double y) =>
+        $"0\nTEXT\n8\n0\n10\n0.0\n20\n{y}\n30\n0.0\n40\n100.0\n1\nL\n50\n0.0\n41\n1.0\n51\n0.0\n7\n{style}\n";
+
+    return "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1009\n"
+         + "9\n$EXTMIN\n10\n0.0\n20\n0.0\n30\n0.0\n"
+         + "9\n$EXTMAX\n10\n1000.0\n20\n1000.0\n30\n0.0\n0\nENDSEC\n"
+         + "0\nSECTION\n2\nTABLES\n"
+         + "0\nTABLE\n2\nLAYER\n70\n1\n0\nLAYER\n2\n0\n70\n0\n62\n7\n6\nCONTINUOUS\n0\nENDTAB\n"
+         + "0\nTABLE\n2\nSTYLE\n70\n2\n"
+         + Style("SHXOK", "TESTANSI.SHX")
+         + Style("SHXMISS", "NOSUCHFONT.SHX")
+         + "0\nENDTAB\n0\nENDSEC\n"
+         + "0\nSECTION\n2\nENTITIES\n"
+         + Text("SHXOK", 0.0)
+         + Text("SHXMISS", 300.0)
+         + "0\nENDSEC\n0\nEOF\n";
 }
 
 /// <summary>打印全部实体的包围盒中心/尺寸/颜色/图层（核对断言用）。</summary>

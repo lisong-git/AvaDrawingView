@@ -83,6 +83,15 @@ public sealed class GeometryConverter
 
     /// <summary>ACIS 载荷无法重建轮廓、只能跳过的 REGION 数。</summary>
     public int RegionUnresolved { get; private set; }
+
+    /// <summary>用 SHX 单线字体排出笔画的文本实体数（走描边，不走 TTF）。</summary>
+    public int ShxTextEntities { get; private set; }
+
+    /// <summary>样式引用 .shx、但本机找不到字库文件而回退 TTF 的文本实体数。</summary>
+    public int ShxTextMissingFont { get; private set; }
+
+    /// <summary>样式名 → (字体文件, 大字体文件)。SHX 排版要用它把文字映射到字库。</summary>
+    private readonly Dictionary<string, (string Font, string Big)> _styleFonts = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>文件头的 PDMODE（诊断用：0 点 / 1 不画 / 2 十字 / 3 叉 / 4 竖线，+32 圆 +64 方）。</summary>
     public int PointDisplayMode => _pointDisplayMode;
     /// <summary>文件头的 PDSIZE（诊断用：&gt;0 世界单位 / &lt;0 视高百分比 / =0 默认 5%）。</summary>
@@ -202,10 +211,13 @@ public sealed class GeometryConverter
         RegionEntities = 0;
         RegionLoops = 0;
         RegionUnresolved = 0;
+        ShxTextEntities = 0;
+        ShxTextMissingFont = 0;
         _pointDisplayMode = 0;
         _pointDisplaySize = 0f;
 
         CacheLayerColors(doc);
+        CacheTextStyles(doc);
         try
         {
             double lts = doc.Header.LineTypeScale;
@@ -1438,7 +1450,19 @@ public sealed class GeometryConverter
         }
 
         float capE = (float)height;
-        float measured = TextMetrics.MeasureWidth(text, capE) * wf;
+
+        // ---- SHX 单线字体优先 ----
+        // 样式指向可用的 .shx 时必须走它：TTF 回退的字宽与字形都对不上（受控基准实测
+        // 数字窄 17.5%、W 宽 20%），而 SHX 本身就是折线，描出来就是 AutoCAD 的形状。
+        var (styleFont, styleBig) = StyleFontsOf(e);
+        // 样式写 TTF（ARIAL.TTF / simhei.ttf）的不算 SHX，也不该记"缺字库"
+        bool wantsShx = ShxFontLibrary.IsShxName(styleFont) || ShxFontLibrary.IsShxName(styleBig);
+        float shxWidth = 0f;
+        bool shxMeasured = wantsShx &&
+            ShxFontLibrary.TryMeasure(text, styleFont, styleBig, capE, out shxWidth);
+        if (wantsShx && !shxMeasured) ShxTextMissingFont++;
+
+        float measured = (shxMeasured ? shxWidth : TextMetrics.MeasureWidth(text, capE)) * wf;
         if (alignWidth > 0 && measured > 1e-6f)
         {
             float ratio = alignWidth / measured;
@@ -1500,6 +1524,37 @@ public sealed class GeometryConverter
         var worldPos = TransformPoint(m, entityPos);
         float worldCap = capE * scale;
         float rotTotal = blockRot + rotEntity;
+
+        // ---- SHX 文字：排成描边几何（局部 → 世界）----
+        // 变换顺序必须与 TTF 那条路一致：先宽度因子、再倾斜、再旋转、最后平移
+        // （对应 DrawText 里 canvas.Scale(wf) / Skew / Rotate / Translate 的次序）。
+        if (shxMeasured &&
+            ShxFontLibrary.TryShape(text, styleFont, styleBig, worldCap,
+                                    lineSpacingFactor, lineAlign, out var shaped))
+        {
+            var sp = shaped.Path;
+            sp.Transform(SKMatrix.CreateScale(wf, 1f));
+            if (MathF.Abs(obl) > 1e-6f) sp.Transform(SKMatrix.CreateSkew(MathF.Tan(obl), 0f));
+            if (MathF.Abs(rotTotal) > 1e-6f) sp.Transform(SKMatrix.CreateRotation(rotTotal));
+            sp.Transform(SKMatrix.CreateTranslation(worldPos.X, worldPos.Y));
+
+            var shxBounds = sp.Bounds;
+            if (!InsideClip(shxBounds)) { sp.Dispose(); ClippedAway++; return; }
+
+            _entities.Add(new CadEntity
+            {
+                Layer = LayerName(e),
+                ColorArgb = color,
+                Handle = _currentHandle,
+                OwnHandle = _currentOwnHandle,
+                Path = sp,
+                TextStrokes = true,
+                LineWeightMm100 = ResolveLineWeight(e, _inheritedLineWeight),
+                Bounds = shxBounds,
+            });
+            ShxTextEntities++;
+            return;
+        }
 
         // 逐行对齐时包围盒按"整块矩形"算（各行首尾落在 ±块宽/2 或 −块宽 上）；
         // 否则沿用字形级精确包围盒（TEXT 的口径不变，历史断言依赖它）。
@@ -1592,6 +1647,43 @@ public sealed class GeometryConverter
 
     /// <summary>autoCAD 默认线宽 0.25mm（头变量 LWDEFAULT；ACadSharp 未暴露，用行业默认值）。</summary>
     private const int DefaultLineWeightMm100 = 25;
+
+    /// <summary>
+    /// 缓存文字样式 → 字库文件名。
+    ///
+    /// <para>**必须走 doc.TextStyles 而不是实体的 Style 属性**：DWG 里的实体只带样式名，
+    /// ACadSharp 交出来的 Style 往往是只填了 Name 的占位对象，直接读它的 Filename 永远拿到空。</para>
+    /// </summary>
+    private void CacheTextStyles(CadDocument doc)
+    {
+        _styleFonts.Clear();
+        try
+        {
+            foreach (var st in doc.TextStyles)
+            {
+                string name = st.Name ?? string.Empty;
+                if (name.Length == 0) continue;
+                _styleFonts[name] = (st.Filename ?? string.Empty, st.BigFontFilename ?? string.Empty);
+            }
+        }
+        catch
+        {
+            // 样式表损坏不影响其他实体
+        }
+    }
+
+    /// <summary>取实体所用样式的 (字体, 大字体) 文件名；取不到返回空串。</summary>
+    private (string Font, string Big) StyleFontsOf(Entity e)
+    {
+        string styleName = e switch
+        {
+            AttributeEntity a => a.Style?.Name,   // 必须排在 TextEntity 前面：它是其子类
+            TextEntity t => t.Style?.Name,
+            MText m => m.Style?.Name,
+            _ => null,
+        } ?? string.Empty;
+        return styleName.Length > 0 && _styleFonts.TryGetValue(styleName, out var f) ? f : (string.Empty, string.Empty);
+    }
 
     /// <summary>
     /// <see cref="LineWeightType"/> → 1/100 mm。

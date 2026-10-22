@@ -17,6 +17,10 @@ public static class CadDocumentLoader
         ct.ThrowIfCancellationRequested();
         var doc = ReadDocument(path, ct);
 
+        // SHX 字库查找：先看图纸所在目录（实测图集里有 11 个 .shx 随图附带）
+        try { ShxFontLibrary.SetDrawingDirectory(Path.GetDirectoryName(Path.GetFullPath(path))); }
+        catch { }
+
         progress?.Report("转换几何…");
         ct.ThrowIfCancellationRequested();
         var converter = new GeometryConverter();
@@ -50,6 +54,10 @@ public static class CadDocumentLoader
             progress?.Report($"REGION：{converter.RegionEntities} 个重建轮廓（{converter.RegionLoops} 环）"
                              + (converter.RegionUnresolved > 0
                                 ? $"，{converter.RegionUnresolved} 个无法解析（ACIS 载荷异常）" : ""));
+        if (converter.ShxTextEntities + converter.ShxTextMissingFont > 0)
+            progress?.Report($"SHX 文字：{converter.ShxTextEntities} 个实体按字库描线"
+                             + (converter.ShxTextMissingFont > 0
+                                ? $"，{converter.ShxTextMissingFont} 条文字缺字库（回退 TTF）" : ""));
         if (converter.NonPlottingLayers > 0)
             progress?.Report($"不打印图层：{converter.NonPlottingLayers} 个已默认隐藏"
                              + "（对应 AutoCAD 的 DEFPOINTS，可在图层面板打开）");

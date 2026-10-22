@@ -34,6 +34,10 @@
 - **资源生命周期**：`DisplayList` 持有原生 `SKPath`（GC 看不见），用 `AddRef`/`Release` 引用计数——绘制操作在构造时 `AddRef`、`Dispose` 时 `Release`，UI 线程换图时 `Release` 旧实例。计数归零才真正释放，避免"渲染线程还在画、UI 线程已释放"的用例
 - **精度**：圆/弧用圆锥曲线（任意缩放不失真），椭圆/样条压平
 - **文本包围盒**：走 `TextMetrics` 用真实字体度量（`MeasureLocalBounds` + `ToWorldBounds`），与渲染共用同一 `SKTypeface`，保证"适应窗口"的范围与屏幕墨迹一致
+- **SHX 单线字体**（`ShxFont` + `ShxFontLibrary`）：自建 SHX 解析器，直接执行字体里的字节命令流
+  （`unifont` 的 ASCII 名字前缀、`bigfont` 的 GBK 内码索引、8 分弧/凸度弧/子形全部处理），
+  把文字排成折线描边，字宽与字形就是 AutoCAD 的口径；样式写 TTF 的仍走系统字体，
+  `.shx` 找不到则回退系统字体并在状态栏报数
 - **颜色**：ACI 256 色表 + TrueColor；ByLayer 解析到图层色，ByBlock 继承外层 INSERT 的解析色
 - **大图性能**（借鉴 ReadCAD 的批次缓冲 + LOD 思路，实测 5.36MB 图纸全图视角
   **7.3 FPS → 63.6 FPS**（绘制 4.5ms）；按 AutoCAD 语义跳过隐藏实体与冻结/关闭图层后，
@@ -48,7 +52,7 @@
 ```powershell
 dotnet build AvaDrawingView.slnx -c Debug
 dotnet run --project src\DrawingView          # 启动 GUI
-dotnet run --project tools\SmokeTest        # 核心链路冒烟测试（解析→转换→索引，293 项断言）
+dotnet run --project tools\SmokeTest        # 核心链路冒烟测试（解析→转换→索引，321 项断言）
 dotnet run --project tools\UiSmokeTest      # UI 渲染冒烟测试（无头，不弹窗口）
 dotnet run --project tools\PerfProbe -- "D:\path\to.dwg"   # 性能基准（--load-only 只测加载；--repeat 8 验内存泄漏）
 dotnet run --project tools\SampleGen        # 重新生成 samples\ 下的样例图纸（含 sample_far.dxf 大坐标样例）
@@ -72,8 +76,10 @@ dotnet run --project tools\DwgCapture -- --in "D:\src.dwg" --out "D:\out\shot.pn
 dotnet run --project tools\PerfProbe  -- "D:\src.dwg" --types                 # 实体类型直方图 + ACIS 载荷概览
 dotnet run --project tools\PerfProbe  -- "D:\src.dwg" --dump-sab D:\out\a.sab # 导出首条 ACIS 载荷
 dotnet run --project tools\PerfProbe  -- --survey "D:\图集" --limit 80 --min-kb 200   # 图集普查（实体/字体）
+dotnet run --project tools\PerfProbe  -- --fonts "D:\图集" --min-kb 200 --limit 20    # 只看字体引用（标注本机有没有这个 .shx）
 $env:DrawingView_NO_REGION = "1"                                              # 关掉 REGION 轮廓，做像素 A/B
 $env:DrawingView_RENDER_SPLIT = "1"                                           # 绘制分段耗时（配合 PerfProbe）
+$env:DrawingView_FONT_PATH = "D:\ACAD\Fonts"                                 # SHX 字体搜索目录（分号分隔；图形目录与 Windows\Fonts 已在搜索链里）
 ```
 
 - `DwgCapture` 只认 `--in` / `--out`（早期文档写的两个位置参数是错的，实测会报 unknown argument）
@@ -126,7 +132,7 @@ dotnet run --project tools\ShapeExport -- "D:\src.dwg" "D:\out"   # 默认输出
 ```
 src/DrawingView.Core      # 无 UI 依赖：解析、几何转换、烘焙批次、显示列表、文本度量、空间索引、视口
 src/DrawingView           # Avalonia 应用：DrawingView、主窗口、图层面板
-tools/SmokeTest         # 样例 DXF 全链路测试（解析→转换→索引，293 项精确断言）
+tools/SmokeTest         # 样例 DXF 全链路测试（解析→转换→索引，321 项精确断言）
 tools/UiSmokeTest       # 无头 Avalonia 渲染测试（真实跑渲染管线，40 项像素/几何断言）
 tools/PerfProbe         # 性能基准（加载分段 / 内存 / 帧耗时 / LOD 扫描 / 墨迹覆盖率 / 泄漏验证）
 tools/SampleGen         # 生成 samples\sample_features.dxf（覆盖全部实体类型与边界情况）
@@ -147,7 +153,9 @@ samples/                # 样例图纸
 > SPLINE 权重与闭合、REGION 轮廓重建（ACIS/SAB）、不打印图层默认隐藏。
 
 - 大图纸优化：SKPicture 静态层录制、分块缓存、块实例复用（当前 INSERT 为烘焙克隆）
-- SHX / 单线字体未支持：当前统一走系统字体（雅黑）回退，字宽与字形与原图有差异
+- SHX 单线字体**已支持**（2026-10-22）：缺字库时（本机没有 `tssdeng.shx`/`hztxt.shx`/`jrs.shx`）
+  仍回退系统字体，字形差异依旧存在；状态栏会报「N 条文字缺字库（回退 TTF）」
+- SHX 大字体的字宽**按字高一个方块**走：gbcbig 的字形结束点比墨迹还窄，直接当前进量会叠字
 - 3DSOLID / BODY / SURFACE 不渲染：**REGION 已支持**（ACIS 的 SAB 二进制载荷由
   `AcisSab` + `RegionOutline` 自建重建，见 P2-7）；三维实体投到 XY 会互相穿插，暂不处理
 - 大坐标（图纸范围 ±1e6）下 float32 精度：深度放大时几何可能抖动

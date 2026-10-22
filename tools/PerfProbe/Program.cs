@@ -36,6 +36,21 @@ int Run(string[] argv)
 {
     var loadOnly = argv.Contains("--load-only");
 
+    // --fonts <dir>：统计图集里"文本实体实际用到哪些字体文件"（按实体数加权）。
+    // 上一次普查只统计了"SHX 样式占 54.9%"，但没回答"具体是哪些 .shx"——
+    // 而 SHX 实现的边界完全由被引用的字体文件决定（simplex 与 gbcbig 是两套编码）。
+    int fontsIdx = Array.IndexOf(argv, "--fonts");
+    if (fontsIdx >= 0 && fontsIdx + 1 < argv.Length)
+    {
+        int limit = 0;
+        int limitIdx = Array.IndexOf(argv, "--limit");
+        if (limitIdx >= 0 && limitIdx + 1 < argv.Length) int.TryParse(argv[limitIdx + 1], out limit);
+        int minKb = 0;
+        int minKbIdx = Array.IndexOf(argv, "--min-kb");
+        if (minKbIdx >= 0 && minKbIdx + 1 < argv.Length) int.TryParse(argv[minKbIdx + 1], out minKb);
+        return FontStat(argv[fontsIdx + 1], limit, minKb);
+    }
+
     // --survey <dir>：批量普查（不看渲染，只回答"图集里到底有什么实体/字体"）
     // 用途：决定 3DSOLID/BODY/SURFACE 值不值得实现、SHX 字体占比多少 —— 先用数据说话，
     // 不要凭"感觉国内图纸都用 SHX"去排优先级。
@@ -582,6 +597,100 @@ static Stats MeasurePanFrames(Window window, DrawingView.Controls.DrawingView vi
 ///
 /// <para>抽样是等距抽样（先按路径排序再均匀取 N 个），避免 limit 只扫到某个子目录。</para>
 /// </summary>
+int FontStat(string dir, int limit, int minKb)
+{
+    long minBytes = (long)minKb * 1024;
+    var files = Directory.EnumerateFiles(dir, "*.*", SearchOption.AllDirectories)
+        .Where(f => (f.EndsWith(".dwg", StringComparison.OrdinalIgnoreCase)
+                  || f.EndsWith(".dxf", StringComparison.OrdinalIgnoreCase))
+                 && (minBytes <= 0 || new FileInfo(f).Length >= minBytes))
+        .OrderBy(f => f, StringComparer.Ordinal).ToList();
+    if (files.Count == 0) { Log($"FAIL: {dir} 下没有 dwg/dxf"); return 1; }
+
+    int total = files.Count;
+    if (limit > 0 && files.Count > limit)
+    {
+        double step = (double)files.Count / limit;
+        var sampled = new List<string>(limit);
+        for (int i = 0; i < limit; i++) sampled.Add(files[(int)(i * step)]);
+        files = sampled;
+    }
+    Log($"=== 字体使用普查 === {dir}");
+    Log($"文件总数 {total}，本次抽样 {files.Count}（等距抽样，--min-kb {minKb}）");
+    Log("");
+
+    static string Prop(object? o, string name)
+        => o?.GetType().GetProperty(name)?.GetValue(o)?.ToString() ?? "";
+
+    // 字体文件名 → 引用它的文本实体数（只统计真正有字的实体）
+    var latin = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+    var big = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+    long noStyle = 0, totalText = 0;
+    int failed = 0;
+
+    foreach (var f in files)
+    {
+        try
+        {
+            ACadSharp.CadDocument doc;
+            if (f.EndsWith(".dwg", StringComparison.OrdinalIgnoreCase))
+            { using var r = new ACadSharp.IO.DwgReader(f); doc = r.Read(); }
+            else { using var r = new ACadSharp.IO.DxfReader(f); doc = r.Read(); }
+
+            var styleMap = new Dictionary<string, (string Font, string Big)>(StringComparer.OrdinalIgnoreCase);
+            foreach (var st in doc.TextStyles)
+                styleMap[Prop(st, "Name")] = (Prop(st, "Filename"), Prop(st, "BigFontFilename"));
+
+            var all = doc.Entities.Concat(doc.BlockRecords.SelectMany(b => b.Entities));
+            foreach (var e in all)
+            {
+                string tn = e.GetType().Name;
+                if (tn != "TextEntity" && tn != "MText" && tn != "AttributeEntity" && tn != "AttributeDefinition")
+                    continue;
+                totalText++;
+                string sn = Prop(e.GetType().GetProperty("Style")?.GetValue(e), "Name");
+                if (sn.Length == 0 || !styleMap.TryGetValue(sn, out var st2))
+                { noStyle++; continue; }
+                string fn = st2.Font.Length > 0 ? st2.Font : "(空=默认)";
+                latin[fn] = latin.GetValueOrDefault(fn) + 1;
+                if (st2.Big.Length > 0) big[st2.Big] = big.GetValueOrDefault(st2.Big) + 1;
+            }
+        }
+        catch (Exception ex)
+        {
+            failed++;
+            Log($"{Path.GetFileName(f),-40} 解析失败：{ex.GetType().Name}");
+        }
+    }
+
+    // 本机能不能找到这些字体文件（SHX 解析第一步：有文件才能验字形）
+    var fontDirs = new[] { @"C:\Windows\Fonts" };
+    var local = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var d in fontDirs.Where(Directory.Exists))
+        foreach (var p in Directory.EnumerateFiles(d, "*.shx"))
+            local.Add(Path.GetFileName(p));
+
+    Log($"文本实体合计 {totalText:N0}（样式名缺失 {noStyle:N0}），解析失败 {failed}");
+    Log("");
+    Log($"--- 主字体（按文本实体数）---  本机有 {local.Count} 个 .shx");
+    foreach (var kv in latin.OrderByDescending(k => k.Value).Take(20))
+    {
+        string tag = local.Contains(kv.Key) ? "本地有" : (kv.Key.Contains('.') ? "本地缺" : "");
+        Log($"{kv.Key,-24}{kv.Value,10:N0}{(double)kv.Value / Math.Max(1, totalText),8:P1}  {tag}");
+    }
+    if (big.Count > 0)
+    {
+        Log("");
+        Log("--- 大字体（中文）---");
+        foreach (var kv in big.OrderByDescending(k => k.Value).Take(10))
+        {
+            string tag = local.Contains(kv.Key) ? "本地有" : "本地缺";
+            Log($"{kv.Key,-24}{kv.Value,10:N0}{(double)kv.Value / Math.Max(1, totalText),8:P1}  {tag}");
+        }
+    }
+    return 0;
+}
+
 int SurveyCorpus(string dir, int limit, int minKb, string csvPath)
 {
     long minBytes = (long)minKb * 1024;

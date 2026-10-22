@@ -99,6 +99,14 @@ public sealed class CadEntity
     /// </summary>
     public PointMark? Mark { get; init; }
     /// <summary>
+    /// SHX 单线字体排出的**文字笔画**（几何在 <see cref="Path"/> 里，世界坐标）。
+    ///
+    /// <para>为什么不走批次：文字一旦进批次就会被 LOD 按尺寸整档丢弃，而"文字突然消失"
+    /// 与"图元缺失"在用户眼里没有区别。所以它和 TTF 文本一样进
+    /// <c>UnbatchedEntities</c>，只是画法由 <see cref="TextDraw"/> 换成描边。</para>
+    /// </summary>
+    public bool TextStrokes { get; init; }
+    /// <summary>
     /// 解析后的线宽（1/100 mm，AutoCAD 口径：25 = 0.25mm；0 = 不显示线宽，按 1px 细线）。
     ///
     /// <para><b>这里存毫米原值而不是"世界单位宽度"</b>：AutoCAD 的线宽显示口径在两种空间里不同 ——
