@@ -1718,8 +1718,29 @@ void RunShxChecks()
                 Check(MathF.Abs(l.Polylines[0][2].Y - 20f) < 0.01f, $"L 末点 y=20（实际 {l.Polylines[0][2].Y:F2}）");
                 Check(MathF.Abs(l.Advance - 10f) < 0.01f, $"L 前进量 10（实际 {l.Advance:F2}）");
             }
-            // 字高换算按实测上沿（H=20），不是头部 above（我们故意写成 30）
-            Check(MathF.Abs(ansi.CapUnits - 20f) < 0.01f, $"字高换算 20 而不是 above=30（实际 {ansi.CapUnits:F2}）");
+            // 字高换算取头部 above（这里是 30），不是实测上沿（H=20）。
+            // 这一条被 ODA 逐字符验证过：gbenor above=48 / 实测 H=38，ODA 的缩放比例恒为 38/48。
+            Check(MathF.Abs(ansi.CapUnits - 30f) < 0.01f, $"字高换算取 above=30（实际 {ansi.CapUnits:F2}）");
+            var m2 = ansi.GetGlyph('M');
+            Check(m2 is not null, "字形 M 存在（mode-2 用例）");
+            if (m2 is not null)
+            {
+                Check(MathF.Abs(m2.Advance - 10f) < 0.01f,
+                      $"mode-2 跳过的矢量不移动画笔，M 前进量 10（实际 {m2.Advance:F2}）");
+                Check(m2.Polylines.Count == 1 && MathF.Abs(m2.Polylines[0][0].X) < 0.01f
+                      && MathF.Abs(m2.Polylines[0][0].Y) < 0.01f,
+                      $"M 起点仍在 (0,0)（实际 {m2.Polylines.FirstOrDefault()?[0]}）");
+            }
+            var sp = ansi.GetGlyph(' ');
+            Check(sp is not null, "空格有记录（不能因为没墨迹就当成缺字）");
+            if (sp is not null)
+            {
+                Check(MathF.Abs(sp.Advance - 12f) < 0.01f, $"空格前进量 12（实际 {sp.Advance:F2}）");
+                Check(sp.Polylines.Count == 0, $"空格没有墨迹（实际 {sp.Polylines.Count} 段）");
+                Check(ShxFontLibrary.TryMeasure("L L", ansiPath, null, 100f, out float wSp)
+                      && MathF.Abs(wSp - 106.67f) < 0.5f,
+                      $"含空格量宽 106.67（实际 {wSp:F2}）");
+            }
             Check(ansi.GetGlyph('Z') is null, "字库里没有 Z 时返回 null（不抛异常）");
         }
 
@@ -1776,11 +1797,11 @@ void RunShxChecks()
         var stroke = list.Entities.FirstOrDefault(e => e.TextStrokes);
         if (stroke is not null)
         {
-            // 字高 100、字库里 L 高 20 单位、宽 10 单位 → 缩放 5 倍 → 50 × 100
+            // 字高 100、字库 above=30（L 本身高 20 单位、宽 10 单位）→ 缩放 100/30 → 33.33 × 66.67
             var b = stroke.Bounds;
             Log($"  描线包围盒 x[{b.Left:F2},{b.Right:F2}] y[{b.Bottom:F2},{b.Top:F2}]");
-            Check(MathF.Abs(b.Width - 50f) < 1f, $"L 宽 50（实际 {b.Width:F2}）");
-            Check(MathF.Abs(b.Height - 100f) < 1f, $"L 高 100（实际 {b.Height:F2}）");
+            Check(MathF.Abs(b.Width - 33.33f) < 1f, $"L 宽 33.33（实际 {b.Width:F2}）");
+            Check(MathF.Abs(b.Height - 66.67f) < 1f, $"L 高 66.67（实际 {b.Height:F2}）");
             Check(MathF.Abs(b.Left) < 1f, $"L 起点 x=0（实际 {b.Left:F2}）");
         }
     }
@@ -1800,7 +1821,7 @@ static byte[] BuildTestAnsiFont()
 
     Raw(System.Text.Encoding.ASCII.GetBytes("AutoCAD-86 unifont 1"));   // 头部以 0x0D 结尾，不能用 index(0)
     Raw(0x0D, 0x0A, 0x1A);
-    U32(3);                       // count = 记录数 + 1
+    U32(5);                       // count = 记录数 + 1
     U16(0);                       // 索引区字节数（解析不用）
     Raw(System.Text.Encoding.ASCII.GetBytes("TESTANSI"));
     Raw(0x00);
@@ -1811,6 +1832,17 @@ static byte[] BuildTestAnsiFont()
     U16('H'); U16(h.Length); Raw(h);
     byte[] l = { (byte)'L', 0x00, 0x02, 0x08, 0x00, 0x00, 0x01, 0x08, 0x0A, 0x00, 0x08, 0x00, 0x14, 0x00 };
     U16('L'); U16(l.Length); Raw(l);
+
+    // M 专门钉 mode-2 语义：0x0E 后面的矢量属于竖排定位，**水平排版下连位移一起丢掉**。
+    // 若只忽略"是否落笔"而仍然移动画笔，起点会跑到 (-5.66,-5.66)，前进量变 14.34 而不是 10
+    // —— 真实的 simplex 就是这样让 't'/'v'/'-' 的前进量算错的（ODA 基准 79 个字符里差 7 个）。
+    byte[] m = { (byte)'M', 0x00, 0x02, 0x0E, 0x8A, 0x01, 0x08, 0x0A, 0x00, 0x02, 0x00 };
+    U16('M'); U16(m.Length); Raw(m);
+
+    // 空格：有记录、有前进量（12）、但**没有墨迹**。不能因为"画不出线"就当成缺字 ——
+    // 真实字库里空格就是这样，误判会让每个空格窄到半个字高（ODA 基准差 4.7%）。
+    byte[] sp = { (byte)' ', 0x00, 0x02, 0x08, 0x0C, 0x00, 0x00 };
+    U16(' '); U16(sp.Length); Raw(sp);
     return ms.ToArray();
 }
 

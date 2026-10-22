@@ -203,9 +203,11 @@ public static class ShxFontLibrary
                 }
                 // 中文用大字体自己的**固定字宽**（gbcbig ≈ 0.73 em，压缩字体的字形结束点
                 // 不代表前进量，按字高 1 em 走会宽出 37%）；西文用字形自个的 Advance。
-                penX += font.Kind == ShxFont.FontKind.BigFont
+                float adv = font.Kind == ShxFont.FontKind.BigFont
                     ? font.AdvanceUnits * scale
                     : glyph.Advance * scale;
+                if (adv <= 0f) adv = FallbackAdvance(c, ansi, big, ansiScale, bigScale);
+                penX += adv;
             }
         }
 
@@ -242,15 +244,18 @@ public static class ShxFontLibrary
     private static (ShxFont? Font, ShxFont.Glyph? Glyph, float Scale) PickGlyph(
         char c, ShxFont? ansi, ShxFont? big, float ansiScale, float bigScale)
     {
-        // 西文字符优先主字体，中文优先大字体；主字体没有的再用另一个兜底
+        // 西文字符优先主字体，中文优先大字体；主字体没有的再用另一个兜底。
+        // **有记录就算"有字"，不能要求"有墨迹"** —— 空格的字形是空的，但它有前进量
+        // （simplex 空格 19 单位 = 0.905 em）；按 Polylines.Count > 0 判定会把空格当缺字，
+        // 落到"半个字高"的兜底上，于是每个空格窄 45%（ODA 基准：整串 "WAVE 2026" 差 4.7%）。
         if (c < 0x80)
         {
-            if (ansi?.GetGlyph(c) is { } ga && ga.Polylines.Count > 0) return (ansi, ga, ansiScale);
-            if (big?.GetGlyph(c) is { } gb && gb.Polylines.Count > 0) return (big, gb, bigScale);
+            if (ansi?.GetGlyph(c) is { } ga) return (ansi, ga, ansiScale);
+            if (big?.GetGlyph(c) is { } gb) return (big, gb, bigScale);
             return (null, null, 0f);
         }
-        if (big?.GetGlyph(c) is { } mb && mb.Polylines.Count > 0) return (big, mb, bigScale);
-        if (ansi?.GetGlyph(c) is { } ma && ma.Polylines.Count > 0) return (ansi, ma, ansiScale);
+        if (big?.GetGlyph(c) is { } mb) return (big, mb, bigScale);
+        if (ansi?.GetGlyph(c) is { } ma) return (ansi, ma, ansiScale);
         return (null, null, 0f);
     }
 
@@ -263,7 +268,8 @@ public static class ShxFontLibrary
             if (c < ' ') continue;
             var (font, glyph, scale) = PickGlyph(c, ansi, big, ansiScale, bigScale);
             if (font is null || glyph is null) { x += FallbackAdvance(c, ansi, big, ansiScale, bigScale); continue; }
-            x += font.Kind == ShxFont.FontKind.BigFont ? font.AdvanceUnits * scale : glyph.Advance * scale;
+            float adv = font.Kind == ShxFont.FontKind.BigFont ? font.AdvanceUnits * scale : glyph.Advance * scale;
+            x += adv > 0f ? adv : FallbackAdvance(c, ansi, big, ansiScale, bigScale);
         }
         return x;
     }

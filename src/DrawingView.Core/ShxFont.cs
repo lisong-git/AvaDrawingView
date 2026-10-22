@@ -239,17 +239,22 @@ public sealed class ShxFont
     private float? _capUnits;
 
     /// <summary>
-    /// 一个"字高"对应多少字体单位（惰性实测）。
+    /// 一个"字高"对应多少字体单位。
     ///
-    /// <para>拿几个典型字形的**上沿 y** 取最大：ANSI 字体用 H/E/X，大字体用常用汉字。
-    /// 直接用头部的 above 不行 —— 实测 gbenor 的 above=48 而 'H' 上沿只有 38
-    /// （above 是字身框，不是大写字高），按 above 换算字会小 21%。</para>
+    /// <para><b>unifont 用头部的 above</b>：它就是字体声明的标称字高，AutoCAD 拿它当
+    /// TEXT 高度的基准。这一条用 ODA 做过逐字符验证 —— <c>gbenor</c> 的 above=48 而
+    /// 实测 'H' 上沿只有 38，ODA 渲染出来的字宽/字高比例**恒为 38/48 = 0.7917**（79 个
+    /// 字符里 78 个精确命中），说明 AutoCAD 口径是"按 above 缩放"，不是"按大写字高"。  </para>
+    ///
+    /// <para><b>bigfont 用实测上沿</b>：大字体头部没有 above/below，ODA 自己用的是
+    /// 90.67 单位（gbcbig 反推，14 个汉字完全一致），与实测"中"上沿 90 差 0.7%。</para>
     /// </summary>
     public float CapUnits
     {
         get
         {
             if (_capUnits is { } v) return v;
+
             ReadOnlySpan<char> sample = Kind == FontKind.BigFont
                 ? "国工日中田山大小上建设说明平面图口"
                 : "HEXN0A";
@@ -261,9 +266,17 @@ public sealed class ShxFont
                 foreach (var p in poly)
                     if (p.Y > max) max = p.Y;
             }
-            if (max < 1f) max = Kind == FontKind.BigFont ? 100f : Math.Max(Above, 1);
-            _capUnits = max;
-            return max;
+
+            float cap = max;
+            if (Kind == FontKind.Unifont && Above > 0)
+            {
+                // 兜底：above 明显不合理时（比如坏字库里写成 0 或离谱的大值）仍用实测上沿。
+                if (max < 1f || (Above >= max * 0.85f && Above <= max * 3f)) cap = Above;
+            }
+            if (cap < 1f) cap = Kind == FontKind.BigFont ? 100f : Math.Max(Above, 1);
+
+            _capUnits = cap;
+            return cap;
         }
     }
 
@@ -469,9 +482,15 @@ public sealed class ShxFont
                     0x9 or 0xF => -0.5f,
                     _ => -1f,
                 };
-                pen.X += dx * len * pen.Scale;
-                pen.Y += dy * len * pen.Scale;
-                if (run) pen.Emit();
+                // 被 0x0E 跳过的矢量**不能移动画笔**：它属于竖排（mode 2）的定位，
+                // 水平排版下必须整条丢掉，否则字形起点会偏移。原来这里把位移写在了
+                // if (run) 外面，和 XY 位移分支（整条忽略）自相矛盾。
+                if (run)
+                {
+                    pen.X += dx * len * pen.Scale;
+                    pen.Y += dy * len * pen.Scale;
+                    pen.Emit();
+                }
                 continue;
             }
 
