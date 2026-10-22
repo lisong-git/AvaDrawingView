@@ -134,20 +134,38 @@ public static class ShxFontLibrary
     public static (ShxFont? Ansi, ShxFont? Big) ResolveStyle(string? fontFile, string? bigFontFile)
         => (Resolve(fontFile), Resolve(bigFontFile));
 
+    /// <summary>
+    /// 这个样式能不能真排竖排。
+    ///
+    /// <para>AutoCAD 的 SHX 竖排要求字体自己带竖排字形变体：西文字体要看头部 modes 的
+    /// bit2（实测 <c>simplex</c>=2 支持、<c>gbenor</c>=0 不支持），大字体（gbcbig/hztxt）
+    /// 都支持。两个字体都不支持时按横排画 —— ODA 对 <c>gbenor</c> 的"垂直"样式也是这么降级的：
+    /// 同一份 DXF 里 simplex 竖排、gbenor 依旧横排。</para>
+    /// </summary>
+    public static bool SupportsVertical(string? fontFile, string? bigFontFile)
+    {
+        var (ansi, big) = ResolveStyle(fontFile, bigFontFile);
+        return (ansi?.SupportsVertical ?? false) || (big?.SupportsVertical ?? false);
+    }
+
     // ---------- 排版 ----------
 
-    /// <summary>排版结果：局部坐标的描边路径 + 宽度。</summary>
+    /// <summary>排版结果：局部坐标的描边路径 + 长度（横排 = 宽、竖排 = 向下排的总长）。</summary>
     public readonly record struct Shaped(SKPath Path, float Width, int Missing);
 
     /// <summary>
     /// 把文本排成**局部坐标**的描边路径：x 向右、y 向上，首行基线在 y=0，字高 = <paramref name="capHeight"/>。
     /// 宽度因子/倾斜/旋转由调用方（转换器）统一施加，与 TTF 那条路保持同一套变换顺序。
     ///
+    /// <para><paramref name="vertical"/> = true 时按竖排排：字形**直立不动**、水平方向按墨迹居中，
+    /// 整列向下走（ODA 基准：字高 100 的 "A" 占 x=±38.1、y=-100…0，"A" 的墨迹就正好在
+    /// 插入点下方一个字高的范围里），所以 <see cref="Shaped.Width"/> 这时是"向下排的总长"。</para>
+    ///
     /// <returns>true = 至少排出一个字形，可以用 SHX 渲染；false = 该样式没有 SHX 字体或没有可用字形。</returns>
     /// </summary>
     public static bool TryShape(string text, string? fontFile, string? bigFontFile,
                                 float capHeight, float lineSpacingFactor, TextLineAlign lineAlign,
-                                out Shaped shaped)
+                                out Shaped shaped, bool vertical = false)
     {
         shaped = default;
         if (string.IsNullOrEmpty(text) || capHeight <= 0) return false;
@@ -167,11 +185,65 @@ public static class ShxFontLibrary
         for (int li = 0; li < lines.Length; li++)
         {
             string line = lines[li];
+            if (vertical)
+            {
+                // 竖排：每一行是一列，按中文阅读习惯**从右往左**换列（与横排往下换行镜像）。
+                // ODA 对 MTEXT 竖排的口径没测（图集里一例都没有），这里按"换列 = 左移一个行距"处理。
+                float colX = -li * capHeight * lineSpacingFactor;
+                float penY = 0f;
+                foreach (char c in line)
+                {
+                    if (c < ' ') continue;
+                    var (font, glyph, scale) = PickGlyph(c, ansi, big, ansiScale, bigScale, vertical: true);
+                    if (font is null || glyph is null)
+                    {
+                        missing++;
+                        penY -= VerticalCellOf(null, c, ansi, big, ansiScale, bigScale);
+                        continue;
+                    }
+                    if (glyph.Polylines.Count > 0)
+                    {
+                        // 两种字库要分开处理：
+                        //  ① 字体自己会定位（simplex：竖排变体已经是 x[-8,8] y[-21,0]）→ 原样画；
+                        //  ② 字体不管（gbcbig 这类大字体没有 0x0E 命令，竖排=横排）→ 我们自己
+                        //     按墨迹水平居中、整体上移一个字高，让墨迹挂在插入点下方。
+                        bool self = font.SelfPositionsVertical(c);
+                        float dx = 0f;
+                        if (!self)
+                        {
+                            // ODA 基准：'A' 墨迹 0…16 单位 → 列两侧各 38.1px，中点正好在插入点
+                            // x 上（按前进格居中会偏 14px）。
+                            float inkMin = float.MaxValue, inkMax = float.MinValue;
+                            foreach (var poly in glyph.Polylines)
+                            foreach (var p in poly)
+                            {
+                                if (p.X < inkMin) inkMin = p.X;
+                                if (p.X > inkMax) inkMax = p.X;
+                            }
+                            dx = inkMax > inkMin ? -0.5f * (inkMin + inkMax) * scale : 0f;
+                        }
+                        float dy = self ? penY : penY - capHeight;
+                        foreach (var poly in glyph.Polylines)
+                        {
+                            if (poly.Length < 2) continue;
+                            path.MoveTo(colX + dx + poly[0].X * scale, dy + poly[0].Y * scale);
+                            for (int k = 1; k < poly.Length; k++)
+                                path.LineTo(colX + dx + poly[k].X * scale, dy + poly[k].Y * scale);
+                        }
+                        drawn++;
+                    }
+                    penY -= VerticalCellOf(font, c, ansi, big, ansiScale, bigScale);
+                }
+                float run = -penY;
+                if (run > maxWidth) maxWidth = run;
+                continue;
+            }
+
             float baseY = -li * capHeight * lineSpacingFactor;
 
             // 先量宽度，才能按行对齐（MTEXT 的 Center/Right 是逐行生效的）
             float w = MeasureLine(line, ansi, big, ansiScale, bigScale, capHeight);
-            float dx = lineAlign switch
+            float dxLine = lineAlign switch
             {
                 TextLineAlign.Center => -w * 0.5f,
                 TextLineAlign.Right => -w,
@@ -179,7 +251,7 @@ public static class ShxFontLibrary
             };
             if (w > maxWidth) maxWidth = w;
 
-            float penX = dx;
+            float penX = dxLine;
             foreach (char c in line)
             {
                 if (c < ' ') continue;
@@ -220,9 +292,30 @@ public static class ShxFontLibrary
         return true;
     }
 
-    /// <summary>只量宽度（与 <see cref="TryShape"/> 同一套前进量），供对齐/两点定宽使用。</summary>
+    /// <summary>竖排字身格（局部坐标，向下）。字形取自哪个字体就用哪个字体的格子。</summary>
+    private static float VerticalCellOf(ShxFont? font, char c, ShxFont? ansi, ShxFont? big,
+                                        float ansiScale, float bigScale)
+    {
+        if (font is not null)
+        {
+            float s = font.Kind == ShxFont.FontKind.BigFont ? bigScale : ansiScale;
+            // 逐字形：竖排前进量是字库按字给的（'A' 31、'1' 31.5、空格 30、连字符 10 单位），
+            // 不是字体常量 —— 用常量会让数字串/含空格的长串逐字累积偏差。
+            float cell = s > 0f ? font.VerticalAdvance(c) * s : 0f;
+            if (cell > 0f) return cell;
+        }
+        // 缺字兜底：拿一个能用的字体的格子，实在没有就按 1 em
+        if (big is not null && bigScale > 0f) return big.VerticalCellUnits * bigScale;
+        if (ansi is not null && ansiScale > 0f) return ansi.VerticalCellUnits * ansiScale;
+        return 1f;
+    }
+
+    /// <summary>
+    /// 只量长度（与 <see cref="TryShape"/> 同一套前进量），供对齐/两点定宽使用。
+    /// 横排返回行宽；<paramref name="vertical"/> = true 时返回"向下排的总长"。
+    /// </summary>
     public static bool TryMeasure(string text, string? fontFile, string? bigFontFile, float capHeight,
-                                  out float width)
+                                  out float width, bool vertical = false)
     {
         width = 0f;
         if (string.IsNullOrEmpty(text) || capHeight <= 0) return false;
@@ -234,7 +327,19 @@ public static class ShxFontLibrary
         float max = 0f;
         foreach (string line in text.Split('\n'))
         {
-            float w = MeasureLine(line, ansi, big, ansiScale, bigScale, capHeight);
+            float w;
+            if (vertical)
+            {
+                w = 0f;
+                foreach (char c in line)
+                {
+                    if (c < ' ') continue;
+                    var (font, glyph, _s) = PickGlyph(c, ansi, big, ansiScale, bigScale, vertical: true);
+                    _ = glyph;
+                    w += VerticalCellOf(font, c, ansi, big, ansiScale, bigScale);
+                }
+            }
+            else w = MeasureLine(line, ansi, big, ansiScale, bigScale, capHeight);
             if (w > max) max = w;
         }
         width = max;
@@ -242,7 +347,7 @@ public static class ShxFontLibrary
     }
 
     private static (ShxFont? Font, ShxFont.Glyph? Glyph, float Scale) PickGlyph(
-        char c, ShxFont? ansi, ShxFont? big, float ansiScale, float bigScale)
+        char c, ShxFont? ansi, ShxFont? big, float ansiScale, float bigScale, bool vertical = false)
     {
         // 西文字符优先主字体，中文优先大字体；主字体没有的再用另一个兜底。
         // **有记录就算"有字"，不能要求"有墨迹"** —— 空格的字形是空的，但它有前进量
@@ -250,12 +355,12 @@ public static class ShxFontLibrary
         // 落到"半个字高"的兜底上，于是每个空格窄 45%（ODA 基准：整串 "WAVE 2026" 差 4.7%）。
         if (c < 0x80)
         {
-            if (ansi?.GetGlyph(c) is { } ga) return (ansi, ga, ansiScale);
-            if (big?.GetGlyph(c) is { } gb) return (big, gb, bigScale);
+            if (ansi?.GetGlyph(c, vertical) is { } ga) return (ansi, ga, ansiScale);
+            if (big?.GetGlyph(c, vertical) is { } gb) return (big, gb, bigScale);
             return (null, null, 0f);
         }
-        if (big?.GetGlyph(c) is { } mb) return (big, mb, bigScale);
-        if (ansi?.GetGlyph(c) is { } ma) return (ansi, ma, ansiScale);
+        if (big?.GetGlyph(c, vertical) is { } mb) return (big, mb, bigScale);
+        if (ansi?.GetGlyph(c, vertical) is { } ma) return (ansi, ma, ansiScale);
         return (null, null, 0f);
     }
 

@@ -46,6 +46,18 @@ public sealed class ShxFont
 
         /// <summary>前进量（字体单位）。等于解释器执行完最后一个命令后的 x。</summary>
         public float Advance { get; init; }
+
+        /// <summary>
+        /// 收笔时的 y（字体单位）。竖排的<b>字身格</b>就是它取绝对值 ——
+        /// 字库在竖排变体末尾用一条「<c>0x0E</c> 保护的位移」把笔送回
+        /// <c>(0, -竖直前进量)</c>，横排时那条位移被整条丢掉，笔停在 <c>(adv, 0)</c>。
+        /// 要注意大字体没有 <c>0x0E</c>，这里的值是"画完后笔停在哪儿"的残留，没有意义，
+        /// 所以只有 <see cref="HasConditional"/> 为真时才可以拿来当前进量。
+        /// </summary>
+        public float AdvanceY { get; init; }
+
+        /// <summary>这套字形里执行过 <c>0x0E</c> 保护的命令（字库自己声明了竖直定位）。</summary>
+        public bool HasConditional { get; init; }
     }
 
     public enum FontKind { Shapes, Unifont, BigFont }
@@ -71,13 +83,27 @@ public sealed class ShxFont
     /// <summary>字体文件路径（诊断用）。</summary>
     public string Path { get; }
 
-    private ShxFont(string path, FontKind kind, Dictionary<int, byte[]> raw, int above, int below, string name)
+    /// <summary>
+    /// unifont 头部的 modes 字节（bigfont 没有，返回 0）。
+    ///
+    /// <para><b>bit2 = 支持竖排</b>：实测 <c>simplex</c> modes=2 而 <c>gbenor</c> modes=0。
+    /// 这不是摆设 —— 样式勾了"垂直"之后，ODA 对 <c>simplex</c> 真改成逐字向下排，
+    /// 对 <c>gbenor</c> 却仍然横排（等于把"垂直"标志忽略掉）。AutoCAD 的 SHX 竖排
+    /// 依赖字体自己提供竖排字形变体，没这个位就没法排。</para>
+    /// </summary>
+    public int Modes { get; }
+
+    /// <summary>该字体能不能竖排：大字体（中文）都行，西文字体看 modes 的 bit2。</summary>
+    public bool SupportsVertical => Kind == FontKind.BigFont || (Modes & 2) != 0;
+
+    private ShxFont(string path, FontKind kind, Dictionary<int, byte[]> raw, int above, int below, int modes, string name)
     {
         Path = path;
         Kind = kind;
         _raw = raw;
         Above = above;
         Below = below;
+        Modes = modes;
         Name = name;
         _gbk = kind == FontKind.BigFont ? TryGetGbk() : null;
     }
@@ -131,7 +157,7 @@ public sealed class ShxFont
         while (i < d.Length && d[i] is 0x0D or 0x0A or 0x1A) i++;
 
         var raw = new Dictionary<int, byte[]>(1024);
-        int above = 0, below = 0;
+        int above = 0, below = 0, modes = 0;
         string name = string.Empty;
 
         try
@@ -145,7 +171,7 @@ public sealed class ShxFont
                 name = Encoding.Latin1.GetString(d, i, z - i);
                 i = z + 1;
                 if (i + 6 > d.Length) { error = "字体参数缺失"; return null; }
-                above = d[i]; below = d[i + 1];
+                above = d[i]; below = d[i + 1]; modes = d[i + 2];
                 i += 6;                                   // above/below/modes/enc/emb/保留
                 for (int k = 0; k < count - 1 && i + 4 <= d.Length; k++)
                 {
@@ -197,7 +223,7 @@ public sealed class ShxFont
         }
 
         if (raw.Count == 0) { error = "没有解出任何字形"; return null; }
-        return new ShxFont(path, kind, raw, above, below, name);
+        return new ShxFont(path, kind, raw, above, below, modes, name);
     }
 
     /// <summary>
@@ -341,19 +367,108 @@ public sealed class ShxFont
         }
     }
 
+    private float? _verticalCellUnits;
+
+    /// <summary>
+    /// 竖排字身格的**兜底值**（字体单位）：字库里没写竖直前进量时用它。
+    ///
+    /// <para>正常情况下用不上 —— 竖排前进量是<b>逐字形</b>的。字库在竖排变体末尾用一条
+    /// <c>0x0E</c> 保护的位移把笔送回 <c>(0, -前进量)</c>，横排时这条位移被整条丢掉，
+    /// 笔停在 <c>(前进量, 0)</c>。所以 <see cref="VerticalAdvance"/> 直接取竖排变体收笔
+    /// 的 |y| 即可（simplex 实测，字高 100 时：'A' = 31 单位、'1' = 31.5、'0' = 31、
+    /// 空格 = 30、连字符 = 10 —— 各不相同。原来把它当成"字体常量 31/21 em"，
+    /// 数字串与含空格的长串会逐字累积偏差）。</para>
+    ///
+    /// <para>兜底场景：大字体（<c>gbcbig</c> 这类）整条记录里没有 <c>0x0E</c>，横竖两套
+    /// 完全一样、收笔 y = 0。此时按 <b>1 em</b> 走 —— <c>hztxt</c> 的 ODA 实测正好 1 em，
+    /// 是最常见口径；<c>gbcbig</c> 实测 1.235 em，用 1 em 会紧 19%
+    /// （已知偏差，见 AGENTS 第 14 节）。</para>
+    /// </summary>
+    public float VerticalCellUnits
+    {
+        get
+        {
+            if (_verticalCellUnits is { } v) return v;
+            float cell = Kind == FontKind.BigFont
+                ? CapUnits
+                : Math.Max(CapUnits * (31f / 21f), 1f);
+            _verticalCellUnits = cell;
+            return cell;
+        }
+    }
+
+    /// <summary>
+    /// 竖排时该字符向下走多少（字体单位）。**逐字形**：取竖排变体收笔的 |y|。
+    ///
+    /// <para>前置条件是这套竖排变体真的执行过 <c>0x0E</c> 保护的命令（<see cref="Glyph.HasConditional"/>）——
+    /// 只有那种字形才会在末尾把笔送回 <c>(0, -前进量)</c>。大字体（<c>gbcbig</c> 等）没有
+    /// <c>0x0E</c>，收笔 y 是画图残留（"中" 34、"图" 43），拿来当前进量会严重叠字，
+    /// 所以回退到 <see cref="VerticalCellUnits"/>。</para>
+    /// </summary>
+    public float VerticalAdvance(char c)
+    {
+        if (GetGlyph(c, vertical: true) is { HasConditional: true } g && MathF.Abs(g.AdvanceY) > 0.01f)
+            return MathF.Abs(g.AdvanceY);
+        return VerticalCellUnits;
+    }
+
     // ---------- 取字形 ----------
 
     /// <summary>按字符取字形（缓存）。字符不在字体里返回 null。</summary>
-    public Glyph? GetGlyph(char c)
+    public Glyph? GetGlyph(char c) => GetGlyph(c, vertical: false);
+
+    /// <summary>
+    /// 按字符取字形。<paramref name="vertical"/> = true 时执行 <c>0x0E</c> 保护的
+    /// "仅竖排生效"命令（横排时要连参数一起丢掉），因此横竖两套要分开缓存。
+    /// </summary>
+    public Glyph? GetGlyph(char c, bool vertical)
     {
         int code = ToCode(c, out _);
         if (code < 0) return null;
-        return _cache.GetOrAdd(code, k => _raw.TryGetValue(k, out var body) ? Interpret(body) : null);
+        return GetGlyphByCode(code, vertical);
     }
 
     /// <summary>按原始代码取字形（测试/诊断用）。</summary>
-    public Glyph? GetGlyphByCode(int code)
-        => _cache.GetOrAdd(code, k => _raw.TryGetValue(k, out var body) ? Interpret(body) : null);
+    public Glyph? GetGlyphByCode(int code) => GetGlyphByCode(code, vertical: false);
+
+    /// <summary>按原始代码取字形；横排/竖排各缓存一份（<c>0x0E</c> 语义不同）。</summary>
+    public Glyph? GetGlyphByCode(int code, bool vertical)
+        => _cache.GetOrAdd(vertical ? code | 0x1000000 : code,
+            k => _raw.TryGetValue(code, out var body) ? Interpret(body, vertical) : null);
+
+    private readonly ConcurrentDictionary<int, bool> _selfPositioned = new();
+
+    /// <summary>
+    /// 该字符的竖排变体是不是**字体自己做了定位**。
+    ///
+    /// <para>这是竖排排版的关键分叉：<c>simplex</c> 的 'A' 横排墨迹是 x[0,16] y[0,21]，
+    /// 竖排变体是 x[-8,8] y[-21,0] —— 字库已经把它"水平居中 + 挂到基线下方"摆好了
+    /// （0x0E 保护的那些矢量就是干这个的），我们只要原样画、然后往下移动一个字身格即可。
+    /// 反过来 <c>gbcbig</c> 这类中文大字体根本没有 0x0E 命令，竖排变体与横排一模一样，
+    /// 就得由我们自己居中 + 上移一个字高。判据就是"两个变体是否不同"。</para>
+    /// </summary>
+    public bool SelfPositionsVertical(char c)
+    {
+        int code = ToCode(c, out _);
+        if (code < 0) return false;
+        return _selfPositioned.GetOrAdd(code, k =>
+        {
+            var h = GetGlyphByCode(k, false);
+            var v = GetGlyphByCode(k, true);
+            if (h is null || v is null) return false;
+            if (ReferenceEquals(h, v)) return false;
+            if (h.Polylines.Count != v.Polylines.Count) return true;
+            for (int i = 0; i < h.Polylines.Count; i++)
+            {
+                var hp = h.Polylines[i];
+                var vp = v.Polylines[i];
+                if (hp.Length != vp.Length) return true;
+                for (int j = 0; j < hp.Length; j++)
+                    if (hp[j] != vp[j]) return true;
+            }
+            return false;
+        });
+    }
 
     /// <summary>字体里是否有这个字符。</summary>
     public bool Has(char c)
@@ -409,6 +524,12 @@ public sealed class ShxFont
         public float X, Y, Scale;
         public bool Down = true;
 
+        /// <summary>当前解释的这套字形是不是"竖排变体"（决定 0x0E 保护的命令跑不跑）。</summary>
+        public bool Vertical;
+
+        /// <summary>竖排变体里真的执行过 <c>0x0E</c> 保护的命令（= 字库自己声明了竖直定位）。</summary>
+        public bool SawConditional;
+
         public void Move()
         {
             if (Cur.Count > 1) Polys.Add(Cur.ToArray());
@@ -430,9 +551,9 @@ public sealed class ShxFont
         }
     }
 
-    private Glyph? Interpret(byte[] body)
+    private Glyph? Interpret(byte[] body, bool vertical)
     {
-        var pen = new Pen { Scale = 1f };
+        var pen = new Pen { Scale = 1f, Vertical = vertical };
         try
         {
             Run(body, pen, 0);
@@ -442,7 +563,13 @@ public sealed class ShxFont
             return null;   // 命令流截断/越界：当作缺字，不抛到渲染层
         }
         pen.Flush();
-        return new Glyph { Polylines = pen.Polys, Advance = pen.X };
+        return new Glyph
+        {
+            Polylines = pen.Polys,
+            Advance = pen.X,
+            AdvanceY = pen.Y,
+            HasConditional = pen.SawConditional,
+        };
     }
 
     /// <summary>
@@ -646,8 +773,11 @@ public sealed class ShxFont
                     }
                     break;
 
-                case 0xE:   // COND_MODE_2：水平排版时"下一条命令连参数一起丢弃"
-                    skip = true;
+                case 0xE:   // COND_MODE_2：只在这个模式下执行下一条命令
+                    // 横排：下一条命令连参数一起丢（0x0E 保护的矢量是竖排定位，横排照跑会错位）；
+                    // 竖排：正常执行 —— 这正是竖排字形变体的入口，也是"竖直前进量"的存放处。
+                    if (run) pen.SawConditional = true;
+                    skip = !pen.Vertical;
                     break;
             }
         }

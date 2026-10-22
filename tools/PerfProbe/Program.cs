@@ -69,6 +69,23 @@ int Run(string[] argv)
         return SurveyCorpus(argv[surveyIdx + 1], limit, minKb, csv);
     }
 
+    // --vertical <dir>：竖排文字普查 —— 先回答"图集里到底有没有竖排"，
+    // 再决定要不要为它改排版。竖排有三种来源，判定要分开：
+    //   ① 样式标志位 bit4（DXF STYLE 组码 70 = 4）——**这才是真竖排**；
+    //      早期把字体名的 '@' 前缀当成竖排判据是错的（那是 TrueType 的约定，
+    //      SHX 字库里 '@simplex.shx' 根本不存在，ODA 也当找不到字体处理）；
+    //   ② 文本实体自身的旋转接近 ±90°（"横排字竖着摆"，不是竖排，但读起来一样）；
+    //   ③ 两者同时成立。
+    //   另外单独统计 '@' 前缀，只为说明旧口径命中的是什么。
+    int vertIdx = Array.IndexOf(argv, "--vertical");
+    if (vertIdx >= 0 && vertIdx + 1 < argv.Length)
+    {
+        int vLimit = 0;
+        int vLimitIdx = Array.IndexOf(argv, "--limit");
+        if (vLimitIdx >= 0 && vLimitIdx + 1 < argv.Length) int.TryParse(argv[vLimitIdx + 1], out vLimit);
+        return VerticalStat(argv[vertIdx + 1], vLimit);
+    }
+
     // --repeat N：连续打开同一图纸 N 次，观察内存是否随次数线性增长（验证 SKPath 释放）
     int repeatCount = 0;
     int repeatIdx = Array.IndexOf(argv, "--repeat");
@@ -687,6 +704,162 @@ int FontStat(string dir, int limit, int minKb)
             string tag = local.Contains(kv.Key) ? "本地有" : "本地缺";
             Log($"{kv.Key,-24}{kv.Value,10:N0}{(double)kv.Value / Math.Max(1, totalText),8:P1}  {tag}");
         }
+    }
+    return 0;
+}
+
+/// <summary>
+/// 竖排文字普查。三种判别口径必须分开统计，否则会把"横排字转了 90°"当成竖排：
+/// <list type="bullet">
+/// <item>样式字体名以 <c>@</c> 开头 —— AutoCAD 的竖排字体约定（<c>@gbcbig.shx</c>）；</item>
+/// <item>文本自身旋转接近 ±90° —— 只是把整串字转了个方向，排版仍是横向；</item>
+/// <item>竖排字体 + 旋转 0 —— 真正需要"逐字向下排"的那一类。</item>
+/// </list>
+/// </summary>
+int VerticalStat(string dir, int limit)
+{
+    var files = Directory.EnumerateFiles(dir, "*.dwg", SearchOption.AllDirectories)
+        .OrderBy(f => f, StringComparer.Ordinal).ToList();
+    if (files.Count == 0) { Log($"FAIL: {dir} 下没有 dwg"); return 1; }
+
+    int total = files.Count;
+    if (limit > 0 && files.Count > limit)
+    {
+        double step = (double)files.Count / limit;
+        var sampled = new List<string>(limit);
+        for (int i = 0; i < limit; i++) sampled.Add(files[(int)(i * step)]);
+        files = sampled;
+    }
+    Log($"=== 竖排文字普查 === {dir}");
+    Log($"文件总数 {total}，本次抽样 {files.Count}");
+    Log("");
+
+    static string Prop(object? o, string name)
+        => o?.GetType().GetProperty(name)?.GetValue(o)?.ToString() ?? "";
+
+    long textTotal = 0, onVerticalStyle = 0, vertText = 0, vertMText = 0, rot90 = 0, vertAndRot = 0, atPrefix = 0;
+    int filesWithVertical = 0, failed = 0;
+    var fontPairs = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+    var atPrefixFonts = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+    var perFile = new List<(string File, long Vert, long Rot90)>();
+    var samples = new List<string>();
+    var clock = System.Diagnostics.Stopwatch.StartNew();
+    int done = 0;
+
+    foreach (var f in files)
+    {
+        done++;
+        if (done % 25 == 0 || done == files.Count)
+            Log($"  …{done}/{files.Count}  竖排图纸 {filesWithVertical}  竖排文本 {onVerticalStyle:N0}  "
+                + $"{clock.Elapsed.TotalSeconds / Math.Max(1, done):F2} s/张");
+
+        try
+        {
+            ACadSharp.CadDocument doc;
+            using (var r = new ACadSharp.IO.DwgReader(f)) doc = r.Read();
+
+            // 竖排 = 样式标志位 bit4（强类型直接读，不再靠字体名猜）
+            var styleMap = new Dictionary<string, (string Font, string Big, bool Vert)>(StringComparer.OrdinalIgnoreCase);
+            bool fileHasVerticalStyle = false;
+            foreach (var st in doc.TextStyles)
+            {
+                bool vert = (st.Flags & ACadSharp.Tables.StyleFlags.VerticalText) != 0;
+                string fn = st.Filename ?? "";
+                string bg = st.BigFontFilename ?? "";
+                styleMap[st.Name] = (fn, bg, vert);
+                if (vert) fileHasVerticalStyle = true;
+                if (fn.StartsWith('@') || bg.StartsWith('@'))
+                {
+                    string key = fn.StartsWith('@') ? fn : bg;
+                    atPrefixFonts[key] = atPrefixFonts.GetValueOrDefault(key) + 1;
+                }
+            }
+            if (fileHasVerticalStyle) filesWithVertical++;
+
+            long fVert = 0, fRot = 0;
+            foreach (var e in doc.Entities.Concat(doc.BlockRecords.SelectMany(b => b.Entities)))
+            {
+                string tn = e.GetType().Name;
+                if (tn != "TextEntity" && tn != "MText" && tn != "AttributeEntity" && tn != "AttributeDefinition")
+                    continue;
+                string txt = Prop(e, "Value");
+                if (txt.Length == 0) continue;
+                textTotal++;
+
+                string sn = Prop(e.GetType().GetProperty("Style")?.GetValue(e), "Name");
+                bool hasStyle = sn.Length > 0 && styleMap.TryGetValue(sn, out _);
+                (string Font, string Big, bool Vert) stv = hasStyle ? styleMap[sn] : (Font: "", Big: "", Vert: false);
+                bool vert = hasStyle && stv.Vert;
+
+                // 归一化到 [0, 180)：横排 0、竖着摆 90
+                double deg = 0;
+                if (e.GetType().GetProperty("Rotation")?.GetValue(e) is double rv)
+                {
+                    deg = rv * 180.0 / Math.PI % 180.0;
+                    if (deg < 0) deg += 180;
+                }
+                bool isRot90 = Math.Abs(deg - 90) < 5;
+
+                if (vert)
+                {
+                    onVerticalStyle++; fVert++;
+                    if (tn == "MText") vertMText++; else vertText++;
+                    string key = $"{(stv.Font.Length > 0 ? stv.Font : "(无)")} + "
+                               + $"{(stv.Big.Length > 0 ? stv.Big : "(无)")}  样式 {sn}";
+                    fontPairs[key] = fontPairs.GetValueOrDefault(key) + 1;
+                }
+                if (hasStyle && (stv.Font.StartsWith('@') || stv.Big.StartsWith('@'))) atPrefix++;
+                if (isRot90) { rot90++; fRot++; }
+                if (vert && isRot90) vertAndRot++;
+
+                if ((vert || isRot90) && samples.Count < 15)
+                    samples.Add($"{Path.GetFileName(f),-28} {(vert ? "样式竖排" : "旋转90° ")}  rot={deg,5:F1}°  "
+                                + $"{sn,-14} {txt.Replace("\n", "⏎"),-24}");
+            }
+            if (fVert > 0 || fRot > 0) perFile.Add((Path.GetFileName(f), fVert, fRot));
+        }
+        catch (Exception ex)
+        {
+            failed++;
+            Log($"{Path.GetFileName(f),-40} 解析失败：{ex.GetType().Name}");
+        }
+    }
+
+    Log("");
+    Log($"文本实体合计 {textTotal:N0}（解析失败 {failed} 个文件）");
+    Log($"  ① 样式标志位竖排（bit4）：  {onVerticalStyle:N0}"
+        + $"（{(double)onVerticalStyle / Math.Max(1, textTotal):P2}）  其中 TEXT {vertText:N0} / MTEXT {vertMText:N0}");
+    Log($"  ② 实体自身旋转 ±90°：      {rot90:N0}（{(double)rot90 / Math.Max(1, textTotal):P2}）");
+    Log($"  ③ 两者同时成立：            {vertAndRot:N0}");
+    Log($"  对照：'@' 前缀样式上的文本 {atPrefix:N0}（旧口径，已证伪）");
+    Log($"  含竖排样式的图纸：          {filesWithVertical}/{files.Count}");
+    Log("");
+
+    if (fontPairs.Count > 0)
+    {
+        Log("--- 竖排文本按字体对（主字体 + 大字体）---");
+        foreach (var kv in fontPairs.OrderByDescending(k => k.Value).Take(20))
+            Log($"{kv.Key,-56}{kv.Value,7:N0} 条");
+        Log("");
+    }
+    if (atPrefixFonts.Count > 0)
+    {
+        Log("--- '@' 前缀字体（旧口径，按样式数）---");
+        foreach (var kv in atPrefixFonts.OrderByDescending(k => k.Value).Take(10))
+            Log($"{kv.Key,-24}{kv.Value,6} 个样式");
+        Log("");
+    }
+    if (perFile.Count > 0)
+    {
+        Log("--- 命中文件 ---");
+        foreach (var t in perFile.OrderByDescending(t => t.Vert + t.Rot90).Take(15))
+            Log($"{t.File,-40} 竖排 {t.Vert,6:N0}   转90° {t.Rot90,6:N0}");
+        Log("");
+    }
+    if (samples.Count > 0)
+    {
+        Log("--- 样例 ---");
+        foreach (string s in samples) Log(s);
     }
     return 0;
 }

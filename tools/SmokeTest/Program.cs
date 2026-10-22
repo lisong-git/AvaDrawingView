@@ -1701,6 +1701,8 @@ void RunShxChecks()
         File.WriteAllBytes(bigPath, BuildTestBigFont());
         File.WriteAllBytes(widePath, BuildTestBigFontWide());
         File.WriteAllText(dxfPath, ShxProbeDxf(), new System.Text.UTF8Encoding(false));
+        // 让按文件名解析（Resolve("TESTFLAT.SHX")）也能命中这批合成字库
+        ShxFontLibrary.SetDrawingDirectory(dir);
 
         // ---- 1. unifont：字头 / 名字前缀 / 字形 / 前进量 / 字高换算 ----
         var ansi = ShxFont.TryLoad(ansiPath, out string? ansiErr);
@@ -1776,7 +1778,111 @@ void RunShxChecks()
                   $"3 个汉字的行宽 180（实际 {(measured ? w3.ToString("F2") : "量不出")}）");
         }
 
-        // ---- 3. TTF 名字不该当成"缺 SHX 字库" ----
+        // ---- 3. 竖排：字体能力位 / 自定位变体 / 字身格 / 排版方向 ----
+        if (ansi is not null)
+        {
+            Check(ansi.Modes == 2, $"unifont 的 modes 读出来了（实际 {ansi.Modes}）");
+            Check(ansi.SupportsVertical, "modes bit2 → 支持竖排");
+
+            // 0x0E 保护的位移：横排丢掉、竖排执行（这是"字库自己给竖排定位"的机制）
+            var vh = ansi.GetGlyph('V');
+            var vv = ansi.GetGlyph('V', true);
+            Check(vh is not null && vv is not null, "V 的横/竖两套字形都在");
+            if (vh is not null && vv is not null)
+            {
+                Check(MathF.Abs(vh.Polylines[0][0].X) < 0.01f && MathF.Abs(vh.Polylines[0][0].Y) < 0.01f,
+                      $"横排 V 从 (0,0) 起笔（实际 {vh.Polylines[0][0]}）");
+                Check(MathF.Abs(vv.Polylines[0][0].X + 5f) < 0.01f && MathF.Abs(vv.Polylines[0][0].Y + 20f) < 0.01f,
+                      $"竖排 V 先跳到 (-5,-20)（实际 {vv.Polylines[0][0]}）");
+                Check(ansi.SelfPositionsVertical('V'), "V 的竖排变体与横排不同 → 字体自定位");
+                Check(!ansi.SelfPositionsVertical('L'), "L 没有竖排变体 → 需要我们自己居中/上移");
+            }
+
+            // 竖排前进量是**逐字形**的：字库在竖排变体末尾用 0x0E 保护的位移把笔送回
+            // (0, -前进量)，所以收笔的 |y| 就是格子。V 的尾巴是 (0,-24) → 24 单位。
+            // 没有 0x0E 的字形（H）收笔 y=0 → 回退到 above×31/21。
+            Check(MathF.Abs(ansi.VerticalAdvance('V') - 24f) < 0.01f,
+                  $"V 的竖排前进量 = 收笔 |y| = 24（实际 {ansi.VerticalAdvance('V'):F2}）");
+            Check(MathF.Abs(ansi.VerticalAdvance(' ') - 18f) < 0.01f,
+                  $"空格的竖排前进量 = 18，与正文字形不同（实际 {ansi.VerticalAdvance(' '):F2}）");
+            Check(MathF.Abs(ansi.VerticalCellUnits - 30f * 31f / 21f) < 0.01f,
+                  $"字库没写竖排前进量时的兜底 = above×31/21（实际 {ansi.VerticalCellUnits:F2}）");
+            Check(MathF.Abs(ansi.VerticalAdvance('H') - ansi.VerticalCellUnits) < 0.01f,
+                  $"没有 0x0E 的字形（H）回退到兜底格子（实际 {ansi.VerticalAdvance('H'):F2}）");
+
+            // 量长度：竖排返回"向下排的总长"，每个字按自己的格子走
+            // V=24、空格=18、V=24 → 66 单位 → 66×(100/30) = 220
+            bool vm = ShxFontLibrary.TryMeasure("V V", ansiPath, null, 100f, out float vLen, vertical: true);
+            Check(vm && MathF.Abs(vLen - 220f) < 0.5f,
+                  $"竖排 \"V V\" 总长 220 = (24+18+24)×100/30（实际 {(vm ? vLen.ToString("F2") : "量不出")}）");
+
+            // 排出来的几何：字库自定位的字形原样画、然后往下走一格
+            if (ShxFontLibrary.TryShape("V", ansiPath, null, 100f, 1f, TextLineAlign.Left, out var vShape, vertical: true))
+            {
+                var vb = vShape.Path.Bounds;
+                Log($"  竖排 V 包络 x[{vb.Left:F2},{vb.Right:F2}] y[{vb.Top:F2},{vb.Bottom:F2}]");
+                Check(MathF.Abs(vb.Left + 16.67f) < 0.5f && MathF.Abs(vb.Right - 16.67f) < 0.5f,
+                      $"竖排 V 以列中心对称（实际 x[{vb.Left:F2},{vb.Right:F2}]）");
+                Check(MathF.Abs(vb.Bottom) < 0.5f && MathF.Abs(vb.Top + 66.67f) < 0.5f,
+                      $"竖排 V 挂在插入点下方（实际 y[{vb.Top:F2},{vb.Bottom:F2}]）");
+                vShape.Path.Dispose();
+            }
+            else Check(false, "竖排 V 能排出几何");
+        }
+
+        // 大字体没有 0x0E 命令 → 竖排要靠我们自己居中 + 上移一个字高，字身格 = 1 em
+        if (big is not null)
+        {
+            Check(!big.SelfPositionsVertical('田'), "bigfont 的田没有竖排变体（竖排=横排）");
+            Check(MathF.Abs(big.VerticalCellUnits - big.CapUnits) < 0.01f,
+                  $"bigfont 竖排字身格 = 1 em = {big.CapUnits:F2}（实际 {big.VerticalCellUnits:F2}）");
+            // 大字体没有 0x0E，收笔 y 只是"画完后笔停在哪儿"的残留（gbcbig 实测 34/43），
+            // 不能当前进量用 —— 必须回退到字体常量。
+            Check(MathF.Abs(big.VerticalAdvance('田') - big.VerticalCellUnits) < 0.01f,
+                  $"bigfont 的竖排前进量回退到 1 em（实际 {big.VerticalAdvance('田'):F2}）");
+
+            bool bm = ShxFontLibrary.TryMeasure("田田", bigPath, null, 100f, out float bLen, vertical: true);
+            Check(bm && MathF.Abs(bLen - 200f) < 0.5f,
+                  $"2 个汉字竖排总长 200（实际 {(bm ? bLen.ToString("F2") : "量不出")}）");
+            if (ShxFontLibrary.TryShape("田田", bigPath, null, 100f, 1f, TextLineAlign.Left, out var bShape, vertical: true))
+            {
+                var bb = bShape.Path.Bounds;
+                Log($"  竖排 田田 包络 x[{bb.Left:F2},{bb.Right:F2}] y[{bb.Top:F2},{bb.Bottom:F2}]");
+                // 田 墨迹 x[0,40]（两笔是相对的：(0,0)→(20,0)，再 (20,40)→(40,40)）→ 缩放 2.5
+                // → 居中后 x[-50,50]；y 从插入点往下排两个字高
+                Check(MathF.Abs(bb.Left + 50f) < 0.5f && MathF.Abs(bb.Right - 50f) < 0.5f,
+                      $"竖排 田田 水平居中（实际 x[{bb.Left:F2},{bb.Right:F2}]）");
+                Check(MathF.Abs(bb.Top + 200f) < 0.5f && MathF.Abs(bb.Bottom) < 0.5f,
+                      $"竖排 田田 向下两个格子、顶边贴插入点（实际 y[{bb.Top:F2},{bb.Bottom:F2}]）");
+                bShape.Path.Dispose();
+            }
+            else Check(false, "竖排 田田 能排出几何");
+        }
+
+        // modes=0 的字体（gbenor 那类）不支持竖排 → 调用方必须降级成横排
+        string flatPath = Path.Combine(dir, "TESTFLAT.SHX");
+        File.WriteAllBytes(flatPath, BuildTestFlatFont());
+        var flat = ShxFont.TryLoad(flatPath, out _);
+        Check(flat is not null && !flat.SupportsVertical, "modes=0 的字体不支持竖排");
+        Check(!ShxFontLibrary.SupportsVertical("TESTFLAT.SHX", null), "SupportsVertical 对 modes=0 返回 false");
+
+        // ---- 3.3 管线：样式 70=4 的走竖排，70=0 的照旧横排 ----
+        string vdxf = Path.Combine(dir, "shx_vertical.dxf");
+        File.WriteAllText(vdxf, ShxVerticalDxf(), new System.Text.UTF8Encoding(false));
+        var vlist = CadDocumentLoader.Load(vdxf, new Progress<string>(_ => { }));
+        var strokes2 = vlist.Entities.Where(e => e.TextStrokes).ToList();
+        Check(strokes2.Count == 2, $"两条都按字库描线（实际 {strokes2.Count}）");
+        if (strokes2.Count == 2)
+        {
+            var horiz = strokes2.OrderBy(e => e.Bounds.Bottom).First();
+            var vert = strokes2.OrderByDescending(e => e.Bounds.Bottom).First();
+            Log($"  横排 Bounds {horiz.Bounds.Width:F1}×{horiz.Bounds.Height:F1}，" +
+                $"竖排 Bounds {vert.Bounds.Width:F1}×{vert.Bounds.Height:F1}");
+            Check(horiz.Bounds.Width > horiz.Bounds.Height * 1.5f, "横排那条是横长的");
+            Check(vert.Bounds.Height > vert.Bounds.Width * 3f, "竖排那条是竖长的（两字一列）");
+        }
+
+        // ---- 3.5 TTF 名字不该当成"缺 SHX 字库" ----
         Check(!ShxFontLibrary.IsShxName("ARIAL.TTF"), "ARIAL.TTF 不算 SHX 字体名");
         Check(!ShxFontLibrary.IsShxName("simhei.ttf"), "simhei.ttf 不算 SHX 字体名");
         Check(ShxFontLibrary.IsShxName("simplex.shx"), "simplex.shx 是 SHX 字体名");
@@ -1821,12 +1927,11 @@ static byte[] BuildTestAnsiFont()
 
     Raw(System.Text.Encoding.ASCII.GetBytes("AutoCAD-86 unifont 1"));   // 头部以 0x0D 结尾，不能用 index(0)
     Raw(0x0D, 0x0A, 0x1A);
-    U32(5);                       // count = 记录数 + 1
+    U32(6);                       // count = 记录数 + 1
     U16(0);                       // 索引区字节数（解析不用）
     Raw(System.Text.Encoding.ASCII.GetBytes("TESTANSI"));
     Raw(0x00);
-    Raw(30, 5, 0, 0, 0, 0);       // above=30（故意与真实字高 20 不同）/ below / modes / enc / emb / pad
-
+    Raw(30, 5, 2, 0, 0, 0);       // above=30 / below=5 / modes=2（bit2 = 支持竖排）/ enc / emb / pad
     // 每条记录：内码 u16（低字节在前）| 数据字节数 u16 | 数据（前面带 ASCII 名字 + 0x00）
     byte[] h = { (byte)'H', 0x00, 0x02, 0x08, 0x00, 0x00, 0x01, 0x08, 0x00, 0x14, 0x00 };
     U16('H'); U16(h.Length); Raw(h);
@@ -1841,8 +1946,47 @@ static byte[] BuildTestAnsiFont()
 
     // 空格：有记录、有前进量（12）、但**没有墨迹**。不能因为"画不出线"就当成缺字 ——
     // 真实字库里空格就是这样，误判会让每个空格窄到半个字高（ODA 基准差 4.7%）。
-    byte[] sp = { (byte)' ', 0x00, 0x02, 0x08, 0x0C, 0x00, 0x00 };
+    // 竖排尾部那条 0x0E 位移把笔送到 (0,-18)：**空格的竖排格子和正文字形不同**
+    // （simplex 实测 30 单位 vs 'A' 的 31），这正是"逐字形前进量"的回归点。
+    byte[] sp = { (byte)' ', 0x00, 0x02, 0x08, 0x0C, 0x00, 0x02, 0x0E, 0x08, 0xF4, 0xEE, 0x00 };
     U16(' '); U16(sp.Length); Raw(sp);
+
+    // V 钉竖排自定位 + 竖排前进量：0x0E 保护的那条位移在横排要丢掉、竖排要执行。
+    // 横排：笔从 (0,0) 起，画 (0,0)→(10,0)→(10,20)；
+    // 竖排：先跳到 (-5,-20)，再画 → 墨迹 x[-5,5] y[-20,0]，正好"水平居中 + 挂在基线下"
+    //      —— 真实的 simplex 就是这么摆 'A' 的（横排 x[0,16] y[0,21] → 竖排 x[-8,8] y[-21,0]）。
+    // 末尾再加一条 0x0E 位移，把笔从 (10,20) 送回 (0,-24)：**竖排前进量 = 收笔的 |y|**
+    // —— 真实的 simplex/'A' 末尾就是 `0E 08 F2 F6`（dx=-14, dy=-10，从 (14,-21) 回到 (0,-31)）。
+    byte[] v =
+    {
+        (byte)'V', 0x00, 0x02, 0x0E, 0x08, 0xFB, 0xEC, 0x01, 0x08, 0x0A, 0x00, 0x08, 0x00, 0x14,
+        0x02, 0x0E, 0x08, 0xFB, 0xE8, 0x00,
+    };
+    U16('V'); U16(v.Length); Raw(v);
+    return ms.ToArray();
+}
+
+/// <summary>
+/// 合成一个"不支持竖排"的 unifont：头部 modes=0（gbenor/gbeitc 就是这样）。
+/// 样式勾了"垂直"也不该硬排竖排 —— ODA 对这类字体就是按横排画的。
+/// </summary>
+static byte[] BuildTestFlatFont()
+{
+    var ms = new MemoryStream();
+    void Raw(params byte[] b) => ms.Write(b, 0, b.Length);
+    void U16(int v) { ms.WriteByte((byte)(v & 0xFF)); ms.WriteByte((byte)((v >> 8) & 0xFF)); }
+    void U32(int v) { for (int k = 0; k < 4; k++) ms.WriteByte((byte)((v >> (8 * k)) & 0xFF)); }
+
+    Raw(System.Text.Encoding.ASCII.GetBytes("AutoCAD-86 unifont 1"));
+    Raw(0x0D, 0x0A, 0x1A);
+    U32(2);                       // count = 1 条记录 + 1
+    U16(0);
+    Raw(System.Text.Encoding.ASCII.GetBytes("TESTFLAT"));
+    Raw(0x00);
+    Raw(30, 5, 0, 0, 0, 0);       // modes = 0：不支持竖排
+
+    byte[] h = { (byte)'H', 0x00, 0x02, 0x08, 0x00, 0x00, 0x01, 0x08, 0x00, 0x14, 0x00 };
+    U16('H'); U16(h.Length); Raw(h);
     return ms.ToArray();
 }
 
@@ -1950,6 +2094,32 @@ static string ShxProbeDxf()
          + "0\nSECTION\n2\nENTITIES\n"
          + Text("SHXOK", 0.0)
          + Text("SHXMISS", 300.0)
+         + "0\nENDSEC\n0\nEOF\n";
+}
+
+/// <summary>
+/// 竖排样图：同一份字库（TESTANSI，modes=2）挂两个样式 —— 横排 70=0 与竖排 70=4。
+/// 竖排是**样式级**标志（DXF STYLE 组码 70 的 bit4），不是字体名的 '@' 前缀。
+/// </summary>
+static string ShxVerticalDxf()
+{
+    string Style(string name, string font, int flags) =>
+        $"0\nSTYLE\n2\n{name}\n70\n{flags}\n40\n0.0\n41\n1.0\n50\n0.0\n71\n0\n42\n2.5\n3\n{font}\n4\n\n";
+    string Text(string style, double y, string content) =>
+        $"0\nTEXT\n8\n0\n10\n0.0\n20\n{y}\n30\n0.0\n40\n100.0\n1\n{content}\n50\n0.0\n41\n1.0\n51\n0.0\n7\n{style}\n";
+
+    return "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1009\n"
+         + "9\n$EXTMIN\n10\n0.0\n20\n0.0\n30\n0.0\n"
+         + "9\n$EXTMAX\n10\n1000.0\n20\n1000.0\n30\n0.0\n0\nENDSEC\n"
+         + "0\nSECTION\n2\nTABLES\n"
+         + "0\nTABLE\n2\nLAYER\n70\n1\n0\nLAYER\n2\n0\n70\n0\n62\n7\n6\nCONTINUOUS\n0\nENDTAB\n"
+         + "0\nTABLE\n2\nSTYLE\n70\n2\n"
+         + Style("H", "TESTANSI.SHX", 0)
+         + Style("V", "TESTANSI.SHX", 4)      // bit4 = VerticalText
+         + "0\nENDTAB\n0\nENDSEC\n"
+         + "0\nSECTION\n2\nENTITIES\n"
+         + Text("H", 0.0, "VVVV")
+         + Text("V", 300.0, "VVVV")
          + "0\nENDSEC\n0\nEOF\n";
 }
 

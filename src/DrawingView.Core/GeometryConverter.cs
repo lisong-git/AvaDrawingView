@@ -90,8 +90,11 @@ public sealed class GeometryConverter
     /// <summary>样式引用 .shx、但本机找不到字库文件而回退 TTF 的文本实体数。</summary>
     public int ShxTextMissingFont { get; private set; }
 
-    /// <summary>样式名 → (字体文件, 大字体文件)。SHX 排版要用它把文字映射到字库。</summary>
-    private readonly Dictionary<string, (string Font, string Big)> _styleFonts = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>按竖排排版的文本实体数（诊断：图集里到底有没有竖排）。</summary>
+    public int ShxVerticalTextEntities { get; private set; }
+
+    /// <summary>样式名 → (字体文件, 大字体文件, 是否竖排)。SHX 排版要用它把文字映射到字库。</summary>
+    private readonly Dictionary<string, (string Font, string Big, bool Vertical)> _styleFonts = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>文件头的 PDMODE（诊断用：0 点 / 1 不画 / 2 十字 / 3 叉 / 4 竖线，+32 圆 +64 方）。</summary>
     public int PointDisplayMode => _pointDisplayMode;
     /// <summary>文件头的 PDSIZE（诊断用：&gt;0 世界单位 / &lt;0 视高百分比 / =0 默认 5%）。</summary>
@@ -213,6 +216,7 @@ public sealed class GeometryConverter
         RegionUnresolved = 0;
         ShxTextEntities = 0;
         ShxTextMissingFont = 0;
+        ShxVerticalTextEntities = 0;
         _pointDisplayMode = 0;
         _pointDisplaySize = 0f;
 
@@ -1454,16 +1458,19 @@ public sealed class GeometryConverter
         // ---- SHX 单线字体优先 ----
         // 样式指向可用的 .shx 时必须走它：TTF 回退的字宽与字形都对不上（受控基准实测
         // 数字窄 17.5%、W 宽 20%），而 SHX 本身就是折线，描出来就是 AutoCAD 的形状。
-        var (styleFont, styleBig) = StyleFontsOf(e);
+        var (styleFont, styleBig, styleVertical) = StyleFontsOf(e);
         // 样式写 TTF（ARIAL.TTF / simhei.ttf）的不算 SHX，也不该记"缺字库"
         bool wantsShx = ShxFontLibrary.IsShxName(styleFont) || ShxFontLibrary.IsShxName(styleBig);
+        // 竖排：样式勾了"垂直"才排竖排，且要求字体支持（西文看 modes bit2，大字体都支持）。
+        // 不支持就按横排画 —— ODA 对 gbenor 这类没有竖排变体的字体也是这么处理的。
+        bool vertical = styleVertical && wantsShx && ShxFontLibrary.SupportsVertical(styleFont, styleBig);
         float shxWidth = 0f;
         bool shxMeasured = wantsShx &&
-            ShxFontLibrary.TryMeasure(text, styleFont, styleBig, capE, out shxWidth);
+            ShxFontLibrary.TryMeasure(text, styleFont, styleBig, capE, out shxWidth, vertical);
         if (wantsShx && !shxMeasured) ShxTextMissingFont++;
 
         float measured = (shxMeasured ? shxWidth : TextMetrics.MeasureWidth(text, capE)) * wf;
-        if (alignWidth > 0 && measured > 1e-6f)
+        if (alignWidth > 0 && measured > 1e-6f && !vertical)
         {
             float ratio = alignWidth / measured;
             if (h == ACadSharp.Entities.TextHorizontalAlignment.Aligned)
@@ -1485,28 +1492,54 @@ public sealed class GeometryConverter
         // ---- 9 宫格局部偏移（世界坐标，y 向上；文本从基线左端向右上延伸）----
         // 逐行对齐时水平量由渲染端按行分配（MTEXT），这里不再偏移，
         // 否则"块居中"与"行居中"会叠加成二次偏移。
-        float offX = alignPerLine ? 0f : h switch
+        //
+        // 竖排要换一套口径：整串从锚点**向下**排，"长度" measured 落在 y 上、列宽就是字高。
+        float offX, offY;
+        if (vertical)
         {
-            ACadSharp.Entities.TextHorizontalAlignment.Center => -measured * 0.5f,
-            ACadSharp.Entities.TextHorizontalAlignment.Middle => -measured * 0.5f,
-            ACadSharp.Entities.TextHorizontalAlignment.Right => -measured,
-            _ => 0f,
-        };
+            // 列宽按字高估（各字形墨迹宽窄不同，但整列宽度就是一个字身）；
+            // 横向对齐移动整列，纵向对齐移动"整串的起笔位置"。
+            float colW = capE;
+            offX = alignPerLine ? 0f : h switch
+            {
+                ACadSharp.Entities.TextHorizontalAlignment.Center => -colW * 0.5f,
+                ACadSharp.Entities.TextHorizontalAlignment.Middle => -colW * 0.5f,
+                ACadSharp.Entities.TextHorizontalAlignment.Right => -colW,
+                _ => 0f,
+            };
+            offY = v switch
+            {
+                TextVerticalAlignmentType.Top => 0f,        // 顶部 = 起笔就在锚点，往下排
+                TextVerticalAlignmentType.Middle => -measured * 0.5f,
+                TextVerticalAlignmentType.Bottom => -measured,
+                _ => 0f,                                     // 基线 = 同上（竖排没有传统基线）
+            };
+        }
+        else
+        {
+            offX = alignPerLine ? 0f : h switch
+            {
+                ACadSharp.Entities.TextHorizontalAlignment.Center => -measured * 0.5f,
+                ACadSharp.Entities.TextHorizontalAlignment.Middle => -measured * 0.5f,
+                ACadSharp.Entities.TextHorizontalAlignment.Right => -measured,
+                _ => 0f,
+            };
 
-        // 多行文本的垂直对齐按**整块**算（AutoCAD MTEXT 的 Middle/Bottom 指整个文字块）：
-        //   块高 = 字高 + (n-1)×行距 + 降部
-        //   Top    → 首行基线 = 锚点 − 字高（首行 cap 顶端贴锚点）
-        //   Middle → 首行基线 = 锚点 − 字高 + 块高/2
-        //   Bottom → 首行基线 = 锚点 + (n-1)×行距 + 降部
-        float lineH = capE * lineSpacingFactor;
-        float blockH = capE + (lineCount - 1) * lineH + desc;
-        float offY = v switch
-        {
-            TextVerticalAlignmentType.Top => -capE,                 // 顶部对齐 → 基线在锚点下方一个字高
-            TextVerticalAlignmentType.Middle => -capE + blockH * 0.5f,
-            TextVerticalAlignmentType.Bottom => (lineCount - 1) * lineH + desc,
-            _ => 0f,                                                // 基线对齐
-        };
+            // 多行文本的垂直对齐按**整块**算（AutoCAD MTEXT 的 Middle/Bottom 指整个文字块）：
+            //   块高 = 字高 + (n-1)×行距 + 降部
+            //   Top    → 首行基线 = 锚点 − 字高（首行 cap 顶端贴锚点）
+            //   Middle → 首行基线 = 锚点 − 字高 + 块高/2
+            //   Bottom → 首行基线 = 锚点 + (n-1)×行距 + 降部
+            float lineH = capE * lineSpacingFactor;
+            float blockH = capE + (lineCount - 1) * lineH + desc;
+            offY = v switch
+            {
+                TextVerticalAlignmentType.Top => -capE,             // 顶部对齐 → 基线在锚点下方一个字高
+                TextVerticalAlignmentType.Middle => -capE + blockH * 0.5f,
+                TextVerticalAlignmentType.Bottom => (lineCount - 1) * lineH + desc,
+                _ => 0f,                                            // 基线对齐
+            };
+        }
 
         var anchor = needsAlignPoint ? alignPt : basePt;
         float rotEntity = (float)rotation + extraRot;
@@ -1530,7 +1563,7 @@ public sealed class GeometryConverter
         // （对应 DrawText 里 canvas.Scale(wf) / Skew / Rotate / Translate 的次序）。
         if (shxMeasured &&
             ShxFontLibrary.TryShape(text, styleFont, styleBig, worldCap,
-                                    lineSpacingFactor, lineAlign, out var shaped))
+                                    lineSpacingFactor, lineAlign, out var shaped, vertical))
         {
             var sp = shaped.Path;
             sp.Transform(SKMatrix.CreateScale(wf, 1f));
@@ -1553,6 +1586,7 @@ public sealed class GeometryConverter
                 Bounds = shxBounds,
             });
             ShxTextEntities++;
+            if (vertical) ShxVerticalTextEntities++;
             return;
         }
 
@@ -1649,7 +1683,7 @@ public sealed class GeometryConverter
     private const int DefaultLineWeightMm100 = 25;
 
     /// <summary>
-    /// 缓存文字样式 → 字库文件名。
+    /// 缓存文字样式 → 字库文件名（+ 竖排标志）。
     ///
     /// <para>**必须走 doc.TextStyles 而不是实体的 Style 属性**：DWG 里的实体只带样式名，
     /// ACadSharp 交出来的 Style 往往是只填了 Name 的占位对象，直接读它的 Filename 永远拿到空。</para>
@@ -1663,7 +1697,10 @@ public sealed class GeometryConverter
             {
                 string name = st.Name ?? string.Empty;
                 if (name.Length == 0) continue;
-                _styleFonts[name] = (st.Filename ?? string.Empty, st.BigFontFilename ?? string.Empty);
+                // 竖排是**样式级**开关（DXF STYLE 组码 70 的 bit4），不是字体名的 '@' 前缀 ——
+                // '@' 那套是 TrueType 字体的约定，SHX 靠这个标志位 + 字体自带的 modes bit2。
+                bool vertical = (st.Flags & StyleFlags.VerticalText) != 0;
+                _styleFonts[name] = (st.Filename ?? string.Empty, st.BigFontFilename ?? string.Empty, vertical);
             }
         }
         catch
@@ -1672,8 +1709,8 @@ public sealed class GeometryConverter
         }
     }
 
-    /// <summary>取实体所用样式的 (字体, 大字体) 文件名；取不到返回空串。</summary>
-    private (string Font, string Big) StyleFontsOf(Entity e)
+    /// <summary>取实体所用样式的 (字体, 大字体, 竖排) ；取不到返回空串 + 非竖排。</summary>
+    private (string Font, string Big, bool Vertical) StyleFontsOf(Entity e)
     {
         string styleName = e switch
         {
@@ -1682,7 +1719,9 @@ public sealed class GeometryConverter
             MText m => m.Style?.Name,
             _ => null,
         } ?? string.Empty;
-        return styleName.Length > 0 && _styleFonts.TryGetValue(styleName, out var f) ? f : (string.Empty, string.Empty);
+        return styleName.Length > 0 && _styleFonts.TryGetValue(styleName, out var f)
+            ? f
+            : (string.Empty, string.Empty, false);
     }
 
     /// <summary>

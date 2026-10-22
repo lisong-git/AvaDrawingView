@@ -56,6 +56,8 @@ public static class CadDocumentLoader
                                 ? $"，{converter.RegionUnresolved} 个无法解析（ACIS 载荷异常）" : ""));
         if (converter.ShxTextEntities + converter.ShxTextMissingFont > 0)
             progress?.Report($"SHX 文字：{converter.ShxTextEntities} 个实体按字库描线"
+                             + (converter.ShxVerticalTextEntities > 0
+                                ? $"（其中竖排 {converter.ShxVerticalTextEntities} 条）" : "")
                              + (converter.ShxTextMissingFont > 0
                                 ? $"，{converter.ShxTextMissingFont} 条文字缺字库（回退 TTF）" : ""));
         if (converter.NonPlottingLayers > 0)
