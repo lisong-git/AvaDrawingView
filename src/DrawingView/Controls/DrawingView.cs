@@ -100,8 +100,13 @@ public class DrawingView : Control
     /// 批次回放成本 ≈ 多少个逐实体绘制（实测标定）。
     /// 两条路都要遍历同样的几何，差异在调用次数与 SKPaint 状态抖动，
     /// 因此当"可见实体数 &gt; 批次数 × 该比值"时才切到批次路径。
+    ///
+    /// <para>2026-10-22 重标定：原值 200 是"批次里塞的是简单细线"时代的数。P1/P2 补齐保真后
+    /// （宽多段线改成轮廓填充、按线宽拆批），批次路径每帧只需 3–5ms 就能画完 8.5 万实体，
+    /// 而逐实体路径要 0.45–0.6µs/个 —— 幕墙图 2x 时估算可见 2.1 万 → 仍走逐实体 → 33ms/21FPS。
+    /// 按实测把比值降到 20：2x 起就切批次（2.1 万 &gt; 344×20），4x 以下仍走逐实体。</para>
     /// </summary>
-    private const int BucketVsEntityCostRatio = 200;
+    private const int BucketVsEntityCostRatio = 20;
 
     private DisplayList? _display;
 
@@ -589,6 +594,59 @@ public class DrawingView : Control
         Interlocked.Exchange(ref _lastDrawTicks, 0);
         Interlocked.Exchange(ref _drawTicksTotal, 0);
         Interlocked.Exchange(ref _drawCount, 0);
+        ResetPassStats();
+    }
+
+    // ---- 分段耗时诊断（DrawingView_RENDER_SPLIT=1 时累计）----
+    // 只回答一个问题：24ms 里批次、文本、点标记各占多少。默认为关，关掉时零开销。
+
+    /// <summary>分段诊断开关：环境变量 <c>DrawingView_RENDER_SPLIT=1</c>。</summary>
+    public static bool RenderSplitEnabled { get; } =
+        Environment.GetEnvironmentVariable("DrawingView_RENDER_SPLIT") == "1";
+
+    /// <summary>批次路径累计耗时（Stopwatch ticks）。</summary>
+    public static long TicksBucketPass;
+    /// <summary>文本 pass 累计耗时。</summary>
+    public static long TicksTextPass;
+    /// <summary>点标记 pass 累计耗时。</summary>
+    public static long TicksPointPass;
+    /// <summary>批次描边累计耗时（诊断用）。</summary>
+    public static long TicksBucketStroke;
+    /// <summary>批次填充累计耗时（诊断用）。</summary>
+    public static long TicksBucketFill;
+    /// <summary>实际画出的点标记数（上一次绘制）。</summary>
+    public static long MarksDrawn;
+    /// <summary>因图层隐藏而跳过的点标记数（上一次绘制）。</summary>
+    public static long MarksHiddenLayer;
+    /// <summary>选中高亮 + 叠加层累计耗时。</summary>
+    public static long TicksSelectPass;
+
+    /// <summary>清空分段耗时。</summary>
+    public static void ResetPassStats()
+    {
+        Interlocked.Exchange(ref TicksBucketPass, 0);
+        Interlocked.Exchange(ref TicksTextPass, 0);
+        Interlocked.Exchange(ref TicksPointPass, 0);
+        Interlocked.Exchange(ref TicksSelectPass, 0);
+        Interlocked.Exchange(ref TicksBucketStroke, 0);
+        Interlocked.Exchange(ref TicksBucketFill, 0);
+    }
+
+    /// <summary>批次内部再拆一层：描边 / 填充 的每帧毫秒。</summary>
+    public static (double Stroke, double Fill) BucketDetailMsPerFrame(long frames)
+    {
+        double f = frames <= 0 ? 1 : frames;
+        double k = 1000.0 / Stopwatch.Frequency / f;
+        return (Volatile.Read(ref TicksBucketStroke) * k, Volatile.Read(ref TicksBucketFill) * k);
+    }
+
+    /// <summary>把分段耗时折成"每帧毫秒"，顺序为 批次 / 文本 / 点标记 / 高亮。</summary>
+    public static (double Bucket, double Text, double Point, double Select) PassMsPerFrame(long frames)
+    {
+        double f = frames <= 0 ? 1 : frames;
+        double k = 1000.0 / Stopwatch.Frequency / f;
+        return (Volatile.Read(ref TicksBucketPass) * k, Volatile.Read(ref TicksTextPass) * k,
+                Volatile.Read(ref TicksPointPass) * k, Volatile.Read(ref TicksSelectPass) * k);
     }
 
     private readonly HashSet<string> _hidden = new(StringComparer.OrdinalIgnoreCase);
@@ -1011,6 +1069,11 @@ public class DrawingView : Control
             using var textPaint = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Fill };
 
             var baked = _list.Baked;
+            // 分段计时（仅在诊断开关打开时记录；关掉时 diag=false，下面的 if 全部跳过）
+            bool diag = RenderSplitEnabled;
+            long tMark = diag ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            long tBucket = 0, tText = 0, tPoint = 0, tSelect = 0;
+
             if (baked is not null && ShouldUseBaked(baked, worldRect))
             {
                 // ---- 批次路径：DrawPath 次数 = 批次数，且按 LOD 整档跳过亚像素几何 ----
@@ -1018,8 +1081,11 @@ public class DrawingView : Control
                 canvas.Concat(worldToScreen);
                 DrawBuckets(canvas, stroke, fill, baked, worldRect, hairline);
                 canvas.Restore();
+                if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tBucket = n - tMark; tMark = n; }
                 DrawTexts(canvas, textPaint, baked.UnbatchedEntities, worldRect);
+                if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tText = n - tMark; tMark = n; }
                 DrawPointMarks(canvas, baked.UnbatchedEntities, worldRect, h);
+                if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tPoint = n - tMark; tMark = n; }
             }
             else
             {
@@ -1029,8 +1095,11 @@ public class DrawingView : Control
                 canvas.Concat(worldToScreen);
                 DrawStrokeEntities(canvas, stroke, fill, visible, hairline);
                 canvas.Restore();
+                if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tBucket = n - tMark; tMark = n; }
                 DrawTexts(canvas, textPaint, visible, worldRect);
+                if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tText = n - tMark; tMark = n; }
                 DrawPointMarks(canvas, visible, worldRect, h);
+                if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tPoint = n - tMark; tMark = n; }
             }
 
             // ---- 选中高亮 pass：叠加在最上层，不走 LOD（选中了就要看得见）----
@@ -1123,6 +1192,16 @@ public class DrawingView : Control
                 }
             }
 
+            if (diag)
+            {
+                long n = System.Diagnostics.Stopwatch.GetTimestamp();
+                tSelect = n - tMark;
+                Interlocked.Add(ref TicksBucketPass, tBucket);
+                Interlocked.Add(ref TicksTextPass, tText);
+                Interlocked.Add(ref TicksPointPass, tPoint);
+                Interlocked.Add(ref TicksSelectPass, tSelect);
+            }
+
             canvas.Restore();
         }
 
@@ -1146,6 +1225,7 @@ public class DrawingView : Control
                                  BakedGeometry baked, SKRect worldRect, float hairline)
         {
             bool lw = _owner.ShowLineWeights;
+            bool diag = RenderSplitEnabled;
             stroke.StrokeWidth = hairline;
             uint current = 0;
             bool hasColor = false;
@@ -1184,9 +1264,14 @@ public class DrawingView : Control
                         // 线宽开关关闭 → 一律细线（AutoCAD 的 LWDISPLAY 关）。细线永远不窄于 1px。
                         float w = lw ? LineWidthWorld(b.LineWidthMm100) : hairline;
                         if (w != currentWidth) { currentWidth = w; stroke.StrokeWidth = w; }
-                        canvas.DrawPath(b.StrokePath, stroke);
+                        if (diag) { long n0 = System.Diagnostics.Stopwatch.GetTimestamp(); canvas.DrawPath(b.StrokePath, stroke); Interlocked.Add(ref TicksBucketStroke, System.Diagnostics.Stopwatch.GetTimestamp() - n0); }
+                        else canvas.DrawPath(b.StrokePath, stroke);
                     }
-                    if (b.FillPath is not null) canvas.DrawPath(b.FillPath, fill);
+                    if (b.FillPath is not null)
+                    {
+                        if (diag) { long n0 = System.Diagnostics.Stopwatch.GetTimestamp(); canvas.DrawPath(b.FillPath, fill); Interlocked.Add(ref TicksBucketFill, System.Diagnostics.Stopwatch.GetTimestamp() - n0); }
+                        else canvas.DrawPath(b.FillPath, fill);
+                    }
                 }
             }
         }
@@ -1226,23 +1311,37 @@ public class DrawingView : Control
         /// 所以必须在屏幕坐标里画，不能跟着世界矩阵走 —— 否则缩小后缩成亚像素、
         /// 放大后糊满屏（原固定 ±1 世界单位十字的两种表现）。详见 <see cref="PointMarkStyle"/>。</para>
         ///
+        /// <para><b>合批（2026-10-22）</b>：原实现逐点 <c>DrawCircle</c>，`3、幕墙横方总汇.dwg`
+        /// 全图 4,477 个点标记实测 29.5ms（6.6µs/个，全花在"每条一次 Skia 调用"上）。
+        /// 现在按颜色分组：实心点收集成一组 <c>DrawPoints</c>，符号聚合进同一条路径一次
+        /// <c>DrawPath</c>，绘制调用从 O(点数) 降到 O(颜色数)。画面完全等价。</para>
+        ///
         /// <para>不走实体的 LOD 阈值：点符号的可见性本来就由视口高度定义，
         /// 加一层"世界尺寸不足就丢"会把所有点整批剔掉。</para>
         /// </summary>
         private void DrawPointMarks(SKCanvas canvas, IEnumerable<CadEntity> entities, SKRect worldRect, float viewportH)
         {
             using var paint = new SKPaint { IsAntialias = true, StrokeWidth = 1f };
-            using var path = new SKPath();   // 复用同一个原生对象：逐点 new SKPath 会拖慢大图
+
+            Dictionary<(uint Color, int SizeEighth), (List<SKPoint> Pts, HashSet<long> Seen)>? dots = null;
+            Dictionary<uint, SKPath>? symbols = null;
+            int drawn = 0, hiddenLayer = 0;
+
+            // 没有隐藏图层时直接跳过逐实体查表（大图上这一步是纯开销）。
+            // 有隐藏图层时才查 _hidden（OrdinalIgnoreCase 字符串集合，单次约 100ns）。
+            bool hasHidden = _hidden.Count > 0;
 
             foreach (var ent in entities)
             {
                 if (ent.Mark is not { } mk) continue;
-                if (_hidden.Contains(ent.Layer)) continue;
+                if (hasHidden && _hidden.Contains(ent.Layer)) { hiddenLayer++; continue; }
 
                 int baseShape = PointMarkStyle.BaseShape(mk.Mode);
                 if (baseShape == PointMarkStyle.ModeInvisible) continue;   // 防御：转换期已滤过
 
-                float size = PointMarkStyle.SizePx(mk.SizeSpec, _zoom, viewportH);
+                float size = baseShape == 0
+                    ? PointMarkStyle.DotDiameterPx(mk.SizeSpec, _zoom)
+                    : PointMarkStyle.SizePx(mk.SizeSpec, _zoom, viewportH);
                 float h = size * 0.5f;
 
                 // 剔除要按"符号半径"外扩：点的包围盒是零面积，视图边界上的点
@@ -1252,16 +1351,27 @@ public class DrawingView : Control
                     mk.Position.Y < worldRect.Top - pad || mk.Position.Y > worldRect.Bottom + pad) continue;
 
                 var c = new SKPoint(mk.Position.X * _zoom + _offset.X, -mk.Position.Y * _zoom + _offset.Y);
-                paint.Color = new SKColor(ResolveColor(ent.ColorArgb));
+                uint color = ResolveColor(ent.ColorArgb);
 
-                // 基础形状 0 = 实心点（AutoCAD 的 PDMODE 0 就是"一个点"）
                 if (baseShape == 0)
                 {
-                    paint.Style = SKPaintStyle.Fill;
-                    canvas.DrawCircle(c, MathF.Max(0.75f, h * 0.5f), paint);
+                    // 基础形状 0 = 实心点（AutoCAD 的 PDMODE 0 就是"一个点"）
+                    var key = (color, (int)MathF.Round(size * 8f));
+                    if (dots is null) dots = new();
+                    if (!dots.TryGetValue(key, out var grp))
+                        dots[key] = grp = (new List<SKPoint>(64), new HashSet<long>());
+                    // 亚像素去重：点径只有 1.5px 时，落在同一半像素上的两个点画出来一模一样。
+                    // 大图全图视角下几千个点会压到同一像素（实测幕墙图 4,477 → 几十个），
+                    // 去重能把逐点光栅化的成本按"可见像素数"而不是"点数"计。
+                    long q = ((long)MathF.Round(c.X * 2f) << 32) ^ (uint)MathF.Round(c.Y * 2f);
+                    if (grp.Seen.Add(q)) grp.Pts.Add(c);
+                    drawn++;
+                    continue;
                 }
 
-                path.Reset();
+                if (symbols is null) symbols = new();
+                if (!symbols.TryGetValue(color, out var path)) symbols[color] = path = new SKPath();
+
                 switch (baseShape)
                 {
                     case 2:   // 十字
@@ -1278,20 +1388,52 @@ public class DrawingView : Control
                 }
                 if (PointMarkStyle.HasCircle(mk.Mode)) path.AddCircle(c.X, c.Y, h);
                 if (PointMarkStyle.HasSquare(mk.Mode)) path.AddRect(SKRect.Create(c.X - h, c.Y - h, size, size));
+                drawn++;
+            }
 
-                if (!path.IsEmpty)
+            // 点：每色一次 DrawPoints（圆头笔帽 → 圆点；笔宽即点径）
+            if (dots is not null)
+            {
+                paint.Style = SKPaintStyle.Stroke;
+                paint.StrokeCap = SKStrokeCap.Round;
+                foreach (var (key, grp) in dots)
                 {
-                    paint.Style = SKPaintStyle.Stroke;
-                    canvas.DrawPath(path, paint);
+                    paint.Color = new SKColor(key.Color);
+                    paint.StrokeWidth = key.SizeEighth / 8f;
+                    canvas.DrawPoints(SKPointMode.Points, grp.Pts.ToArray(), paint);
                 }
+                paint.StrokeCap = SKStrokeCap.Butt;
+            }
+
+            // 符号：每色一次 DrawPath
+            if (symbols is not null)
+            {
+                paint.Style = SKPaintStyle.Stroke;
+                paint.StrokeWidth = 1f;
+                foreach (var (color, path) in symbols)
+                {
+                    using (path)
+                    {
+                        paint.Color = new SKColor(color);
+                        canvas.DrawPath(path, paint);
+                    }
+                }
+            }
+
+            if (RenderSplitEnabled)
+            {
+                Volatile.Write(ref MarksDrawn, drawn);
+                Volatile.Write(ref MarksHiddenLayer, hiddenLayer);
             }
         }
 
         private void DrawTexts(SKCanvas canvas, SKPaint paint, IEnumerable<CadEntity> entities, SKRect worldRect)
         {
+            bool hasHidden = _hidden.Count > 0;
             foreach (var ent in entities)
             {
-                if (ent.Text is null || _hidden.Contains(ent.Layer)) continue;
+                if (ent.Text is null) continue;
+                if (hasHidden && _hidden.Contains(ent.Layer)) continue;
                 if (!ent.Bounds.IntersectsWith(worldRect)) continue;
                 DrawText(canvas, paint, ent.Text, ResolveColor(ent.ColorArgb));
             }

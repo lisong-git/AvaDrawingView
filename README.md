@@ -48,13 +48,13 @@
 ```powershell
 dotnet build AvaDrawingView.slnx -c Debug
 dotnet run --project src\DrawingView          # 启动 GUI
-dotnet run --project tools\SmokeTest        # 核心链路冒烟测试（解析→转换→索引，289 项断言）
+dotnet run --project tools\SmokeTest        # 核心链路冒烟测试（解析→转换→索引，293 项断言）
 dotnet run --project tools\UiSmokeTest      # UI 渲染冒烟测试（无头，不弹窗口）
 dotnet run --project tools\PerfProbe -- "D:\path\to.dwg"   # 性能基准（--load-only 只测加载；--repeat 8 验内存泄漏）
 dotnet run --project tools\SampleGen        # 重新生成 samples\ 下的样例图纸（含 sample_far.dxf 大坐标样例）
 dotnet run --project tools\BlockExport -- "D:\path\to.dwg" "D:\out" --referenced   # 按块导出独立 DWG
 dotnet run --project tools\ShapeExport -- "D:\path\to.dwg" "D:\out"               # 按相交分组导出独立 DWG
-dotnet run --project tools\DwgCapture -- "D:\path\to.dwg" "D:\out\shot.png"       # 无头渲染 PNG
+dotnet run --project tools\DwgCapture -- --in "D:\path\to.dwg" --out "D:\out\shot.png"   # 无头渲染 PNG
 ```
 
 一键跑完构建 + 两项冒烟（结果汇总到 `.regress.log`）：
@@ -68,15 +68,20 @@ powershell -ExecutionPolicy Bypass -File tools\regress.ps1
 ### 渲染对照 / 实体诊断开关
 
 ```powershell
-dotnet run --project tools\DwgCapture -- "D:\src.dwg" "D:\out\shot.png" --rect 31114,-15132,31142,-15111 --report
+dotnet run --project tools\DwgCapture -- --in "D:\src.dwg" --out "D:\out\shot.png" --rect 31114,-15132,31142,-15111 --report
 dotnet run --project tools\PerfProbe  -- "D:\src.dwg" --types                 # 实体类型直方图 + ACIS 载荷概览
 dotnet run --project tools\PerfProbe  -- "D:\src.dwg" --dump-sab D:\out\a.sab # 导出首条 ACIS 载荷
+dotnet run --project tools\PerfProbe  -- --survey "D:\图集" --limit 80 --min-kb 200   # 图集普查（实体/字体）
 $env:DrawingView_NO_REGION = "1"                                              # 关掉 REGION 轮廓，做像素 A/B
+$env:DrawingView_RENDER_SPLIT = "1"                                           # 绘制分段耗时（配合 PerfProbe）
 ```
 
+- `DwgCapture` 只认 `--in` / `--out`（早期文档写的两个位置参数是错的，实测会报 unknown argument）
 - `--rect left,top,right,bottom`：只渲染指定世界坐标窗口，用于同一定点区域的开/关对照
 - `--report` 的 JSON 含 `regionEntities / regionLoops / regionUnresolved / pointMarkEntities`
 - `PerfProbe --types`：实体类型直方图 + 前 14 条 SAB 记录（指针后标目标类型）；`--points` 列点实体
+- `PerfProbe --survey <dir> [--limit N] [--min-kb N] [--csv path]`：批量普查图集里的实体类型分布与
+  SHX 字体渗透率，输出 CSV。**`--min-kb` 别省**，否则碎块文件会把占比带偏
 
 ### BlockExport：块导出为独立 DWG
 
@@ -121,7 +126,7 @@ dotnet run --project tools\ShapeExport -- "D:\src.dwg" "D:\out"   # 默认输出
 ```
 src/DrawingView.Core      # 无 UI 依赖：解析、几何转换、烘焙批次、显示列表、文本度量、空间索引、视口
 src/DrawingView           # Avalonia 应用：DrawingView、主窗口、图层面板
-tools/SmokeTest         # 样例 DXF 全链路测试（解析→转换→索引，289 项精确断言）
+tools/SmokeTest         # 样例 DXF 全链路测试（解析→转换→索引，293 项精确断言）
 tools/UiSmokeTest       # 无头 Avalonia 渲染测试（真实跑渲染管线，40 项像素/几何断言）
 tools/PerfProbe         # 性能基准（加载分段 / 内存 / 帧耗时 / LOD 扫描 / 墨迹覆盖率 / 泄漏验证）
 tools/SampleGen         # 生成 samples\sample_features.dxf（覆盖全部实体类型与边界情况）

@@ -36,6 +36,24 @@ int Run(string[] argv)
 {
     var loadOnly = argv.Contains("--load-only");
 
+    // --survey <dir>：批量普查（不看渲染，只回答"图集里到底有什么实体/字体"）
+    // 用途：决定 3DSOLID/BODY/SURFACE 值不值得实现、SHX 字体占比多少 —— 先用数据说话，
+    // 不要凭"感觉国内图纸都用 SHX"去排优先级。
+    int surveyIdx = Array.IndexOf(argv, "--survey");
+    if (surveyIdx >= 0 && surveyIdx + 1 < argv.Length)
+    {
+        int limit = 0;
+        int limitIdx = Array.IndexOf(argv, "--limit");
+        if (limitIdx >= 0 && limitIdx + 1 < argv.Length) int.TryParse(argv[limitIdx + 1], out limit);
+        int minKb = 0;
+        int minKbIdx = Array.IndexOf(argv, "--min-kb");
+        if (minKbIdx >= 0 && minKbIdx + 1 < argv.Length) int.TryParse(argv[minKbIdx + 1], out minKb);
+        string csv = Path.Combine(Path.GetTempPath(), "DrawingView_survey.csv");
+        int csvIdx = Array.IndexOf(argv, "--csv");
+        if (csvIdx >= 0 && csvIdx + 1 < argv.Length) csv = argv[csvIdx + 1];
+        return SurveyCorpus(argv[surveyIdx + 1], limit, minKb, csv);
+    }
+
     // --repeat N：连续打开同一图纸 N 次，观察内存是否随次数线性增长（验证 SKPath 释放）
     int repeatCount = 0;
     int repeatIdx = Array.IndexOf(argv, "--repeat");
@@ -216,9 +234,21 @@ int Run(string[] argv)
             view.Viewport.ZoomAt((float)mult, new SKPoint(W / 2f, H / 2f));
 
         int visible = CountVisible(list, view, W, H);
+        DrawingView.Controls.DrawingView.ResetPassStats();
         var ms = MeasureFrames(window, view, 12);
 
         Log($"{mult,6:F0}x   {visible,8}   {ms.Count,4}   {ms.Median,8:F1}  {ms.DrawMedian,8:F1} {ms.P95,7:F1} {ms.Min,7:F1} {ms.Max,7:F1}   {1000.0 / Math.Max(ms.Median, 0.001),7:F1}");
+
+        // 分段拆解：批次 / 文本 / 点标记 / 高亮 各占多少（DrawingView_RENDER_SPLIT=1 时才有数）
+        if (DrawingView.Controls.DrawingView.RenderSplitEnabled)
+        {
+            var (bk, tx, pt, se) = DrawingView.Controls.DrawingView.PassMsPerFrame(ms.Count);
+            var (bs, bf) = DrawingView.Controls.DrawingView.BucketDetailMsPerFrame(ms.Count);
+            Log($"        └ 批次 {bk:F2}ms（描边 {bs:F2} + 填充 {bf:F2}）/ 文本 {tx:F2}ms / 点标记 {pt:F2}ms / 高亮 {se:F2}ms"
+                + $" / 其余 {Math.Max(0, ms.DrawMedian - bk - tx - pt - se):F2}ms"
+                + $" / 点标记 实画 {DrawingView.Controls.DrawingView.MarksDrawn}"
+                + $" 隐藏层跳过 {DrawingView.Controls.DrawingView.MarksHiddenLayer}");
+        }
     }
 
     // 平移场景（卡顿的直接来源：每次 pointer move 都重绘）
@@ -476,14 +506,19 @@ static (double Ink, int NonWhite, string? Png) CaptureAndAnalyze(Window window, 
     int w = fb.Size.Width, h = fb.Size.Height;
     var row = new byte[fb.RowBytes];
     int nonWhite = 0;
+    // 背景色取左上角像素：无头捕获的背景是控件的 BackgroundColor（AutoCAD 风格默认黑底），
+    // 旧实现写死"非白 = 墨迹"，黑底下恒报 99.9%，覆盖率这个指标等于没有。
+    System.Runtime.InteropServices.Marshal.Copy(fb.Address, row, 0, fb.RowBytes);
+    int bgB = row[0], bgG = row[1], bgR = row[2];
     for (int y = 0; y < h; y++)
     {
         System.Runtime.InteropServices.Marshal.Copy(fb.Address + y * fb.RowBytes, row, 0, fb.RowBytes);
         for (int x = 0; x < w; x++)
         {
             int o = x * 4;
-            // BGRA8888：任一通道明显暗于白即算墨迹
-            if (row[o] < 240 || row[o + 1] < 240 || row[o + 2] < 240) nonWhite++;
+            if (row[o + 3] < 8) continue;                       // 全透明 = 未绘制
+            int d = Math.Abs(row[o] - bgB) + Math.Abs(row[o + 1] - bgG) + Math.Abs(row[o + 2] - bgR);
+            if (d > 24) nonWhite++;                             // 与背景明显不同 = 墨迹
         }
     }
     long total = (long)w * h;
@@ -536,6 +571,113 @@ static Stats MeasurePanFrames(Window window, DrawingView.Controls.DrawingView vi
         samples.Add(sw.Elapsed.TotalMilliseconds);
     }
     return new Stats(samples);
+}
+
+/// <summary>
+/// 图集普查（--survey &lt;dir&gt; [--limit N] [--csv path]）：只读文件、不走渲染。
+///
+/// <para>回答两个排期问题，避免凭感觉定优先级：
+/// ① 3DSOLID / BODY / SURFACE 这类"暂不渲染"的实体到底占多少；
+/// ② SHX 单线字体在真实图集里的渗透率（样式数 + 落在 SHX 样式上的文本实体数）。</para>
+///
+/// <para>抽样是等距抽样（先按路径排序再均匀取 N 个），避免 limit 只扫到某个子目录。</para>
+/// </summary>
+int SurveyCorpus(string dir, int limit, int minKb, string csvPath)
+{
+    long minBytes = (long)minKb * 1024;
+    var files = Directory.EnumerateFiles(dir, "*.*", SearchOption.AllDirectories)
+        .Where(f => (f.EndsWith(".dwg", StringComparison.OrdinalIgnoreCase)
+                  || f.EndsWith(".dxf", StringComparison.OrdinalIgnoreCase))
+                 && (minBytes <= 0 || new FileInfo(f).Length >= minBytes))
+        .OrderBy(f => f, StringComparer.Ordinal).ToList();
+    if (files.Count == 0) { Log($"FAIL: {dir} 下没有 dwg/dxf"); return 1; }
+
+    int total = files.Count;
+    if (limit > 0 && files.Count > limit)
+    {
+        double step = (double)files.Count / limit;
+        var sampled = new List<string>(limit);
+        for (int i = 0; i < limit; i++) sampled.Add(files[(int)(i * step)]);
+        files = sampled;
+    }
+    Log($"=== 图集普查 === {dir}");
+    Log($"文件总数 {total}，本次抽样 {files.Count}（等距抽样）");
+    Log("");
+
+    var csv = new System.Text.StringBuilder("file,entities,region,solid3d,body,surface,proxy,hatch,insert,text,mtext,styles,shxStyles,textsOnShx,status\n");
+    int failed = 0;
+    long sumEnt = 0, sumRegion = 0, sumSolid = 0, sumBody = 0, sumSurface = 0, sumProxy = 0, sumHatch = 0, sumInsert = 0, sumText = 0, sumMtext = 0;
+    long sumStyles = 0, sumShxStyles = 0, sumTextsOnShx = 0;
+    int filesWithSolid = 0, filesWithShx = 0;
+
+    static string Prop(object? o, string name)
+        => o?.GetType().GetProperty(name)?.GetValue(o)?.ToString() ?? "";
+
+    foreach (var f in files)
+    {
+        string name = Path.GetFileName(f);
+        try
+        {
+            ACadSharp.CadDocument doc;
+            if (f.EndsWith(".dwg", StringComparison.OrdinalIgnoreCase))
+            { using var r = new ACadSharp.IO.DwgReader(f); doc = r.Read(); }
+            else { using var r = new ACadSharp.IO.DxfReader(f); doc = r.Read(); }
+
+            var blocks = doc.BlockRecords.SelectMany(b => b.Entities).ToList();
+            var all = doc.Entities.Concat(blocks).ToList();
+
+            int Count(string t) => all.Count(e => e.GetType().Name == t);
+            int region = Count("Region"), solid = Count("Solid3D"), body = Count("Body"), surface = Count("Surface");
+            int proxy = all.Count(e => e.GetType().Name.Contains("Proxy", StringComparison.Ordinal));
+            int hatch = Count("Hatch"), insert = Count("Insert");
+            int text = Count("TextEntity") + Count("MText") + Count("AttributeEntity") + Count("AttributeDefinition");
+            int mtext = Count("MText");
+
+            // SHX 渗透率：样式级（Filename 以 .shx 结尾或配了大字体）+ 实体级（文本用到的样式）
+            var styles = doc.TextStyles.ToList();
+            var shxNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var st in styles)
+            {
+                string fn = Prop(st, "Filename");
+                string big = Prop(st, "BigFontFilename");
+                if (fn.EndsWith(".shx", StringComparison.OrdinalIgnoreCase) || big.Length > 0)
+                    shxNames.Add(Prop(st, "Name"));
+            }
+            int textsOnShx = all.Count(e =>
+            {
+                var st = e.GetType().GetProperty("Style")?.GetValue(e);
+                string styleName = Prop(st, "Name");
+                return styleName.Length > 0 && shxNames.Contains(styleName);
+            });
+
+            sumEnt += all.Count; sumRegion += region; sumSolid += solid; sumBody += body; sumSurface += surface;
+            sumProxy += proxy; sumHatch += hatch; sumInsert += insert; sumText += text; sumMtext += mtext;
+            sumStyles += styles.Count; sumShxStyles += shxNames.Count; sumTextsOnShx += textsOnShx;
+            if (solid + body + surface > 0) filesWithSolid++;
+            if (shxNames.Count > 0) filesWithShx++;
+
+            csv.Append($"\"{name}\",{all.Count},{region},{solid},{body},{surface},{proxy},{hatch},{insert},{text},{mtext},{styles.Count},{shxNames.Count},{textsOnShx},ok\n");
+            Log($"{name,-42} 实体 {all.Count,7:N0}  3D/体/面 {solid}/{body}/{surface}  SHX 样式 {shxNames.Count}/{styles.Count}  用 SHX 的文本 {textsOnShx:N0}");
+        }
+        catch (Exception ex)
+        {
+            failed++;
+            csv.Append($"\"{name}\",0,0,0,0,0,0,0,0,0,0,0,0,0,\"{ex.GetType().Name}\"\n");
+            Log($"{name,-42} 解析失败：{ex.GetType().Name}");
+        }
+    }
+
+    File.WriteAllText(csvPath, csv.ToString());
+    Log("");
+    Log("--- 汇总 ---");
+    Log($"扫描 {files.Count} 个，解析失败 {failed}");
+    Log($"实体合计 {sumEnt:N0}：REGION {sumRegion:N0} / 3DSOLID {sumSolid:N0} / BODY {sumBody:N0} / SURFACE {sumSurface:N0} / 代理 {sumProxy:N0}");
+    Log($"含 3DSOLID/BODY/SURFACE 的文件：{filesWithSolid}（{(double)filesWithSolid / Math.Max(1, files.Count - failed):P1}）");
+    Log($"SHX：样式 {sumShxStyles:N0}/{sumStyles:N0}（{(double)sumShxStyles / Math.Max(1, sumStyles):P1}），"
+        + $"含 SHX 样式的文件 {filesWithShx}（{(double)filesWithShx / Math.Max(1, files.Count - failed):P1}），"
+        + $"落在 SHX 样式上的文本实体 {sumTextsOnShx:N0}/{sumText:N0}");
+    Log($"明细 CSV：{csvPath}");
+    return 0;
 }
 
 /// <summary>同步记录各阶段时间戳（Progress&lt;T&gt; 在无 UI 上下文时会派发到线程池，不适合计时）。</summary>

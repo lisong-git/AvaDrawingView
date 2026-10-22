@@ -54,4 +54,26 @@ public static class PointMarkStyle
         // 至少 1px：再小就完全看不见，而"看不见"会让人误判成实体丢失
         return px < 1f ? 1f : px;
     }
+
+    /// <summary>PDMODE 基础形状 0（"点"）的默认直径：1.5 设备像素。</summary>
+    public const float DefaultDotPx = 1.5f;
+
+    /// <summary>
+    /// PDMODE 基础形状 0（点）的屏幕直径。
+    ///
+    /// <para><b>为什么不套 <see cref="SizePx"/> 的 5% 规则</b>：实测 `3、幕墙横方总汇.dwg`
+    /// 有 4,477 个 PDMODE=0 / PDSIZE=0 的点，按 5% 视高算每个直径 45px —— 全图会糊成一片点阵，
+    /// 而 ODA 参考出图（`.compare/oda_3幕.png`）里这些点放大到当前视口只剩一个像素级小点。
+    /// 结论：「5% 视高」是**符号模式**（2/3/4 及 32/64 叠加）的尺寸口径，点模式就是一个点，
+    /// 不随视口放大。这是 P2-3 首版实现漏掉的一档，也是渲染耗时回退的直接来源（45px 抗锯齿
+    /// 实心圆逐个绘制）。</para>
+    ///
+    /// <para>PDSIZE &gt; 0 是用户显式给了世界单位尺寸，仍然尊重（乘缩放换算成像素），
+    /// 只是不小于 1px。</para>
+    /// </summary>
+    public static float DotDiameterPx(float pdsize, float zoom)
+    {
+        if (pdsize > 0f) return SizePx(pdsize, zoom, 0f);
+        return DefaultDotPx;
+    }
 }

@@ -894,6 +894,19 @@ void RunPointFileSample(string path)
     Check(PointMarkStyle.SizePx(0.001f, 1e-4f, 600f) >= 1f,
           $"极端小尺寸兜底为 1px（实际 {PointMarkStyle.SizePx(0.001f, 1e-4f, 600f):F3}）");
 
+    // PDMODE 0（点）与符号模式的口径不同（2026-10-22）：
+    // 「5% 视高」只给符号用；点就是一个点，不随视口放大。
+    // 反例证据：幕墙图 4,477 个 PDMODE=0/PDSIZE=0 的点按 5% 算成 45px，
+    // 逐个抗锯齿实心圆要 29.5ms/帧（全图 21FPS），而 ODA 参考出图里它们只是像素级小点。
+    Check(Near(PointMarkStyle.DotDiameterPx(0f, 0.000581f), PointMarkStyle.DefaultDotPx, 1e-4f),
+          $"PDMODE=0 且 PDSIZE=0 → 固定 1.5px 点（实际 {PointMarkStyle.DotDiameterPx(0f, 0.000581f):F2}）");
+    Check(Near(PointMarkStyle.DotDiameterPx(-10f, 4f), PointMarkStyle.DefaultDotPx, 1e-4f),
+          "PDMODE=0 且 PDSIZE<0 → 仍是 1.5px 点（百分比口径只对符号生效）");
+    Check(Near(PointMarkStyle.DotDiameterPx(20f, 2f), 40f, 1e-3f),
+          $"PDMODE=0 但 PDSIZE>0 → 尊重显式世界尺寸（20×2 = 40px，实际 {PointMarkStyle.DotDiameterPx(20f, 2f):F2}）");
+    Check(PointMarkStyle.DotDiameterPx(0f, 1f) < PointMarkStyle.SizePx(0f, 1f, 600f) / 10f,
+          "点模式尺寸远小于同参数下的符号尺寸（不是同一套口径）");
+
     var list = CadDocumentLoader.Load(path);
     Check(list.Entities.Count == 3, $"实体数 == 3（实际 {list.Entities.Count}）");
     Check(list.PointMarkEntities == 3, $"点标记 == 3（实际 {list.PointMarkEntities}）");
