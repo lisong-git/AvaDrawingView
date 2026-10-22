@@ -52,7 +52,7 @@
 ```powershell
 dotnet build AvaDrawingView.slnx -c Debug
 dotnet run --project src\DrawingView          # 启动 GUI
-dotnet run --project tools\SmokeTest        # 核心链路冒烟测试（解析→转换→索引，321 项断言）
+dotnet run --project tools\SmokeTest        # 核心链路冒烟测试（解析→转换→索引，325 项断言）
 dotnet run --project tools\UiSmokeTest      # UI 渲染冒烟测试（无头，不弹窗口）
 dotnet run --project tools\PerfProbe -- "D:\path\to.dwg"   # 性能基准（--load-only 只测加载；--repeat 8 验内存泄漏）
 dotnet run --project tools\SampleGen        # 重新生成 samples\ 下的样例图纸（含 sample_far.dxf 大坐标样例）
@@ -132,7 +132,7 @@ dotnet run --project tools\ShapeExport -- "D:\src.dwg" "D:\out"   # 默认输出
 ```
 src/DrawingView.Core      # 无 UI 依赖：解析、几何转换、烘焙批次、显示列表、文本度量、空间索引、视口
 src/DrawingView           # Avalonia 应用：DrawingView、主窗口、图层面板
-tools/SmokeTest         # 样例 DXF 全链路测试（解析→转换→索引，321 项精确断言）
+tools/SmokeTest         # 样例 DXF 全链路测试（解析→转换→索引，325 项精确断言）
 tools/UiSmokeTest       # 无头 Avalonia 渲染测试（真实跑渲染管线，40 项像素/几何断言）
 tools/PerfProbe         # 性能基准（加载分段 / 内存 / 帧耗时 / LOD 扫描 / 墨迹覆盖率 / 泄漏验证）
 tools/SampleGen         # 生成 samples\sample_features.dxf（覆盖全部实体类型与边界情况）
@@ -155,7 +155,9 @@ samples/                # 样例图纸
 - 大图纸优化：SKPicture 静态层录制、分块缓存、块实例复用（当前 INSERT 为烘焙克隆）
 - SHX 单线字体**已支持**（2026-10-22）：缺字库时（本机没有 `tssdeng.shx`/`hztxt.shx`/`jrs.shx`）
   仍回退系统字体，字形差异依旧存在；状态栏会报「N 条文字缺字库（回退 TTF）」
-- SHX 大字体的字宽**按字高一个方块**走：gbcbig 的字形结束点比墨迹还窄，直接当前进量会叠字
+- SHX 大字体的字宽取**字身框**（`ShxFont.AdvanceUnits` = 左沿中位数 + 右沿中位数），
+  不是字高也不是字形结束点：gbcbig 实际是 0.73 em 的压缩字身框，按字高走每行会宽 37%；
+  汉字的**字间微调（kern）**仍未做
 - 3DSOLID / BODY / SURFACE 不渲染：**REGION 已支持**（ACIS 的 SAB 二进制载荷由
   `AcisSab` + `RegionOutline` 自建重建，见 P2-7）；三维实体投到 XY 会互相穿插，暂不处理
 - 大坐标（图纸范围 ±1e6）下 float32 精度：深度放大时几何可能抖动

@@ -1695,9 +1695,11 @@ void RunShxChecks()
     {
         string ansiPath = Path.Combine(dir, "TESTANSI.SHX");
         string bigPath = Path.Combine(dir, "TESTBIG.SHX");
+        string widePath = Path.Combine(dir, "TESTWIDE.SHX");
         string dxfPath = Path.Combine(dir, "shx_probe.dxf");
         File.WriteAllBytes(ansiPath, BuildTestAnsiFont());
         File.WriteAllBytes(bigPath, BuildTestBigFont());
+        File.WriteAllBytes(widePath, BuildTestBigFontWide());
         File.WriteAllText(dxfPath, ShxProbeDxf(), new System.Text.UTF8Encoding(false));
 
         // ---- 1. unifont：字头 / 名字前缀 / 字形 / 前进量 / 字高换算 ----
@@ -1737,6 +1739,20 @@ void RunShxChecks()
                       $"田 只画出自己的 2 段，尾部 07 8F 00 不当子形（实际 {tian.Polylines.Count} 段）");
                 Check(MathF.Abs(tian.Advance - 40f) < 0.01f, $"田 结束点 x=40（两笔累计，实际 {tian.Advance:F2}）");
             }
+        }
+
+        // ---- 2.5 大字体固定字宽：不能按字高走（gbcbig 是压缩字身框） ----
+        var wide = ShxFont.TryLoad(widePath, out string? wideErr);
+        Check(wide is not null, $"等宽 bigfont 解析成功（{wideErr ?? "ok"}）");
+        if (wide is not null)
+        {
+            Check(MathF.Abs(wide.CapUnits - 100f) < 0.01f, $"字高换算 100（实际 {wide.CapUnits:F2}）");
+            Check(MathF.Abs(wide.AdvanceUnits - 60f) < 0.01f,
+                  $"固定字宽 = 左沿 5 + 右沿 55 = 60，而不是字高 100（实际 {wide.AdvanceUnits:F2}）");
+            // 3 个汉字应前进 3 × 60 = 180（旧实现按字高会是 300）
+            bool measured = ShxFontLibrary.TryMeasure("田田田", widePath, null, 100f, out float w3);
+            Check(measured && MathF.Abs(w3 - 180f) < 0.5f,
+                  $"3 个汉字的行宽 180（实际 {(measured ? w3.ToString("F2") : "量不出")}）");
         }
 
         // ---- 3. TTF 名字不该当成"缺 SHX 字库" ----
@@ -1835,6 +1851,50 @@ static byte[] BuildTestBigFont()
     U16(0x008F); U16(blob.Count); U32(offBlob);
     foreach (byte b in tian) ms.WriteByte(b);
     foreach (byte b in blob) ms.WriteByte(b);
+    return ms.ToArray();
+}
+
+/// <summary>
+/// 合成一个"10 个等宽字身"的 bigfont：每个字形 x∈[5,55]、上沿 100（第一个内码是 0xCCEF = "田"）。
+///
+/// <para>用来钉住大字体的**固定字宽** = 左沿中位数 + 右沿中位数 = 60，而不是字高 100：
+/// gbcbig 就是这种压缩大字体（字身框 66 单位、字高 90 单位），按 1 em 走每行会宽出 37%
+/// —— 这是 2026-10-22 用 ODA 参考渲染（0.727 em）反查出来的。</para>
+/// </summary>
+static byte[] BuildTestBigFontWide()
+{
+    const int N = 10;
+    var bodies = new List<List<byte>>();
+    for (int k = 0; k < N; k++)
+    {
+        var d = new List<byte> { 0xCC, (byte)(0xEF + k), 0x00, 0x07, 0x8E, 0x05 };   // 固定 6 字节前缀
+        d.AddRange(new byte[] { 0x02, 0x08, 0x05, 0x00, 0x01, 0x08, 0x32, 0x00 });  // 抬笔(5,0) → 画到 (55,0)
+        // XY 位移是**相对**的：笔 1 停在 (55,0)，要回到 x=5 得走 -50（0xCE）
+        d.AddRange(new byte[] { 0x02, 0x08, 0xCE, 0x64, 0x01, 0x08, 0x32, 0x00 });  // 抬笔→(5,100) → 画到 (55,100)
+        bodies.Add(d);
+    }
+
+    var ms = new MemoryStream();
+    void Raw(params byte[] b) => ms.Write(b, 0, b.Length);
+    void U16(int v) { ms.WriteByte((byte)(v & 0xFF)); ms.WriteByte((byte)((v >> 8) & 0xFF)); }
+    void U32(int v) { for (int k = 0; k < 4; k++) ms.WriteByte((byte)((v >> (8 * k)) & 0xFF)); }
+
+    Raw(System.Text.Encoding.ASCII.GetBytes("AutoCAD-86 bigfont 1"));
+    Raw(0x0D, 0x0A, 0x1A);
+    U16(8);                     // 前导
+    U16(N);                     // count
+    U16(1);                     // nChange
+    U16(0x0000); U16(0xFFFF);   // 一个变更区间
+
+    int indexStart = (int)ms.Position;
+    int dataStart = indexStart + N * 8;
+    int off = dataStart;
+    for (int k = 0; k < N; k++)
+    {
+        U16(0xCCEF + k); U16(bodies[k].Count); U32(off);
+        off += bodies[k].Count;
+    }
+    foreach (var b in bodies) Raw(b.ToArray());
     return ms.ToArray();
 }
 

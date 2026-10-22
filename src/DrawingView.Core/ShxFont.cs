@@ -267,6 +267,67 @@ public sealed class ShxFont
         }
     }
 
+    private float? _advanceUnits;
+
+    /// <summary>
+    /// 大字体"一个字的固定前进量"（字体单位）。**大字体是等宽的**，所有汉字同一格。
+    ///
+    /// <para><b>不能用字形结束点的 x</b>：实测 gbcbig 里 <c>中</c> 的结束点只有 12 单位、
+    /// <c>图</c> 28 单位（最后一个 PEN_UP 之后就结束了），照这个走会严重叠字。
+    /// <b>也不能用字高</b>：gbcbig 是压缩大字体，字身框宽 ≈ 66 单位而字高 ≈ 90 单位
+    /// （0.73 em），按 1 em 走每行宽出 37%。</para>
+    ///
+    /// <para>这里利用"汉字在字身框内水平居中"这一点反推框宽 = 左沿中位数 + 右沿中位数
+    /// （gbcbig 实测 5 + 61 = 66，与 ODA 参考渲染反推的 65.6 差 0.6%）。中位数对
+    /// 标点/窄字和少量超宽字形都稳健；采样 240 个字形就够（顺序采样，结果可复现）。</para>
+    ///
+    /// <para>非大字体返回 0，表示"按每个字形自己的 Advance 走"。</para>
+    /// </summary>
+    public float AdvanceUnits
+    {
+        get
+        {
+            if (_advanceUnits is { } v) return v;
+            if (Kind != FontKind.BigFont) { _advanceUnits = 0f; return 0f; }
+
+            const int Sample = 240;
+            var codes = new int[_raw.Count];
+            _raw.Keys.CopyTo(codes, 0);
+            Array.Sort(codes);                              // 顺序稳定 → 同一字库每次结果一致
+
+            var lefts = new List<float>(Sample);
+            var rights = new List<float>(Sample);
+            int step = Math.Max(1, codes.Length / Sample);
+            for (int i = 0; i < codes.Length && lefts.Count < Sample; i += step)
+            {
+                if (GetGlyphByCode(codes[i]) is not { } g) continue;
+                float lo = float.MaxValue, hi = float.MinValue;
+                foreach (var poly in g.Polylines)
+                foreach (var p in poly)
+                {
+                    if (p.X < lo) lo = p.X;
+                    if (p.X > hi) hi = p.X;
+                }
+                if (hi <= lo) continue;
+                lefts.Add(lo);
+                rights.Add(hi);
+            }
+
+            float adv;
+            if (lefts.Count >= 8)
+            {
+                lefts.Sort();
+                rights.Sort();
+                adv = lefts[lefts.Count / 2] + rights[rights.Count / 2];
+            }
+            else adv = CapUnits;
+
+            if (adv <= 0) adv = CapUnits;
+            _advanceUnits = adv;
+            return adv;
+        }
+    }
+
     // ---------- 取字形 ----------
 
     /// <summary>按字符取字形（缓存）。字符不在字体里返回 null。</summary>

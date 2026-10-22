@@ -201,10 +201,10 @@ public static class ShxFontLibrary
                     }
                     drawn++;
                 }
-                // 中文字按字高走一个方块（大字体没有可靠的前进量：
-                // 实测 gbcbig 的"图/面"结束点 x 比字形墨迹还窄，直接用会叠字）
+                // 中文用大字体自己的**固定字宽**（gbcbig ≈ 0.73 em，压缩字体的字形结束点
+                // 不代表前进量，按字高 1 em 走会宽出 37%）；西文用字形自个的 Advance。
                 penX += font.Kind == ShxFont.FontKind.BigFont
-                    ? capHeight
+                    ? font.AdvanceUnits * scale
                     : glyph.Advance * scale;
             }
         }
@@ -263,17 +263,17 @@ public static class ShxFontLibrary
             if (c < ' ') continue;
             var (font, glyph, scale) = PickGlyph(c, ansi, big, ansiScale, bigScale);
             if (font is null || glyph is null) { x += FallbackAdvance(c, ansi, big, ansiScale, bigScale); continue; }
-            x += font.Kind == ShxFont.FontKind.BigFont ? capHeight : glyph.Advance * scale;
+            x += font.Kind == ShxFont.FontKind.BigFont ? font.AdvanceUnits * scale : glyph.Advance * scale;
         }
         return x;
     }
 
-    /// <summary>缺字时的占位前进量：中文字一个方块，西文半个字高。</summary>
+    /// <summary>缺字时的占位前进量：中文按大字体的固定字宽，西文按半个字高。</summary>
     private static float FallbackAdvance(char c, ShxFont? ansi, ShxFont? big, float ansiScale, float bigScale)
     {
         if (c >= 0x80)
         {
-            if (big is not null && bigScale > 0) return big.CapUnits * bigScale;
+            if (big is not null && bigScale > 0) return big.AdvanceUnits * bigScale;
             if (ansi is not null && ansiScale > 0) return ansi.CapUnits * ansiScale;
         }
         if (ansi is not null && ansiScale > 0) return ansi.CapUnits * 0.5f * ansiScale;
