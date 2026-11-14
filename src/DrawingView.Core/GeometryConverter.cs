@@ -274,6 +274,18 @@ public sealed class GeometryConverter
     private static readonly bool ClipUseInverseXform =
         Environment.GetEnvironmentVariable("DrawingView_CLIP_INV_XFORM") != "0";
 
+    /// <summary>
+    /// 块内（嵌套块定义里的）XCLIP 是否也参与裁剪。默认**开**（2026-11-14 修）。
+    ///
+    /// <para>此前这里是硬跳过（<c>parent.IsIdentity</c>），因为"块内边界到底在哪个坐标系"
+    /// 没标定出来，猜错会误藏正确内容。用 `52陶板节点` 的 `TK-A3-NT/qwe`（H=1498）标定后
+    /// 换算链已经闭合（见 <see cref="TryGetSpatialClip"/> 的说明），故放开。</para>
+    ///
+    /// <para>环境变量 <c>DrawingView_CLIP_IN_BLOCK=0</c> 可回到"块内一律不裁"的旧行为做 A/B。</para>
+    /// </summary>
+    private static readonly bool ClipInBlock =
+        Environment.GetEnvironmentVariable("DrawingView_CLIP_IN_BLOCK") != "0";
+
     /// <summary>打印每个空间过滤器的换算结果（诊断"这块为什么被裁/没裁"）。<c>DrawingView_CLIP_DEBUG=1</c>。</summary>
     private static readonly bool ClipDebug =
         Environment.GetEnvironmentVariable("DrawingView_CLIP_DEBUG") == "1";
@@ -816,17 +828,16 @@ public sealed class GeometryConverter
         // ZOOM E 的 VIEWSIZE=849；我们照画 26 份，自适应范围从 y=1162 被拉到 y=2878，
         // 于是"适应窗口"把整张图缩到 1/3，上方拖出一条锯齿长条。
         //
-        // 只在顶层（parent 为单位阵）生效：块内的边界究竟在块坐标系还是世界系未经验证，
-        // 猜错会**误藏正确内容**，宁可不裁。
+        // 只在顶层（parent 为单位阵）或已标定块内换算（见 ClipInBlock）时生效。
         SKPath? prevSpatialClip = _spatialClipPath;
         SKRect prevSpatialBounds = _spatialClipBounds;
         bool prevSpatialIsRect = _spatialClipIsRect;
         bool clipChanged = false;
         int entityStart = _entities.Count;
-        if (SpatialClipEnabled && parent.IsIdentity &&
-            TryGetSpatialClip(e, out var clipPath, out var clipBounds, out var clipIsRect))
+        if (SpatialClipEnabled && (parent.IsIdentity || ClipInBlock) &&
+            TryGetSpatialClip(e, parent, out var clipPath, out var clipBounds, out var clipIsRect))
         {
-            if (TryGetEntityBounds(e, out var entityBounds) && !entityBounds.IntersectsWith(clipBounds))
+            if (TryGetEntityBounds(e, parent, out var entityBounds) && !entityBounds.IntersectsWith(clipBounds))
             {
                 // 边界与实体完全不相交 = 过滤器坐标系没读出来（ACadSharp 对一部分旧格式过滤器
                 // 的 Normal/InsertTransform 不可信）。这时边界位置本身没有意义，只能按"这条引用
@@ -962,8 +973,18 @@ public sealed class GeometryConverter
     ///
     /// <para><b>返回多边形而不是外接矩形</b>（P2-17）：实测 <c>THSYB1-12 层间竖剖.dwg</c> 的边界是
     /// 8 点台阶形，面积只有外接矩形的 74%；按矩形裁会把缺口里的内容画出来（AutoCAD 是抠掉的）。</para>
+    ///
+    /// <para><b>块内（2026-11-14 补）</b>：上面这条链在块里还要再乘**父链矩阵**（块坐标→世界），
+    /// 即 <c>world = parent × selfInsert × inverse(boundary)</c>。之前这里靠
+    /// <c>parent.IsIdentity</c> 把块内一律跳过，理由是"边界到底在哪个坐标系没标定"；用
+    /// <c>52陶板节点</c> 的 <c>TK-A3-NT/qwe</c>（H=1498）标定后这条链是闭合的：边界
+    /// (432.741,123.331)-(478.741,150.029) 过 <c>inv</c>（缩放 304.2042 + 平移
+    /// -133156.85/-27416.02）落回 qwe 块坐标 (-1515,10102)-(12478,18223)（与块内容 754..13748
+    /// 同一量级），再乘 qwe 的插入（scale 0.00329 = inv 缩放的倒数，互为逆）得父块坐标
+    /// (367.6,116.3)-(413.6,143.0)，最后乘 TK 的插入（-90° + scale 2）得世界
+    /// (645.2,335.0)-(698.6,427.0)。这个窗口把图签缩略平面图的左半切掉，与 ODA / AutoCAD 的显示一致（实测该区多画 2153→46 px）。</para>
     /// </summary>
-    private bool TryGetSpatialClip(Entity e, out SKPath clipPath, out SKRect bounds, out bool isRect)
+    private bool TryGetSpatialClip(Entity e, in SKMatrix parent, out SKPath clipPath, out SKRect bounds, out bool isRect)
     {
         clipPath = null!;
         bounds = default;
@@ -1066,6 +1087,8 @@ public sealed class GeometryConverter
             }
 
             var w = CadTransform.Apply(toWorld, new SKPoint((float)x, (float)y));
+            // 块内：再沿父链回到世界（顶层 parent 为单位阵，这一步是恒等，行为不变）
+            if (!parent.IsIdentity) w = CadTransform.Apply(parent, w);
             x = w.X;
             y = w.Y;
 
@@ -1081,7 +1104,7 @@ public sealed class GeometryConverter
 
         var rect = new SKRect(minX, minY, maxX, maxY);
         if (ClipDebug)
-            Console.Error.WriteLine($"[clip] H={e.Handle} inv={(invToBlock is not null ? "yes" : "no")} hasToWorld={hasToWorld} rect=({rect.Left:F1},{rect.Top:F1})-({rect.Right:F1},{rect.Bottom:F1})");
+            Console.Error.WriteLine($"[clip] H={e.Handle} inBlock={!parent.IsIdentity} inv={(invToBlock is not null ? "yes" : "no")} hasToWorld={hasToWorld} rect=({rect.Left:F1},{rect.Top:F1})-({rect.Right:F1},{rect.Bottom:F1})");
 
         // 只有 1~2 个点（实测 THSYB1-12 的 H=845/H=850 就是 2 点对角）画不出多边形，
         // 按外接矩形处理：这类记录本身是坏的，但 AutoCAD 照样按它裁 —— 与实体不相交时
@@ -1170,8 +1193,14 @@ public sealed class GeometryConverter
             && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
     }
 
-    /// <summary>实体包围盒（世界坐标）；空盒/取不到时返回 false（此时不参与裁剪判定）。</summary>
-    private static bool TryGetEntityBounds(Entity e, out SKRect bounds)
+    /// <summary>实体包围盒（**世界坐标**）；空盒/取不到时返回 false（此时不参与裁剪判定）。</summary>
+    ///
+    /// <para><paramref name="parent"/>：实体所在容器的块坐标→世界矩阵。ACadSharp 的
+    /// <c>GetBoundingBox()</c> 给的是**父容器坐标**（块内实体是块定义坐标，Insert 是父块坐标，
+    /// 模型空间实体是世界坐标），块内实体不乘这一步就会拿"块坐标的盒子"去和"世界的裁剪窗口"比，
+    /// 永远不相交 —— 表现是整块被当成"裁掉"丢掉（2026-11-14 块内 XCLIP 就是这个坑：qwe 的
+    /// 692 个展开图元全丢）。</para>
+    private static bool TryGetEntityBounds(Entity e, in SKMatrix parent, out SKRect bounds)
     {
         bounds = default;
         BoundingBox bb;
@@ -1184,8 +1213,38 @@ public sealed class GeometryConverter
         if (x1 < x0) (x0, x1) = (x1, x0);
         if (y1 < y0) (y0, y1) = (y1, y0);
 
-        bounds = SKRect.Create((float)x0, (float)y0, (float)(x1 - x0), (float)(y1 - y0));
+        var box = SKRect.Create((float)x0, (float)y0, (float)(x1 - x0), (float)(y1 - y0));
+
+        // ACadSharp 的 Insert.GetBoundingBox() 已经含它自己的插入变换、给的是**父容器坐标**
+        // （实测 TK-A3-NT/qwe H=1498：(375.1,54.9)-(417.8,139.7)，与父块坐标一致），
+        // 所以这里只需要沿父链回到世界，不要再乘一次自身矩阵（会缩成 0.003 倍、误判不相交）。
+        if (!parent.IsIdentity)
+            box = TransformRect(box, parent);
+
+        bounds = box;
         return true;
+    }
+
+    /// <summary>轴对齐盒子过仿射变换（取四角的外接矩形）。</summary>
+    private static SKRect TransformRect(SKRect r, in SKMatrix m)
+    {
+        var pts = new[]
+        {
+            new SKPoint(r.Left, r.Top),
+            new SKPoint(r.Right, r.Top),
+            new SKPoint(r.Right, r.Bottom),
+            new SKPoint(r.Left, r.Bottom),
+        };
+        pts = m.MapPoints(pts);   // SkiaSharp 的这个重载返回新数组，不原地改
+        float minX = float.MaxValue, minY = float.MaxValue, maxX = float.MinValue, maxY = float.MinValue;
+        foreach (var p in pts)
+        {
+            if (p.X < minX) minX = p.X;
+            if (p.X > maxX) maxX = p.X;
+            if (p.Y < minY) minY = p.Y;
+            if (p.Y > maxY) maxY = p.Y;
+        }
+        return SKRect.Create(minX, minY, maxX - minX, maxY - minY);
     }
 
     private static bool IsIdentityMatrix(in Matrix4 m)

@@ -86,6 +86,9 @@ $env:DrawingView_NO_REGION = "1"                                              # 
 $env:DrawingView_RENDER_SPLIT = "1"                                           # 绘制分段耗时（配合 PerfProbe）
 $env:DrawingView_FONT_PATH = "D:\ACAD\Fonts"                                 # SHX 字体搜索目录（分号分隔；图形目录与 Windows\Fonts 已在搜索链里）
 $env:DrawingView_NO_AA = "1"                                                  # 关抗锯齿（只给与 ODA 逐像素对拍；产品里别开，批次路径会慢 4 倍）
+$env:DrawingView_CLIP_IN_BLOCK = "0"                                          # 块内 XCLIP 不裁（A/B 用，默认裁）
+$env:DrawingView_NO_SPATIAL_CLIP = "1"                                        # 整体关掉 SpatialFilter 裁剪
+$env:DrawingView_CLIP_DEBUG = "1"                                             # 打印每条 XCLIP 的换算窗口与 inBlock 标记
 ```
 
 - `DwgCapture` 只认 `--in` / `--out`（早期文档写的两个位置参数是错的，实测会报 unknown argument）
