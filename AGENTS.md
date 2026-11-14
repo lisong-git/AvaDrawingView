@@ -639,6 +639,47 @@ ACadSharp 读不出来，见 P2-22）。属于"两个都是小量、方向相反
 
 `(05)` 的 `H=4301` 从此不再需要 `DrawingView_CLIP_DROP_HANDLES`。
 
+### 18. MTEXT 断行：折行的字宽必须等于画字的字宽（2026-11-14 修复）
+
+`AddMText` 里断行和画字是两条独立的度量路径，字宽因子必须**同一个值**：
+
+```
+widthFactor = \W（显式）或 STYLE 的组码 41 ─┐
+      └ 若把 \T 折进宽度（默认，见下）→ widthFactor ×= \T
+断行  TextWrap.Wrap(text, height, rectWidth, widthFactor, font)   ← 传 widthFactor
+画字  TextDraw.WidthFactor = widthFactor
+```
+
+修之前断行传的是 `wfWidth`（只含 `\W`），而画字用的是 `wfWidth × \T`。`52陶板节点/9---陶板节点 (05).dwg`
+图签"备注"块 `\H0.76x;\W0.8;\T0.8;`：画字按 0.64、断行按 0.80，断行以为每行更宽 →
+**折成 19 行，ODA 只有 10 行**，整块比参照多出 9 列、高度铺满图签格。改成同一个值后 19→16 行，
+ODA 覆盖率 92.8%→93.7%、我方漏画 11,613→10,162（回归 PASS=397 FAIL=0）。
+
+**顺带证伪一条旧建议**：不要为了"图签文字偏小"去做**逐 run `\H`**。受控基准
+`.compare/mt3.dxf`（`{\H0.76x;中文AB}{\H1.053x;中文AB}` 与 `\H0.76x;…\P\H1.053x;…` 两组）
+在 ODA 上实测：**两段等高，只认首个 `\H`**；`\W`（`.compare/mt3.dxf` 第三组 0.8/1.2）才是逐 run。
+`MTextFormat` 现在"整条取首个可见字符所在作用域"的口径是对的，别再改。
+
+**另一条已知差异（不要当 bug 修）**：受控基准 `.compare/wrap4.dxf`（29 个汉字 / 字高 40 /
+组码 41 栏宽 400）在 ODA 上是**一行不折**（单位宽 2,272），我们是折成 6 行。也就是说
+**ODA/Teigha 的 MTEXT 不做自动折行**。我们保留折行是跟随 AutoCAD 语义（`RectangleWidth` 就是
+排版栏宽），代价是图签说明块的列数会比 ODA 多。判断"折行有没有问题"只能看
+① 同一实体的行数是否与 `RectangleWidth` 自洽 ② 整图指标有没有变差，不能拿 ODA 的行数当标准。
+
+### 19. 像素对拍要关抗锯齿（`--no-aa`，2026-11-14）
+
+ODA 出图几乎不做抗锯齿：同一张 `(05)` 的 161,529 个非零像素里 **99.8% 亮度 >40**；我们开 AA
+后 230,480 个非零像素里有 **65,261 落在 7~40**（每条细线两侧的灰边）。3px 容差 + 阈值 40 的
+口径下，这批灰边会被判成「漏画」—— 实测关掉 AA 后 ODA 覆盖率 93.7%→**95.4%**、漏画
+10,162→**7,492**，多画几乎不动（5,402→5,102）。
+
+```powershell
+dotnet run --project tools\DwgCapture -c Release -- --in a.dwg --out a.png --no-aa   # 或 DrawingView_NO_AA=1
+```
+
+`DrawingView.Antialias` 默认 `true`，**产品里不要关**：关闭后批次路径从 43.9ms 恶化到 179.2ms
+（Skia 走不到细线快速路径）。它只服务"与 ODA 逐像素对拍"这一个用途。
+
 ## 已知踩坑（重要）
 
 ### ACadSharp 3.4.9 API（与旧版/文档差异大）

@@ -489,6 +489,39 @@ void RunMTextSample(string path)
     if (wrapped is not null)
         Check(Near(wrapped.LineSpacingFactor, TextMetrics.LineSpacingFactor, 1e-3f),
               $"未指定行距倍数时用默认 1.667（实际 {wrapped.LineSpacingFactor:F3}）");
+
+    // ---- 断行的字宽必须等于画字的字宽（2026-11-14）----
+    // `\W0.8;\T0.8;` 折进绘制宽度后是 0.64；断行若还按 0.8 量，会以为每行更宽 → 提前折行。
+    // 实测 52陶板节点/9---陶板节点 (05).dwg 图签"备注"块因此折成 19 行（ODA 10 行）。
+    // 这里用内存实体钉住：行数必须等于「按 0.64 折」的结果，而不是「按 0.8 折」的结果。
+    {
+        const string cjkLine = "此设计图纸之版权归深圳市三鑫幕墙工程有限公司所有未加盖印章甲乙丙丁";
+        var mt = new ACadSharp.Entities.MText
+        {
+            Value = @"\W0.8;\T0.8;" + cjkLine,
+            InsertPoint = new CSMath.XYZ(0, 0, 0),
+            Height = 10,
+            AttachmentPoint = ACadSharp.Entities.AttachmentPointType.TopLeft,
+            RectangleWidth = 100,
+        };
+        var doc = new ACadSharp.CadDocument();
+        doc.Entities.Add(mt);
+        var td = new GeometryConverter().Convert(doc).FirstOrDefault(e => e.Text is not null)?.Text;
+        Check(td is not null, "MTEXT（\\W0.8;\\T0.8;）产出 TextDraw");
+        if (td is not null)
+        {
+            Check(Near(td.WidthFactor, 0.64f, 1e-3f),
+                  $"\\W0.8 × \\T0.8 折进宽度的结果 = 0.64（实际 {td.WidthFactor:F3}）");
+            int folded = TextWrap.Wrap(cjkLine, 10f, 100f, 0.64f, td.Font).Split('\n').Length;
+            int unfolded = TextWrap.Wrap(cjkLine, 10f, 100f, 0.80f, td.Font).Split('\n').Length;
+            int actual = td.Text.Split('\n').Length;
+            Check(folded < unfolded, $"两种字宽确实折出不同行数（0.64 → {folded} 行，0.80 → {unfolded} 行）");
+            Check(actual == folded,
+                  $"断行按画字的字宽 0.64（实际 {actual} 行，按 0.80 会是 {unfolded} 行）");
+            float widest = td.Text.Split('\n').Max(l => td.Font.MeasureWidth(l, td.Height) * td.WidthFactor);
+            Check(widest <= 100.5f, $"折行后最宽一行不超过栏宽 100（实际 {widest:F2}）");
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 大坐标 float32 精度（P2-8）

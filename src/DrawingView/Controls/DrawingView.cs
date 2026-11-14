@@ -774,6 +774,19 @@ public class DrawingView : Control
     public static bool RenderSplitEnabled { get; } =
         Environment.GetEnvironmentVariable("DrawingView_RENDER_SPLIT") == "1";
 
+    /// <summary>
+    /// 全部画笔的抗锯齿开关（默认开）。<b>只给像素对拍用</b>：ODA 出图几乎不做抗锯齿
+    /// （实测 161,529 个非零像素里 99.8% 亮度 &gt;40），我们开 AA 后每条细线四周都带一圈
+    /// 灰边（同一张图 230,480 个非零像素里 65,261 落在 7~40），阈值一卡就把"我们画了但更淡"
+    /// 判成漏画。对拍时关掉，两边的墨迹口径才可比。
+    ///
+    /// <para><b>不要在产品里关</b>：实测关掉会让批次路径从 43.9ms 恶化到 179.2ms
+    /// （Skia 走不到细线快速路径）。所以默认 true，由 <c>--no-aa</c> /
+    /// <c>DrawingView_NO_AA=1</c> 显式打开。</para>
+    /// </summary>
+    public static bool Antialias { get; set; } =
+        Environment.GetEnvironmentVariable("DrawingView_NO_AA") != "1";
+
     /// <summary>批次路径累计耗时（Stopwatch ticks）。</summary>
     public static long TicksBucketPass;
     /// <summary>文本 pass 累计耗时。</summary>
@@ -1247,12 +1260,11 @@ public class DrawingView : Control
             float hairline = 1f / MathF.Max(_zoom, 1e-6f);
 
             // 每帧只分配 3 个 paint（而非每实体一个）。
-            // 注意：这里刻意保持 IsAntialias = true —— 实测关闭批次抗锯齿会让这一档
-            // 从 43.9ms 恶化到 179.2ms（Skia 走不到细线快速路径），故不采用
-            // ReadCAD 的 EnableBulkLineAntialias=false 设置。
-            using var stroke = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Stroke };
-            using var fill = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Fill };
-            using var textPaint = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Fill };
+            // 抗锯齿默认开：实测关闭批次抗锯齿会让这一档从 43.9ms 恶化到 179.2ms
+            // （Skia 走不到细线快速路径）。对拍时才用 --no-aa 关（见 Antialias 注释）。
+            using var stroke = new SKPaint { IsAntialias = Antialias, Style = SKPaintStyle.Stroke };
+            using var fill = new SKPaint { IsAntialias = Antialias, Style = SKPaintStyle.Fill };
+            using var textPaint = new SKPaint { IsAntialias = Antialias, Style = SKPaintStyle.Fill };
 
             var baked = _list.Baked;
             // 分段计时（仅在诊断开关打开时记录；关掉时 diag=false，下面的 if 全部跳过）
@@ -1303,14 +1315,14 @@ public class DrawingView : Control
             {
                 using var dimCover = new SKPaint
                 {
-                    IsAntialias = true,
+                    IsAntialias = Antialias,
                     Style = SKPaintStyle.Stroke,
                     Color = _bg,
                     StrokeWidth = hairline * 3,
                 };
                 using var dimDraw = new SKPaint
                 {
-                    IsAntialias = true,
+                    IsAntialias = Antialias,
                     Style = SKPaintStyle.Stroke,
                     StrokeWidth = hairline,
                 };
@@ -1344,21 +1356,21 @@ public class DrawingView : Control
             {
                 using var hlGlow = new SKPaint
                 {
-                    IsAntialias = true,
+                    IsAntialias = Antialias,
                     Style = SKPaintStyle.Stroke,
                     Color = new SKColor(0, 120, 215, 80),
                     StrokeWidth = hairline * 6,
                 };
                 using var hlStroke = new SKPaint
                 {
-                    IsAntialias = true,
+                    IsAntialias = Antialias,
                     Style = SKPaintStyle.Stroke,
                     Color = new SKColor(0, 120, 215),
                     StrokeWidth = hairline * 2,
                 };
                 using var hlFill = new SKPaint
                 {
-                    IsAntialias = true,
+                    IsAntialias = Antialias,
                     Style = SKPaintStyle.Fill,
                     Color = new SKColor(0, 120, 215, 70),
                 };
@@ -1386,10 +1398,10 @@ public class DrawingView : Control
             {
                 using var ovStroke = new SKPaint
                 {
-                    IsAntialias = true,
+                    IsAntialias = Antialias,
                     Style = SKPaintStyle.Stroke,
                 };
-                using var ovFill = new SKPaint { IsAntialias = true, Style = SKPaintStyle.Fill };
+                using var ovFill = new SKPaint { IsAntialias = Antialias, Style = SKPaintStyle.Fill };
 
                 // 虚线段长按世界单位给（hairline 的倍数）→ 屏幕观感不随缩放变化。
                 SKPathEffect? dash = null;
@@ -1609,7 +1621,7 @@ public class DrawingView : Control
         /// </summary>
         private void DrawPointMarks(SKCanvas canvas, IEnumerable<CadEntity> entities, SKRect worldRect, float viewportH)
         {
-            using var paint = new SKPaint { IsAntialias = true, StrokeWidth = 1f };
+            using var paint = new SKPaint { IsAntialias = Antialias, StrokeWidth = 1f };
 
             Dictionary<(uint Color, int SizeEighth), (List<SKPoint> Pts, HashSet<long> Seen)>? dots = null;
             Dictionary<uint, SKPath>? symbols = null;

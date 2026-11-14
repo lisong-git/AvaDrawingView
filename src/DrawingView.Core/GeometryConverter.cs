@@ -2041,7 +2041,7 @@ public sealed class GeometryConverter
         double oblique = 0;
         double height = mt.Height * Math.Max(0.05, fmt.HeightFactor);
 
-        // ---- 断行：组码 41（RectangleWidth）是 AutoCAD 的排版栏宽，超过就折行 ----
+        // 断行：组码 41（RectangleWidth）是 AutoCAD 的排版栏宽，超过就折行 ----
         // 断行按**本条文字实际会用的字体**逐字量宽：用默认字体的宽度断行，
         // 换成宋体之后行会断得太早（宋体比雅黑窄两成），排版立刻跑偏。
         var text = raw ?? string.Empty;
@@ -2054,8 +2054,12 @@ public sealed class GeometryConverter
             // 图签"备注"块：\W0.8 时每行只排 21 字（应为 25 字），整块多出 7 行、长度多 43%，
             // 与 ODA 差出半个图签格。\T（字间距）不参与：CJK 字距本来就是全角，
             // ODA 反解得 \W0.8 的每字步进 = em×0.8，没有 \T 那一层。
-            // 宽度用 wfWidth（\W 优先、否则样式 41），与下面真正画字时的字宽同源。
-            text = TextWrap.Wrap(text, (float)height, rectWidth, (float)wfWidth, textFont);
+            //
+            // **必须传 widthFactor 而不是 wfWidth**（2026-11-14 修）：\T 折进绘制宽度后
+            // 实际画字用的是 wfWidth×Tracking（备注块 = 0.8×0.8 = 0.64），断行若仍按 0.8 量，
+            // 会以为每行更宽 → 提前折行。实测该块折成 19 行（ODA 10 行）、整块多出 9 列、
+            // 与 ODA 差出半个图签格。断行与画字必须同一个字宽。
+            text = TextWrap.Wrap(text, (float)height, rectWidth, (float)widthFactor, textFont);
 
         // 行距：AutoCAD 单倍 = 1.667 × 字高；组码 44（LineSpacing）是倍数，默认 1.0
         float spacingFactor = TextMetrics.LineSpacingFactor

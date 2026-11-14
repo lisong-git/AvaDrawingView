@@ -16,7 +16,7 @@ namespace DwgCapture;
 /// 不显示窗口，适合被 DSH 插件以文件交接方式调用：
 ///
 ///   DwgCapture --in drawing.dwg --out shot.png --report shot.json
-///              [--width 1600] [--height 900] [--background black|white]
+///              [--width 1600] [--height 900] [--background black|white] [--no-aa]
 ///              [--all] [--lod 0] [--hide-layer 图层名] [--drop-clip-handle 句柄]
 ///
 /// 背景默认黑色（与 AutoCAD 模型空间一致，方便和 OdaShot 的同 rect 图直接对比）。
@@ -259,7 +259,7 @@ internal static class Program
         DwgCapture --in <dwg path> --out <png path> [--report <json path>]
                    [--width 1600] [--height 900] [--background black|white]
                    [--all] [--lod 0] [--hide-layer 图层名] [--drop-clip-handle 句柄] [--layout <布局名>] [--lineweights] [--zoom 1]
-                     [--rect left,top,right,bottom] [--rect-pad 1.0]
+                     [--rect left,top,right,bottom] [--rect-pad 1.0] [--no-aa]
 
         Exit codes: 0 success, 2 bad arguments, 3 input missing, 4 parse failure,
         5 render/write failure. The report (if requested) is written for failures too.
@@ -322,6 +322,11 @@ internal static class Program
                     break;
                 case "--hide-layer":
                     options.HideLayers.Add(Next());
+                    break;
+                case "--no-aa":
+                    // 像素对拍专用：ODA 出图几乎不做抗锯齿，我们开 AA 后细线四周带灰边，
+                    // 阈值一卡就把"画了但更淡"判成漏画。产品里别关（批次路径会慢 4 倍）。
+                    DrawingView.Controls.DrawingView.Antialias = false;
                     break;
                 case "--drop-clip-handle":
                     // 十进制句柄（与 --report / 诊断输出里的 H= 一致，非十六进制）

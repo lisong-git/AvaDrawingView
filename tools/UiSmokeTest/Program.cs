@@ -157,6 +157,24 @@ int Run(string[] argv)
     Check(rendered, "连续 5 帧渲染不抛异常");
     if (error is not null) Log($"       {error}");
 
+    // ---------- 5b. 关抗锯齿开关真的生效（--no-aa / DrawingView_NO_AA=1）----------
+    // 判据：AA 打开时每条细线两侧有一圈暗边（通道值 8~40），关掉后这些像素应基本消失。
+    // 这个开关只服务"与 ODA 逐像素对拍"（ODA 出图几乎不做 AA），产品里默认开。
+    Check(DrawingView.Controls.DrawingView.Antialias, "抗锯齿默认开（产品口径）");
+    view.InvalidateVisual();
+    window.CaptureRenderedFrame();
+    int dimAa = CountDimInk(window.CaptureRenderedFrame());
+    DrawingView.Controls.DrawingView.Antialias = false;
+    view.InvalidateVisual();
+    window.CaptureRenderedFrame();
+    int dimNoAa = CountDimInk(window.CaptureRenderedFrame());
+    DrawingView.Controls.DrawingView.Antialias = true;
+    view.InvalidateVisual();
+    window.CaptureRenderedFrame();
+    Log($"       暗边像素：AA 开 {dimAa}，AA 关 {dimNoAa}");
+    Check(dimAa > 0 && dimNoAa >= 0, $"两种模式都取到像素（{dimAa} / {dimNoAa}）");
+    Check(dimAa > dimNoAa * 3, $"关掉抗锯齿后细线暗边显著减少（{dimAa} → {dimNoAa}）");
+
     // ---------- 6. 双击中键适应窗口（AutoCAD 语义；基准 = 适应窗口应有的缩放） ----------
     view.FitToContent();
     double fitted = view.Viewport.Zoom;
@@ -453,6 +471,33 @@ static bool WaitUntil(Func<bool> condition, int timeoutMs)
         Thread.Sleep(50);
     }
     return condition();
+}
+
+/// <summary>
+/// 数"暗边"像素：最大通道落在 8~40 之间。抗锯齿在细线两侧留下的正是这一档，
+/// ODA 出图几乎全无（99.8% 的非零像素 > 40）。用来判断 --no-aa 是否真的生效。
+/// </summary>
+static int CountDimInk(WriteableBitmap? frame)
+{
+    if (frame is null) return -1;
+    using var fb = frame.Lock();
+    bool bgra = fb.Format == PixelFormat.Bgra8888;
+    int w = fb.Size.Width, h = fb.Size.Height, stride = fb.RowBytes;
+    var row = new byte[stride];
+    int count = 0;
+    for (int y = 0; y < h; y++)
+    {
+        Marshal.Copy(IntPtr.Add(fb.Address, y * stride), row, 0, stride);
+        for (int x = 0; x < w; x++)
+        {
+            int o = x * 4;
+            int c0 = row[o], c1 = row[o + 1], c2 = row[o + 2];
+            int r = bgra ? c2 : c0, g = c1, b = bgra ? c0 : c2;
+            int m = Math.Max(r, Math.Max(g, b));
+            if (m >= 8 && m <= 40) count++;
+        }
+    }
+    return count;
 }
 
 static int CountMagenta(WriteableBitmap? frame)

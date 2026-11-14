@@ -63,7 +63,7 @@ dotnet run --project tools\PerfProbe -- "D:\path\to.dwg"   # 性能基准（--lo
 dotnet run --project tools\SampleGen        # 重新生成 samples\ 下的样例图纸（含 sample_far.dxf 大坐标样例）
 dotnet run --project tools\BlockExport -- "D:\path\to.dwg" "D:\out" --referenced   # 按块导出独立 DWG
 dotnet run --project tools\ShapeExport -- "D:\path\to.dwg" "D:\out"               # 按相交分组导出独立 DWG
-dotnet run --project tools\DwgCapture -- --in "D:\path\to.dwg" --out "D:\out\shot.png"   # 无头渲染 PNG（默认黑底，--background white 出白底）
+dotnet run --project tools\DwgCapture -- --in "D:\path\to.dwg" --out "D:\out\shot.png"   # 无头渲染 PNG（默认黑底；--background white 出白底；--no-aa 关抗锯齿供与 ODA 对拍）
 ```
 
 一键跑完构建 + 两项冒烟（结果汇总到 `.regress.log`）：
@@ -85,10 +85,13 @@ dotnet run --project tools\PerfProbe  -- --fonts "D:\图集" --min-kb 200 --limi
 $env:DrawingView_NO_REGION = "1"                                              # 关掉 REGION 轮廓，做像素 A/B
 $env:DrawingView_RENDER_SPLIT = "1"                                           # 绘制分段耗时（配合 PerfProbe）
 $env:DrawingView_FONT_PATH = "D:\ACAD\Fonts"                                 # SHX 字体搜索目录（分号分隔；图形目录与 Windows\Fonts 已在搜索链里）
+$env:DrawingView_NO_AA = "1"                                                  # 关抗锯齿（只给与 ODA 逐像素对拍；产品里别开，批次路径会慢 4 倍）
 ```
 
 - `DwgCapture` 只认 `--in` / `--out`（早期文档写的两个位置参数是错的，实测会报 unknown argument）
 - `--rect left,top,right,bottom`：只渲染指定世界坐标窗口，用于同一定点区域的开/关对照
+- `--no-aa`：关掉画笔抗锯齿。ODA 出图几乎不做抗锯齿，开 AA 时细线两侧的灰边（亮度 7~40）
+  会被阈值判成「漏画」；同一张 `(05)` 实测覆盖率 93.7%→95.4%、漏画 10,162→7,492
 - `--report` 的 JSON 含 `regionEntities / regionLoops / regionUnresolved / pointMarkEntities`
 - `PerfProbe --types`：实体类型直方图 + 前 14 条 SAB 记录（指针后标目标类型）；`--points` 列点实体
 - `PerfProbe --survey <dir> [--limit N] [--min-kb N] [--csv path]`：批量普查图集里的实体类型分布与
@@ -162,8 +165,11 @@ samples/                # 样例图纸
   仍回退系统字体，字形差异依旧存在；状态栏会报「N 条文字缺字库（回退 TTF）」
 - 字体族（2026-11-13，P2-16）：混排（"备注 Notes"）整条落**一个**字体，不做 AutoCAD 那种
   「西文走主字体、中文走大字体」的逐字符分流；`\H` 相对高度取首个值作用于整条
-  （AutoCAD 是逐 run）—— `9---陶板节点 (05)` 图签说明首段 `\H0.76x`、次段 `\H1.053x`，
-  我们统一按 0.76x。两者都是**排版**层面的遗留项，与字体选择无关
+  —— `9---陶板节点 (05)` 图签说明首段 `\H0.76x`、次段 `\H1.053x`，我们统一按 0.76x。
+  这是**ODA 实测口径**（受控基准 `mt3.dxf` 两段等高），不是遗漏，别改成逐 run
+- MTEXT 折行：我们按 `RectangleWidth` 折（AutoCAD 语义），但 **ODA/Teigha 不折**
+  （受控基准 `wrap4.dxf`：29 字、栏宽 400、单位宽 2,272，ODA 仍画一行）。
+  所以图签说明块的列数会比 ODA 多，属已知差异，不要拿 ODA 的行数当标准
 - SHX 大字体的字宽取**字身框**（`ShxFont.AdvanceUnits` = 左沿中位数 + 右沿中位数），
   不是字高也不是字形结束点：gbcbig 实际是 0.73 em 的压缩字身框，按字高走每行会宽 37%；
   汉字的**字间微调（kern）**仍未做
