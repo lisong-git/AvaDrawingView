@@ -33,11 +33,16 @@
 - **线程模型**：解析/转换/索引在后台线程完成后产出不可变 `DisplayList`，引用替换交给渲染线程，渲染回调只读无锁
 - **资源生命周期**：`DisplayList` 持有原生 `SKPath`（GC 看不见），用 `AddRef`/`Release` 引用计数——绘制操作在构造时 `AddRef`、`Dispose` 时 `Release`，UI 线程换图时 `Release` 旧实例。计数归零才真正释放，避免"渲染线程还在画、UI 线程已释放"的用例
 - **精度**：圆/弧用圆锥曲线（任意缩放不失真），椭圆/样条压平
-- **文本包围盒**：走 `TextMetrics` 用真实字体度量（`MeasureLocalBounds` + `ToWorldBounds`），与渲染共用同一 `SKTypeface`，保证"适应窗口"的范围与屏幕墨迹一致
+- **文本包围盒**：走 `TextMetrics` 用真实字体度量（`MeasureLocalBounds` + `ToWorldBounds`），与渲染共用同一份字体对象，保证"适应窗口"的范围与屏幕墨迹一致
+- **字体族**（`TextFont` + `TextFontLibrary`，2026-11-13）：字体按 STYLE 的字体字段解析，
+  不再全局硬编码微软雅黑 —— 写 TTF 就按文件名找，写 SHX 就用 AutoCAD 自带的同名 TrueType 替身
+  （`romans.shx→romans__.ttf`、`simplex.shx→simplex_.ttf`、`txt.shx→monotxt_.ttf`），
+  大字体（`hztxt`/`gbcbig`/`chinese`）落宋体。解析结果挂在 `TextDraw.Font` 上，**度量与绘制用同一个对象**
+  （换字体就换 cap/em 比例，两边不一致包围盒立刻错位）。受控基准实测字宽偏差从 +29% 收到 +2.2%
 - **SHX 单线字体**（`ShxFont` + `ShxFontLibrary`）：自建 SHX 解析器，直接执行字体里的字节命令流
   （`unifont` 的 ASCII 名字前缀、`bigfont` 的 GBK 内码索引、8 分弧/凸度弧/子形全部处理），
   把文字排成折线描边，字宽与字形就是 AutoCAD 的口径；样式写 TTF 的仍走系统字体，
-  `.shx` 找不到则回退系统字体并在状态栏报数
+  `.shx` 找不到则按上面的字体族规则挑 TTF 替身，并在状态栏报数
 - **颜色**：ACI 256 色表 + TrueColor；ByLayer 解析到图层色，ByBlock 继承外层 INSERT 的解析色
 - **大图性能**（借鉴 ReadCAD 的批次缓冲 + LOD 思路，实测 5.36MB 图纸全图视角
   **7.3 FPS → 63.6 FPS**（绘制 4.5ms）；按 AutoCAD 语义跳过隐藏实体与冻结/关闭图层后，
@@ -58,7 +63,7 @@ dotnet run --project tools\PerfProbe -- "D:\path\to.dwg"   # 性能基准（--lo
 dotnet run --project tools\SampleGen        # 重新生成 samples\ 下的样例图纸（含 sample_far.dxf 大坐标样例）
 dotnet run --project tools\BlockExport -- "D:\path\to.dwg" "D:\out" --referenced   # 按块导出独立 DWG
 dotnet run --project tools\ShapeExport -- "D:\path\to.dwg" "D:\out"               # 按相交分组导出独立 DWG
-dotnet run --project tools\DwgCapture -- --in "D:\path\to.dwg" --out "D:\out\shot.png"   # 无头渲染 PNG
+dotnet run --project tools\DwgCapture -- --in "D:\path\to.dwg" --out "D:\out\shot.png"   # 无头渲染 PNG（默认黑底，--background white 出白底）
 ```
 
 一键跑完构建 + 两项冒烟（结果汇总到 `.regress.log`）：
@@ -155,6 +160,10 @@ samples/                # 样例图纸
 - 大图纸优化：SKPicture 静态层录制、分块缓存、块实例复用（当前 INSERT 为烘焙克隆）
 - SHX 单线字体**已支持**（2026-10-22）：缺字库时（本机没有 `tssdeng.shx`/`hztxt.shx`/`jrs.shx`）
   仍回退系统字体，字形差异依旧存在；状态栏会报「N 条文字缺字库（回退 TTF）」
+- 字体族（2026-11-13，P2-16）：混排（"备注 Notes"）整条落**一个**字体，不做 AutoCAD 那种
+  「西文走主字体、中文走大字体」的逐字符分流；`\H` 相对高度取首个值作用于整条
+  （AutoCAD 是逐 run）—— `9---陶板节点 (05)` 图签说明首段 `\H0.76x`、次段 `\H1.053x`，
+  我们统一按 0.76x。两者都是**排版**层面的遗留项，与字体选择无关
 - SHX 大字体的字宽取**字身框**（`ShxFont.AdvanceUnits` = 左沿中位数 + 右沿中位数），
   不是字高也不是字形结束点：gbcbig 实际是 0.73 em 的压缩字身框，按字高走每行会宽 37%；
   汉字的**字间微调（kern）**仍未做

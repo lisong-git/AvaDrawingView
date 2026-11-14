@@ -16,8 +16,10 @@ namespace DwgCapture;
 /// 不显示窗口，适合被 DSH 插件以文件交接方式调用：
 ///
 ///   DwgCapture --in drawing.dwg --out shot.png --report shot.json
-///              [--width 1600] [--height 900] [--background white|black]
-///              [--all] [--lod 0]
+///              [--width 1600] [--height 900] [--background black|white]
+///              [--all] [--lod 0] [--hide-layer 图层名] [--drop-clip-handle 句柄]
+///
+/// 背景默认黑色（与 AutoCAD 模型空间一致，方便和 OdaShot 的同 rect 图直接对比）。
 ///
 /// 退出码：0 成功；2 参数错误；3 输入不存在；4 解析失败；5 渲染/写文件失败。
 /// 报告文件始终尽力写出，调用方据此拿到结构化错误。
@@ -101,13 +103,30 @@ internal static class Program
             };
             window.Show();
 
+            // --hide-layer 走**转换期**过滤：渲染期 SetLayerHidden 只对合批几何生效，
+            // UnbatchedEntities（文字/点标记/带裁剪图元）会漏，定位"多出来的东西"时不靠谱。
             var convertOptions = string.IsNullOrWhiteSpace(options.Layout)
+                                 && options.HideLayers.Count == 0
+                                 && options.DropClipHandles.Count == 0
                 ? null
-                : new GeometryConvertOptions { LayoutName = options.Layout };
+                : new GeometryConvertOptions
+                {
+                    LayoutName = options.Layout,
+                    HideLayers = options.HideLayers.Count == 0 ? null : options.HideLayers,
+                    DropClipHandles = options.DropClipHandles.Count == 0 ? null : options.DropClipHandles,
+                };
             list = CadDocumentLoader.LoadAsync(input, null, default, convertOptions).GetAwaiter().GetResult();
             view.SetDisplay(list);
             window.CaptureRenderedFrame(); // 完成布局并触达首帧
-            if (options.Rect is { } focus) view.ZoomTo(focus);
+            // padding=1：--rect 出图的映射就是「世界矩形 = 画面」，一像素一世界单位，
+            // 才能和 ODA 的 --rect 逐像素对拍（1.2 的留白只能靠猜比例还原）
+            if (options.Rect is { } focus)
+            {
+                view.ZoomTo(focus, options.RectPadding);
+                // Viewport.Fit 里带一个固定的 0.9「留白」系数，抵消掉才能做到
+                // 「1 像素 = 1 世界单位」，与 ODA --rect 的映射严格一致
+                view.ZoomBy(1f / 0.9f);
+            }
             else
             {
                 view.FitToContent(coreOnly: !options.AllExtents);
@@ -166,6 +185,9 @@ internal static class Program
             regionEntities = list.RegionEntities,
             regionLoops = list.RegionLoops,
             regionUnresolved = list.RegionUnresolved,
+            spatialClipped = list.SpatialClipped,
+            layerFiltered = list.LayerFiltered,
+            fonts = list.FontUsage,
             extents = Rect(list.Extents),
             coreExtents = Rect(list.CoreExtents),
             pngBytes = bytes,
@@ -235,9 +257,9 @@ internal static class Program
     private static string Usage() =>
         """
         DwgCapture --in <dwg path> --out <png path> [--report <json path>]
-                   [--width 1600] [--height 900] [--background white|black]
-                   [--all] [--lod 0] [--layout <布局名>] [--lineweights] [--zoom 1]
-                     [--rect left,top,right,bottom]
+                   [--width 1600] [--height 900] [--background black|white]
+                   [--all] [--lod 0] [--hide-layer 图层名] [--drop-clip-handle 句柄] [--layout <布局名>] [--lineweights] [--zoom 1]
+                     [--rect left,top,right,bottom] [--rect-pad 1.0]
 
         Exit codes: 0 success, 2 bad arguments, 3 input missing, 4 parse failure,
         5 render/write failure. The report (if requested) is written for failures too.
@@ -293,6 +315,19 @@ internal static class Program
                     options.Rect = SKRect.Create(l, t, MathF.Abs(r2 - l), MathF.Abs(b2 - t));
                     break;
                 }
+                case "--rect-pad":
+                    if (!float.TryParse(Next(), out var pad) || pad < 1f || pad > 10f)
+                        throw new ArgumentException("--rect-pad must be a number in [1, 10]");
+                    options.RectPadding = pad;
+                    break;
+                case "--hide-layer":
+                    options.HideLayers.Add(Next());
+                    break;
+                case "--drop-clip-handle":
+                    // 十进制句柄（与 --report / 诊断输出里的 H= 一致，非十六进制）
+                    if (!ulong.TryParse(Next(), out var dropHandle)) throw new ArgumentException("--drop-clip-handle 需要十进制句柄");
+                    options.DropClipHandles.Add(dropHandle);
+                    break;
                 case "--lod":
                     if (!float.TryParse(Next(), out var lod) || lod < 0 || lod > 10000)
                         throw new ArgumentException("--lod must be a number in 0..10000");
@@ -313,13 +348,22 @@ internal static class Program
         public string? ReportPath;
         public int Width = 1600;
         public int Height = 900;
-        public SKColor Background = SKColors.White;
+        /// <summary>
+        /// 默认黑底：与 AutoCAD 模型空间 / ODA 参考渲染一致，出图可直接对拍。
+        /// 需要白底（打印稿观感、旧基线复现）时显式传 <c>--background white</c>。
+        /// </summary>
+        public SKColor Background = SKColors.Black;
         public SKRect? Rect;
+        public float RectPadding = 1f;
         public bool AllExtents;
         public float Lod;
         public string? Layout;
         public bool LineWeights;
         public float Zoom = 1f;
+        /// <summary>诊断用：按图层名隐藏（可重复）。定位"哪个图层画出了多余内容"时逐层排除。</summary>
+        public List<string> HideLayers = new();
+        /// <summary>这些句柄的空间过滤器边界不可信时整块丢弃（AutoCAD 实测确认过时才加）。</summary>
+        public List<ulong> DropClipHandles = new();
         public bool Help;
     }
 }

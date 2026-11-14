@@ -448,7 +448,9 @@ void RunMTextSample(string path)
         var lines = wrapped.Text.Split('\n');
         Check(lines.Length >= 2, $"栏宽 60 的超长文本被折成多行（实际 {lines.Length} 行）");
         Check(string.Concat(lines) == new string('W', 40), "折行不丢字（拼接后与原串一致）");
-        float widest = lines.Max(l => TextMetrics.MeasureWidth(l, wrapped.Height));
+        // 量宽度必须用**该文字自己的字体**（P2-16）：断行也是按它折算的，
+        // 换成默认字体量会得到"比栏宽还宽"的假失败（实测 107.63 vs 栏宽 60）
+        float widest = lines.Max(l => wrapped.Font.MeasureWidth(l, wrapped.Height));
         Check(widest <= 60.5f, $"每行宽度不超过栏宽 60（最宽行 {widest:F2}）");
         Check(widest > 45f, $"行宽接近栏宽而不是保守地只放一个字（最宽行 {widest:F2}）");
     }

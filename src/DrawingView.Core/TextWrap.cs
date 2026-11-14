@@ -21,7 +21,12 @@ public static class TextWrap
     /// </summary>
     /// <param name="capHeight">字高（CAD 口径 = 大写字高），用于度量。</param>
     /// <param name="widthFactor">宽度因子（TEXT 用；MTEXT 恒为 1，保留参数以便复用）。</param>
-    public static string Wrap(string text, float capHeight, float maxWidth, float widthFactor = 1f)
+    /// <param name="font">
+    /// 度量用字体。必须传**这条文字实际会用的那个**：宋体比雅黑窄两成，
+    /// 用默认字体断行会让整段文字提前折行（P2-16）。
+    /// </param>
+    public static string Wrap(string text, float capHeight, float maxWidth, float widthFactor = 1f,
+                              TextFont? font = null)
     {
         if (string.IsNullOrEmpty(text) || maxWidth <= 0f || capHeight <= 0f) return text;
 
@@ -32,12 +37,13 @@ public static class TextWrap
         for (int li = 0; li < lines.Length; li++)
         {
             if (li > 0) result.Append('\n');
-            WrapLine(lines[li], capHeight, maxWidth / wf, result);
+            WrapLine(lines[li], capHeight, maxWidth / wf, result, font ?? TextFont.Default);
         }
         return result.ToString();
     }
 
-    private static void WrapLine(string line, float capHeight, float maxWidth, System.Text.StringBuilder sink)
+    private static void WrapLine(string line, float capHeight, float maxWidth, System.Text.StringBuilder sink,
+                                 TextFont font)
     {
         if (line.Length == 0) return;
 
@@ -48,7 +54,7 @@ public static class TextWrap
         for (int i = 0; i < line.Length; i++)
         {
             char c = line[i];
-            float adv = TextMetrics.CharAdvance(c, capHeight);
+            float adv = font.CharAdvance(c, capHeight);
 
             // 超过栏宽：在最近的可断点处断，没有可断点就硬断
             if (acc + adv > maxWidth && i > start)

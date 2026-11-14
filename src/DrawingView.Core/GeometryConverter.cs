@@ -24,6 +24,21 @@ public sealed class GeometryConvertOptions
     /// 不开这个开关的表现是"整张白屏"，比"渲染了布局"更容易被误判成打不开。
     /// </summary>
     public bool AutoPaperSpaceWhenModelEmpty { get; init; } = true;
+
+    /// <summary>
+    /// 转换期按图层名跳过（大小写不敏感）。null / 空 = 不过滤。
+    ///
+    /// <para>与渲染期 <c>SetLayerHidden</c> 的区别：后者只对合批几何生效，
+    /// <c>UnbatchedEntities</c>（文字、点标记、带裁剪图元）不受影响；诊断"多出来一块东西
+    /// 到底是哪个图层画的"必须用这个开关。</para>
+    /// </summary>
+    public IReadOnlyCollection<string>? HideLayers { get; init; }
+
+    /// <summary>
+    /// 这些顶层实体的句柄，其"边界失效的空间过滤器"一律**整块丢弃**（覆盖默认的框内兜底）。
+    /// 与 <c>DrawingView_CLIP_DROP_HANDLES</c> 叠加生效，用于已用 AutoCAD 实测确认过的图纸。
+    /// </summary>
+    public IReadOnlyCollection<ulong>? DropClipHandles { get; init; }
 }
 
 /// <summary>
@@ -95,6 +110,23 @@ public sealed class GeometryConverter
 
     /// <summary>样式名 → (字体文件, 大字体文件, 是否竖排)。SHX 排版要用它把文字映射到字库。</summary>
     private readonly Dictionary<string, (string Font, string Big, bool Vertical)> _styleFonts = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 样式名 → 组码 41 的宽度因子。**只有 MTEXT 用它**：MTEXT 在 DXF 里没有实体级字宽字段，
+    /// 没有内联 <c>\W</c> 时 AutoCAD/ODA 就是拿样式宽度作字宽（受控基准 <c>.compare/mtstyle.dxf</c>）。
+    /// TEXT 反过来只认实体 41，见 <see cref="AddText"/> 的注释。
+    /// </summary>
+    private readonly Dictionary<string, float> _styleWidths = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 字体使用统计：字体名（含来源标注）→ 用它画了多少条 TTF 文字。
+    /// 用途是让 <c>DwgCapture --report</c> 能直接看出"这张图到底用了哪些字体、多少条是兜底"。
+    /// SHX 走描边那条路，不计入这里。
+    /// </summary>
+    private readonly Dictionary<string, int> _fontUsage = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>本图用到的字体及其条数（诊断用）。</summary>
+    public IReadOnlyDictionary<string, int> FontUsage => _fontUsage;
     /// <summary>文件头的 PDMODE（诊断用：0 点 / 1 不画 / 2 十字 / 3 叉 / 4 竖线，+32 圆 +64 方）。</summary>
     public int PointDisplayMode => _pointDisplayMode;
     /// <summary>文件头的 PDSIZE（诊断用：&gt;0 世界单位 / &lt;0 视高百分比 / =0 默认 5%）。</summary>
@@ -109,6 +141,148 @@ public sealed class GeometryConverter
     /// <summary>视口裁剪掉的实体数（布局渲染诊断用）。</summary>
     public int ClippedAway { get; private set; }
 
+    /// <summary>
+    /// 被**实体级空间过滤器**（<c>XDictionary: ACAD_FILTER → SPATIAL</c>，即 XCLIP / 局部打开
+    /// 遗留的裁剪边界）整块裁掉的实体数。
+    /// </summary>
+    public int SpatialClipped { get; private set; }
+
+    /// <summary>
+    /// 是否按实体级空间过滤器裁剪。<c>DrawingView_NO_SPATIAL_CLIP=1</c> 可关闭，
+    /// 用于与不认裁剪的第三方渲染器做 A/B 对照。
+    /// </summary>
+    private static readonly bool SpatialClipEnabled =
+        Environment.GetEnvironmentVariable("DrawingView_NO_SPATIAL_CLIP") != "1";
+
+    /// <summary>
+    /// MTEXT 的 <c>\T</c>（字间距）是否折进字宽。默认折；<c>DrawingView_MTEXT_TRACKING=raw</c> 不折。
+    ///
+    /// <para>AutoCAD 的 <c>\T</c> 语义是"首个字之后每个字压缩"，不是"整串缩放"：
+    /// 受控基准 `mt.dxf` 反解 ODA —— `\W0.8` 把宽度压到 0.80，`\T0.75` 只压到 **0.936**
+    /// （2 个字只有 1 个间隙可压）；按同一模型，20 个字应压到 0.76。我们没有逐字排版通道，
+    /// 只能整串缩，于是**短串偏压、长串刚好**。`(05)` 图纸主体 ±2px 命中率实测：
+    /// 折 95.8% / 不折 94.0%（该图 \`\T\` 多出现在长串说明文字上）→ 默认折。</para>
+    /// </summary>
+    private static readonly bool s_mtextFoldTracking =
+        Environment.GetEnvironmentVariable("DrawingView_MTEXT_TRACKING") != "raw";
+
+    /// <summary>转换期跳过的图层名（大写）；null = 不过滤。<see cref="GeometryConvertOptions.HideLayers"/> 落在这里。</summary>
+    private HashSet<string>? _hideLayers;
+
+    /// <summary>被转换期图层过滤跳过的实体数（含块内展开的）。</summary>
+    public int LayerFiltered { get; private set; }
+
+    /// <summary>本轮生效的"整块丢弃"句柄集合（环境变量 ∪ <see cref="GeometryConvertOptions.DropClipHandles"/>）。</summary>
+    private HashSet<ulong> _clipDropHandles = ClipDropHandles;
+
+    /// <summary>
+    /// 裁剪边界与本实体包围盒完全不相交时怎么处理（说明过滤器坐标系没读出来 —— ACadSharp 对
+    /// 一部分旧格式过滤器取到的 `Normal` 不是单位向量、`InsertTransform` 恒为单位阵）。
+    ///
+    /// <list type="bullet">
+    ///   <item><c>frame</c>（默认）：一律保留（退化为按图纸范围裁）—— 宁可多画；</item>
+    ///   <item><c>drop</c>：一律整块丢弃；</item>
+    ///   <item><c>auto</c>：按"实体有多大比例落在图纸范围内"决定
+    ///   （<see cref="ClipUnresolvedMinCoverage"/>）。</item>
+    /// </list>
+    ///
+    /// <para>为什么要分开留着：<c>9---陶板节点 (0).dwg</c> 有 12 个共用同一失效边界的 INSERT
+    /// （详图零件，其中一块石材 bbox 8804×8189 只有 0.4% 落在图纸内），AutoCAD 照画；整块丢弃
+    /// 会**丢掉两组零件**，`auto` 用覆盖率判也会把它们判掉。<c>9---陶板节点 (05).dwg</c> 的
+    /// `H=4301 → *U33` 方向相反 —— 9 个成员（`00--填充` 5 段竖条 + `00--标注` 4 个文字）
+    /// 大部分在图外，最下段探进图框上方，AutoCAD 与 ODA 该处均为空，保留兜底就会画出一道
+    /// 多余的折角符号。两种情况覆盖率**反相关**（0.4% 要留、17.5% 要丢），说明真正的判据不在这里，
+    /// 而在 DWG 里还没解析出来的 XCLIP 状态/边界换算 —— 故默认取保守的 <c>frame</c>。</para>
+    /// </summary>
+    private static readonly string ClipUnresolvedMode =
+        (Environment.GetEnvironmentVariable("DrawingView_CLIP_UNRESOLVED") ?? "frame").Trim().ToLowerInvariant();
+
+    /// <summary>
+    /// 手工豁免：这些句柄（十进制，逗号分隔）的"无解裁剪"一律**整块丢弃**，
+    /// 覆盖 <see cref="ClipUnresolvedMode"/> 的判断。环境变量
+    /// <c>DrawingView_CLIP_DROP_HANDLES=4301,4302</c>。
+    ///
+    /// <para>为什么需要它：XCLIP 的启用状态在 ACadSharp 暴露的字段里读不出来（两边的
+    /// `DisplayBoundary / ClipFrontPlane / ClipBackPlane / BoundaryPoints` 完全一致，XDATA 为空，
+    /// 扩展字典都只有 `ACAD_FILTER/SPATIAL`），AutoCAD 对同一种数据却给出相反结果。
+    /// 拿到实测结论的个别图纸用它兜住，比全局猜一个阈值安全。</para>
+    /// </summary>
+    private static readonly HashSet<ulong> ClipDropHandles = ParseHandleSet(
+        Environment.GetEnvironmentVariable("DrawingView_CLIP_DROP_HANDLES"));
+
+    private static HashSet<ulong> ParseHandleSet(string? raw)
+    {
+        var set = new HashSet<ulong>();
+        if (string.IsNullOrWhiteSpace(raw)) return set;
+        foreach (var part in raw.Split(',', ';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            if (ulong.TryParse(part, out var h)) set.Add(h);
+        return set;
+    }
+
+    /// <summary>
+    /// <see cref="ClipUnresolvedMode"/> 取 <c>auto</c> 时的判据：实体包围盒落在图纸范围内的
+    /// **面积占比**门槛，低于它按"被 XCLIP 裁掉了"处理、整块丢弃。
+    ///
+    /// <para>实测覆盖率：`(05)` 的 `H=4301` 17.5%，`(0)` 的 12 个 INSERT 里最小的一块石材 0.4%。
+    /// 需要丢的那个覆盖率反而更高 —— 判据反相关，`auto` 只能当诊断档用。
+    /// 环境变量 <c>DrawingView_CLIP_MIN_COVER</c> 可改（0~1）。</para>
+    /// </summary>
+    private static readonly float ClipUnresolvedMinCoverage = ResolveMinCoverage();
+
+    private static float ResolveMinCoverage()
+    {
+        var raw = Environment.GetEnvironmentVariable("DrawingView_CLIP_MIN_COVER");
+        if (float.TryParse(raw, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var v) && v >= 0 && v <= 1)
+            return v;
+        return 0.3f;
+    }
+
+    /// <summary>
+    /// 裁剪边界的坐标取法（P2-17 的标定开关，默认 <see cref="ClipXformMode.Raw"/>）：
+    /// <list type="bullet">
+    ///   <item><c>raw</c>：边界点当世界坐标直接用（实测 PE0101/PE0203 这类图纸就是这样）；</item>
+    ///   <item><c>tf</c>：只过 <c>SpatialFilter.InsertTransform</c>；</item>
+    ///   <item><c>full</c>：再过实体自身的插入矩阵（旧行为，THSYB1-11 曾按它标定）。</item>
+    /// </list>
+    /// 环境变量 <c>DrawingView_CLIP_XFORM=raw|tf|full</c>。
+    /// </summary>
+    private enum ClipXformMode { Auto, Raw, Tf, Full }
+
+    /// <summary>法向不可信的过滤器是否退化为"按图纸范围裁"（默认开）。</summary>
+    private static readonly bool BadNormalClipToSheet =
+        Environment.GetEnvironmentVariable("DrawingView_CLIP_BAD_NORMAL") != "skip";
+
+    /// <summary>
+    /// <c>InsertTransform</c> 读成单位阵（= ACadSharp 没解出来）时，改用
+    /// <c>InverseInsertTransform</c> 把边界点换算回块坐标 —— 实测这两个字段**只有一个是对的**。
+    ///
+    /// <para>实测 <c>9---陶板节点 (05).dwg</c> 的 <c>H=4301</c>：正向是单位阵，反向是
+    /// <c>translate(-54114.93, +5341.49)</c>。边界点 <c>(54024.93,-5747.26)-(54599.11,-5067.42)</c>
+    /// 过一遍反向矩阵落到块内的 <c>(-90.0,-405.8)-(484.2,274.1)</c>（x 正好整数 -90，不是巧合），
+    /// 再加插入点得到世界矩形 <c>(422.7,432.4)-(996.9,1112.2)</c> —— 正好是图框内一个合理的
+    /// XCLIP 矩形，且把图框上方那道多余折角（y≈1128）切在外面，与 AutoCAD/ODA 一致。
+    /// 而不换算时边界落在 <c>(54025,-5747)</c>（离图形 5.3 万单位），只能落到"无解兜底"。</para>
+    ///
+    /// <para>默认**开**：两张实测图纸（`(05)` 与 `(0)`，共 24 个过滤器）都是"正向坏、反向好"，
+    /// 换算后与 ODA 的匹配度同时上升：`(05)` 折角消失且不多丢内容（仅我方 5,860→5,238，
+    /// 而整块丢弃会丢到缺失 11,613→13,732）；`(0)` 覆盖率 95.3%→97.7%、命中 92.6%→98.5%、
+    /// 仅我方 13,547→2,627。换算出来落在离谱位置的那些（`(0)` 里有 (121756,…)/(174917,…)）
+    /// 与实体不相交，自然退回 <see cref="ClipUnresolvedMode"/> 的兜底，不会误裁。
+    /// 环境变量 <c>DrawingView_CLIP_INV_XFORM=0</c> 可关掉对照。</para>
+    /// </summary>
+    private static readonly bool ClipUseInverseXform =
+        Environment.GetEnvironmentVariable("DrawingView_CLIP_INV_XFORM") != "0";
+
+    /// <summary>打印每个空间过滤器的换算结果（诊断"这块为什么被裁/没裁"）。<c>DrawingView_CLIP_DEBUG=1</c>。</summary>
+    private static readonly bool ClipDebug =
+        Environment.GetEnvironmentVariable("DrawingView_CLIP_DEBUG") == "1";
+
+    private static readonly ClipXformMode ClipXform = Enum.TryParse<ClipXformMode>(
+        Environment.GetEnvironmentVariable("DrawingView_CLIP_XFORM"), ignoreCase: true, out var xf)
+        ? xf
+        : ClipXformMode.Auto;
+
     /// <summary>实际渲染的空间名（"Model" 或布局名）。</summary>
     public string ActiveSpace { get; private set; } = "Model";
 
@@ -117,6 +291,38 @@ public sealed class GeometryConverter
 
     /// <summary>视口内容的裁剪矩形（图纸坐标）；null = 不裁剪（模型空间或布局自身几何）。</summary>
     private SKRect? _clipRect;
+
+    /// <summary>
+    /// 当前生效的**空间过滤器边界多边形**（世界坐标，P2-17）。null = 不裁。
+    /// 与 <see cref="_clipRect"/> 的区别：视口永远是矩形，而 XCLIP 的边界可以是任意多边形
+    /// （实测 `THSYB1-12` 是 8 点台阶形，面积只有外接矩形的 74%）—— 按外接矩形裁会把
+    /// 缺口里的内容画出来，与 AutoCAD 不一致。
+    /// </summary>
+    private SKPath? _spatialClipPath;
+
+    private SKRect _spatialClipBounds;
+    private bool _spatialClipIsRect;
+
+    /// <summary>
+    /// 视口矩形 ∩ 空间过滤器多边形 = 本层图元真正的裁剪区域（世界坐标，闭合）。
+    /// 由 <see cref="RebuildScopeClip"/> 维护；null = 该层不裁。
+    /// </summary>
+    private SKPath? _scopeClip;
+    private SKRect _scopeClipBounds;
+    private bool _scopeClipIsRect;
+
+    /// <summary>本图创建的全部裁剪路径（所有权转移给 DisplayList，见 <see cref="ClipPaths"/>）。</summary>
+    private readonly List<SKPath> _clipPaths = new();
+
+    /// <summary>本图用到的裁剪区域，交给 <c>DisplayList</c> 统一释放。</summary>
+    public IReadOnlyList<SKPath> ClipPaths => _clipPaths;
+
+    /// <summary>
+    /// 图纸范围（文件头 EXTMIN/EXTMAX）。只用于**边界与图形脱节**的兜底：
+    /// 裁剪边界经两次变换后仍与实体不相交时，按这个范围裁 —— 与 AutoCAD 的实测表现一致
+    /// （见 <see cref="TryGetSpatialClip"/> 的标定说明与 P2-13 条目）。
+    /// </summary>
+    private SKRect? _sheetRect;
 
     /// <summary>当前视口冻结的图层（AutoCAD：视口冻结只影响该视口）。</summary>
     private HashSet<string>? _clipFrozenLayers;
@@ -175,6 +381,14 @@ public sealed class GeometryConverter
     /// 用于「有/无 REGION」的像素对照 —— 判断渲染差异到底来自 REGION 还是别的东西。
     /// </summary>
     private static readonly bool ShowRegions = Environment.GetEnvironmentVariable("DrawingView_NO_REGION") != "1";
+
+    /// <summary>
+    /// 不打印图层（PlotFlag=false，如 DEFPOINTS）是否默认隐藏 —— 对齐 ODA/打印语义。
+    /// 判据本身不可全信：ACadSharp 对部分外部导出图会把整表都读成不打印，
+    /// 因此只在「不打印图层不超过全表 1/4」时才启用（见 <c>CacheLayerColors</c>）。
+    /// 置 <c>DrawingView_SHOW_NONPLOT=1</c> 可完全关闭，用于对照实验。
+    /// </summary>
+    private static readonly bool HideNonPlotLayers = Environment.GetEnvironmentVariable("DrawingView_SHOW_NONPLOT") != "1";
     private static readonly string TracePath = Path.Combine(Path.GetTempPath(), "conv_trace.log");
     private static int _traceSeq;
 
@@ -191,13 +405,32 @@ public sealed class GeometryConverter
     public List<CadEntity> Convert(CadDocument doc, CancellationToken ct = default, GeometryConvertOptions? options = null)
     {
         _entities.Clear();
+        _fontUsage.Clear();
         _layerColors.Clear();
         _layerOrder.Clear();
         _initiallyHidden.Clear();
         _viewports.Clear();
         _clipRect = null;
         _clipFrozenLayers = null;
+        _spatialClipPath = null;
+        _spatialClipBounds = default;
+        _spatialClipIsRect = false;
+        _scopeClip = null;
+        _scopeClipBounds = default;
+        _scopeClipIsRect = false;
+        _clipPaths.Clear();   // 上一轮建的裁剪路径已随旧 DisplayList 释放
+        _sheetRect = CadDocumentLoader.HeaderModelSpaceRect(doc);
+        _hideLayers = options?.HideLayers is { Count: > 0 } hl
+            ? new HashSet<string>(hl, StringComparer.OrdinalIgnoreCase)
+            : null;
+        _clipDropHandles = options?.DropClipHandles is { Count: > 0 } dh
+            ? new HashSet<ulong>(ClipDropHandles) { }
+            : new HashSet<ulong>(ClipDropHandles);
+        if (options?.DropClipHandles != null)
+            foreach (var h in options.DropClipHandles) _clipDropHandles.Add(h);
+        LayerFiltered = 0;
         ClippedAway = 0;
+        SpatialClipped = 0;
         Skipped = 0;
         AttributeDrawn = 0;
         AttributeInvisible = 0;
@@ -396,31 +629,133 @@ public sealed class GeometryConverter
         {
             _clipRect = null;
             _clipFrozenLayers = null;
+            RebuildScopeClip();
         }
         _spaceNotes.Add($"vp id={vp.Id} paper={LayoutProjection.PaperRect(vp)} " +
                             $"viewH={vp.ViewHeight:F1} scale={LayoutProjection.Scale(vp):F4} " +
                             $"clip={clip} kept={_entities.Count - before}");
     }
 
-    /// <summary>把路径裁到当前视口矩形；返回 null 表示被裁没了。</summary>
-    private SKPath? ApplyViewportClip(SKPath path)
+    /// <summary>
+    /// 重新计算本层的裁剪区域 = 视口矩形 ∩ 空间过滤器多边形；两者都没有时不裁。
+    ///
+    /// <para>裁剪改为**渲染期画布裁剪**（<see cref="CadEntity.ClipPath"/>）：Skia 的
+    /// <c>SKPath.Op</c> 按填充区域求交，开放路径（LINE/ARC/PLINE）面积为 0、求交结果为空，
+    /// 之前那条"路径求交"通道等于把视口/裁剪框里的线条全部删掉（实测
+    /// <c>line.Op(rect, Intersect)</c> 返回 0 点）。画布裁剪对标边、填充、文字一视同仁。</para>
+    /// </summary>
+    private void RebuildScopeClip()
     {
-        if (_clipRect is not { } rect) return path;
-        using var rectPath = new SKPath();
-        rectPath.AddRect(rect);
-        var clipped = path.Op(rectPath, SKPathOp.Intersect);
-        path.Dispose();
-        if (clipped is null || clipped.IsEmpty)
+        _scopeClip = null;
+        _scopeClipBounds = default;
+        _scopeClipIsRect = false;
+
+        if (_clipRect is { } rect)
         {
-            clipped?.Dispose();
-            ClippedAway++;
-            return null;
+            var p = RectPath(rect);
+            _clipPaths.Add(p);
+            _scopeClip = p;
+            _scopeClipBounds = rect;
+            _scopeClipIsRect = true;
         }
-        return clipped;
+
+        if (_spatialClipPath is { } sp)
+        {
+            if (_scopeClip is not { } outer)
+            {
+                _scopeClip = sp;
+                _scopeClipBounds = _spatialClipBounds;
+                _scopeClipIsRect = _spatialClipIsRect;
+                return;
+            }
+
+            // 两条闭合路径求交：都有面积，Op 在这里是可靠的
+            var inter = outer.Op(sp, SKPathOp.Intersect);
+            _clipPaths.Add(inter ?? new SKPath());
+            _scopeClip = inter;
+            _scopeClipBounds = SKRect.Intersect(_scopeClipBounds, _spatialClipBounds);
+            _scopeClipIsRect = _scopeClipIsRect && _spatialClipIsRect;
+            if (inter is null || inter.IsEmpty)
+            {
+                // 视口与裁剪框不相交 → 这一层什么也不画
+                _scopeClipBounds = SKRect.Create(_scopeClipBounds.Left, _scopeClipBounds.Top, 0, 0);
+            }
+        }
     }
 
+    private static SKPath RectPath(SKRect r)
+    {
+        var path = new SKPath();
+        path.AddRect(r);
+        return path;
+    }
+
+    /// <summary>包围盒是否可能落在裁剪区域内（快速剔除；精确裁剪在渲染期做）。</summary>
     private bool InsideClip(SKRect bounds)
-        => _clipRect is not { } rect || bounds.IntersectsWith(rect);
+        => _scopeClip is null || bounds.IntersectsWith(_scopeClipBounds);
+
+    /// <summary>
+    /// 实体包围盒有多大比例落在 <paramref name="sheet"/> 内（面积比，0~1）。
+    /// 用于判断一条"边界失效"的裁剪引用是不是绝大部分在图纸外（见 <see cref="ClipUnresolvedMode"/>）。
+    /// 任一边退化为 0（轴对齐直线）时按 1 处理，交给调用方的相交判断去决定。
+    /// </summary>
+    private static float BoundsCoverage(SKRect entity, SKRect? sheet)
+    {
+        if (sheet is not { } frame) return 1f;
+        float area = entity.Width * entity.Height;
+        var inter = SKRect.Intersect(entity, frame);
+        float hit = MathF.Max(0f, inter.Width) * MathF.Max(0f, inter.Height);
+        if (!(area > 0)) return hit > 0 ? 1f : 0f;
+        return Math.Clamp(hit / area, 0f, 1f);
+    }
+
+    /// <summary>
+    /// 给 [fromIndex, _entities.Count) 内新增的图元挂裁剪区域（P2-17）。
+    ///
+    /// <para>只有**跨边界**的图元才真的挂 <see cref="CadEntity.ClipPath"/>：完全落在区域内
+    /// 的照常参与合批（挂上就得逐条画，大块裁剪会掉帧）；完全在区域外的直接丢弃。
+    /// 包围盒一律收窄到裁剪区域，否则自适应范围会把框外内容算进去。</para>
+    /// </summary>
+    private void ApplyScopeClip(int fromIndex)
+    {
+        if (_scopeClip is null) return;
+        for (int i = fromIndex; i < _entities.Count; i++)
+        {
+            var e = _entities[i];
+            if (e.ClipPath is not null) continue;      // 外层已经挂过
+
+            if (!e.Bounds.IntersectsWith(_scopeClipBounds))
+            {
+                // 完全在裁剪区域外：直接丢弃，别让它污染范围（路径是原生内存，得手动释放）
+                ClippedAway++;
+                e.Path?.Dispose();
+                e.FillPath?.Dispose();
+                _entities.RemoveAt(i--);
+                continue;
+            }
+
+            if (!ScopeContainsBounds(e.Bounds))
+                e.ClipPath = _scopeClip;
+
+            e.Bounds = SKRect.Intersect(e.Bounds, _scopeClipBounds);
+        }
+    }
+
+    /// <summary>
+    /// 包围盒是否整个落在裁剪区域里（= 不必逐条裁剪）。
+    /// 矩形区域直接比矩形；多边形区域用"四角都在里面"判定 —— 凹多边形的极端情形可能
+    /// 误判成完全在内而漏裁一小块，换来的是绝大多数图元仍然能合批。
+    /// </summary>
+    private bool ScopeContainsBounds(SKRect bounds)
+    {
+        if (!_scopeClipBounds.Contains(bounds)) return false;
+        if (_scopeClipIsRect) return true;
+        if (_scopeClip is not { } clip) return true;
+        return clip.Contains(bounds.Left, bounds.Top)
+            && clip.Contains(bounds.Right, bounds.Top)
+            && clip.Contains(bounds.Right, bounds.Bottom)
+            && clip.Contains(bounds.Left, bounds.Bottom);
+    }
 
     private bool IsFrozenInViewport(Entity e)
         => _clipFrozenLayers is { Count: > 0 } set && set.Contains(LayerName(e));
@@ -448,6 +783,15 @@ public sealed class GeometryConverter
     /// </param>
     private void ConvertEntity(Entity e, in SKMatrix parent, int depth, uint? inheritedColor, ulong? handleOverride = null)
     {
+        // 诊断用图层过滤：在**转换期**丢弃，连文字/点标记/带裁剪图元一起走
+        // （渲染期 SetLayerHidden 只管合批几何，定位"多出来的东西"时会漏）。
+        if (_hideLayers is { } hidden && e.Layer is { } lay && hidden.Contains(lay.Name))
+        {
+            LayerFiltered++;
+            Skipped++;
+            return;
+        }
+
         // 实体被显式隐藏（DXF 组码 60 = 1，AutoCAD 亦不显示）。
         // 实测测试图.dwg：7836 个源实体带此标记（其中 1734 个 INSERT），展开约 5 万个显示实体；
         // 过滤后全图墨迹覆盖率 3.06% → 2.03%，经与 AutoCAD 语义核对属于正确行为而非内容丢失。
@@ -463,6 +807,62 @@ public sealed class GeometryConverter
 
         // 视口冻结（VPFREEZE）：只在该视口内不显示，与全局图层冻结不同
         if (IsFrozenInViewport(e)) { Skipped++; return; }
+
+        // 实体级空间过滤器（XDictionary: ACAD_FILTER → SPATIAL）——XCLIP 与「局部打开」留下的
+        // 裁剪边界。AutoCAD 对带裁剪边界的块引用/外部参照**只画框内部分**，框外连 EXTMAX 都不算。
+        //
+        // 实测 52陶板节点/9---陶板节点 (05).dwg：模型空间一个 26 成员的裁剪块（INSERT H=4301 →
+        // *U33，边界落在 (54025,-5747)-(54599,-5067)，离图形 5.3 万单位）。AutoCAD 整块不画、
+        // ZOOM E 的 VIEWSIZE=849；我们照画 26 份，自适应范围从 y=1162 被拉到 y=2878，
+        // 于是"适应窗口"把整张图缩到 1/3，上方拖出一条锯齿长条。
+        //
+        // 只在顶层（parent 为单位阵）生效：块内的边界究竟在块坐标系还是世界系未经验证，
+        // 猜错会**误藏正确内容**，宁可不裁。
+        SKPath? prevSpatialClip = _spatialClipPath;
+        SKRect prevSpatialBounds = _spatialClipBounds;
+        bool prevSpatialIsRect = _spatialClipIsRect;
+        bool clipChanged = false;
+        int entityStart = _entities.Count;
+        if (SpatialClipEnabled && parent.IsIdentity &&
+            TryGetSpatialClip(e, out var clipPath, out var clipBounds, out var clipIsRect))
+        {
+            if (TryGetEntityBounds(e, out var entityBounds) && !entityBounds.IntersectsWith(clipBounds))
+            {
+                // 边界与实体完全不相交 = 过滤器坐标系没读出来（ACadSharp 对一部分旧格式过滤器
+                // 的 Normal/InsertTransform 不可信）。这时边界位置本身没有意义，只能按"这条引用
+                // 有多大比例落在图纸范围内"猜 AutoCAD 会不会画它 —— 详见 ClipUnresolvedMode。
+                bool keepInFrame = ClipUnresolvedMode switch
+                {
+                    "drop" => false,
+                    "frame" => true,
+                    _ => BoundsCoverage(entityBounds, _sheetRect) >= ClipUnresolvedMinCoverage,
+                };
+                if (_clipDropHandles.Contains(e.Handle)) keepInFrame = false;   // 手工豁免（见字段说明）
+                if (!keepInFrame || _sheetRect is not { } sheet || !entityBounds.IntersectsWith(sheet))
+                {
+                    clipPath.Dispose();
+                    SpatialClipped++;
+                    Skipped++;
+                    return;
+                }
+
+                clipPath.Dispose();
+                _spatialClipPath = RectPath(sheet);
+                _clipPaths.Add(_spatialClipPath);
+                _spatialClipBounds = sheet;
+                _spatialClipIsRect = true;
+            }
+            else
+            {
+                _spatialClipPath = clipPath;
+                _clipPaths.Add(clipPath);
+                _spatialClipBounds = clipBounds;
+                _spatialClipIsRect = clipIsRect;
+            }
+
+            RebuildScopeClip();
+            clipChanged = true;
+        }
 
         var prevHandle = _currentHandle;
         var prevOwnHandle = _currentOwnHandle;
@@ -487,8 +887,11 @@ public sealed class GeometryConverter
                 case MText mt:
                 {
                     // MText 与 TextEntity 是兄弟类型（is TextEntity 匹配不到 MText，2026-09-25 SmokeTest 实证）
-                    var raw = !string.IsNullOrEmpty(mt.PlainText) ? mt.PlainText : CleanMText(mt.Value);
-                    AddMText(mt, raw, parent, color);
+                    // **必须解析原始 Value**：PlainText 会把 \W0.8\T0.75; 这类格式码的参数体留在正文里，
+                    // 图签会整块糊掉（见 MTextFormat 的说明）。
+                    var fmt = MTextFormat.Parse(mt.Value);
+                    var raw = string.IsNullOrEmpty(fmt.Text) ? CleanMText(mt.Value) : fmt.Text;
+                    AddMText(mt, raw, parent, color, fmt);
                     break;
                 }
                 // 块定义里的属性**占位符**（AttributeDefinition）不画：块参照显示的是 ATTRIB 的值，
@@ -529,9 +932,278 @@ public sealed class GeometryConverter
         }
         finally
         {
+            // 本层新增的图元统一挂裁剪区域、收窄包围盒（含文字/点标记）
+            ApplyScopeClip(entityStart);
+
             _currentHandle = prevHandle;
             _currentOwnHandle = prevOwnHandle;
+            if (clipChanged)
+            {
+                _spatialClipPath = prevSpatialClip;
+                _spatialClipBounds = prevSpatialBounds;
+                _spatialClipIsRect = prevSpatialIsRect;
+                RebuildScopeClip();
+            }
         }
+    }
+
+    /// <summary>
+    /// 读实体级裁剪边界（<c>XDictionary["ACAD_FILTER"]["SPATIAL"]</c>），返回**世界坐标多边形**。
+    ///
+    /// <para><b>坐标要换两次</b>（2026-11-13 用 AutoCAD 标定，见下）：</para>
+    /// <list type="number">
+    ///   <item>边界点 → <b>块空间</b>：由 <see cref="SpatialFilter.InsertTransform"/> 完成（组码 40 的 3×4 矩阵）；</item>
+    ///   <item>块空间 → <b>世界</b>：由该实体自身的插入矩阵完成（INSERT 的缩放/旋转/插入点 + 挤出方向）。</item>
+    /// </list>
+    /// <para>标定证据（THSYB1-11 标准竖剖.dwg，H=758，AutoCAD 只留该实体后 EXTMIN/EXTMAX =
+    /// (-100.02,-25.04)-(200.05,38.02)）：边界点 (1325,-1288.5)-(1625,-1225.5)，矩阵 #1 平移
+    /// (-1025,+1263.5) → 块空间 (300,-25)-(600,38)，插入点 (-400,0) → 世界 (-100,-25)-(200,38)，逐位吻合。
+    /// 只做第一步会得到 (300,-25)（偏 400），两步都不做会得到 (1325,-1288.5)（偏 1400+）。</para>
+    ///
+    /// <para><b>返回多边形而不是外接矩形</b>（P2-17）：实测 <c>THSYB1-12 层间竖剖.dwg</c> 的边界是
+    /// 8 点台阶形，面积只有外接矩形的 74%；按矩形裁会把缺口里的内容画出来（AutoCAD 是抠掉的）。</para>
+    /// </summary>
+    private bool TryGetSpatialClip(Entity e, out SKPath clipPath, out SKRect bounds, out bool isRect)
+    {
+        clipPath = null!;
+        bounds = default;
+        isRect = false;
+
+        var xdict = e.XDictionary;
+        if (xdict is null) return false;
+        if (!xdict.TryGetEntry<CadDictionary>("ACAD_FILTER", out var filter)) return false;
+        if (!filter.TryGetEntry<SpatialFilter>("SPATIAL", out var sf)) return false;
+
+        var points = sf.BoundaryPoints;
+        if (points is null || points.Count == 0) return false;
+
+        // 先验可信度：ACadSharp 对**旧格式**的 SPATIAL_FILTER 会解析错位（法向读出 (0,0,1.8e6)、
+        // 原点读出 (330084,31081) 这种量级，边界点也跟着偏）。这类记录宁可整条不用 ——
+        // 猜错了会**把内容裁没**，不裁最多是多画一点。
+        // 实测：9---陶板节点 (03)/(04) 的过滤器法向都是坏的，按坏边界裁会把整块裁空。
+        var n = sf.Normal;
+        if (System.Math.Abs(System.Math.Abs(n.Z) - 1.0) > 1e-3 ||
+            System.Math.Abs(n.X) > 1e-6 || System.Math.Abs(n.Y) > 1e-6)
+        {
+            // 数据不可信（ACadSharp 读不出矩阵）时，边界点也一起偏。AutoCAD 照样会裁，
+            // 只是我们算不出裁到哪儿；退而求其次按**图纸范围**（文件头 EXTMIN/EXTMAX，
+            // 本来就是 AutoCAD 自己算的）裁 —— 实测 THSYB1-12 的 H=845 靠这条把
+            // 探到 x=-803 的块内容收回到图框内，与 AutoCAD 的 extents 对得上。
+            if (BadNormalClipToSheet && _sheetRect is { } sheet)
+            {
+                clipPath = RectPath(sheet);
+                bounds = sheet;
+                isRect = true;
+                return true;
+            }
+            return false;
+        }
+
+        // 坐标取法（见 ClipXformMode 的说明）：Auto 下"矩阵是单位阵"就当边界已经是世界坐标，
+        // 否则先过 InsertTransform 再过实体插入矩阵。
+        var toBlock = sf.InsertTransform;
+        bool tfIdentity = IsIdentityMatrix(toBlock);
+
+        // 正向矩阵读成单位阵、反向矩阵却有内容 ⇒ 换用反向矩阵（见 ClipUseInverseXform）。
+        //
+        // 注意平移分量的位置：ACadSharp 读这类旧记录的 4x4 是**先转置再填**的，平移落在
+        // 最后一列（M03/M13），而行优先约定该在的 M30/M31 是 0 —— 直接 `Matrix4 * XYZ`
+        // 会把它丢掉（实测结果里边界点原样未动）。这里自己按**列向量**约定乘：
+        // x' = M00·x + M01·y + M03，y' = M10·x + M11·y + M13（线性部分也一起用上，
+        // `竖剖节点陶板.dwg` 的 H=36849 反向矩阵是 M11 = -1 的镜像，只取平移会算歪）。
+        Matrix4? invToBlock = null;
+        if (tfIdentity && ClipUseInverseXform)
+        {
+            var inv = sf.InverseInsertTransform;
+            if (!IsIdentityMatrix(inv))
+            {
+                invToBlock = inv;
+                tfIdentity = false;
+            }
+        }
+
+        bool hasToBlock = ClipXform switch
+        {
+            ClipXformMode.Raw => false,
+            ClipXformMode.Tf => !tfIdentity,
+            ClipXformMode.Full => !tfIdentity,
+            _ => !tfIdentity,                       // Auto
+        };
+
+        // 实体自身的块→世界矩阵；非 INSERT（或退化插入）时按单位阵处理
+        SKMatrix toWorld = SKMatrix.Identity;
+        bool useEntityMatrix = ClipXform switch
+        {
+            ClipXformMode.Full => true,
+            ClipXformMode.Auto => !tfIdentity,
+            _ => false,
+        };
+        bool hasToWorld = useEntityMatrix
+                          && e is Insert ins && CadTransform.TryInsertMatrix(ins, out toWorld);
+        if (!hasToWorld) toWorld = SKMatrix.Identity;
+
+        var world = new List<SKPoint>(points.Count);
+        float minX = float.MaxValue, minY = float.MaxValue, maxX = float.MinValue, maxY = float.MinValue;
+        foreach (var p in points)
+        {
+            double x = p.X, y = p.Y;
+            if (hasToBlock)
+            {
+                if (invToBlock is { } m)
+                {
+                    // 反向矩阵（世界→块）：ACadSharp 把平移填在最后一列，按列向量约定乘
+                    double nx = m.M00 * x + m.M01 * y + m.M02 * 0 + m.M03;
+                    double ny = m.M10 * x + m.M11 * y + m.M12 * 0 + m.M13;
+                    x = nx;
+                    y = ny;
+                }
+                else
+                {
+                    var block = toBlock * new XYZ(x, y, 0);
+                    x = block.X;
+                    y = block.Y;
+                }
+            }
+
+            var w = CadTransform.Apply(toWorld, new SKPoint((float)x, (float)y));
+            x = w.X;
+            y = w.Y;
+
+            if (double.IsNaN(x) || double.IsNaN(y) || double.IsInfinity(x) || double.IsInfinity(y)) return false;
+            world.Add(new SKPoint((float)x, (float)y));
+            minX = MathF.Min(minX, (float)x);
+            minY = MathF.Min(minY, (float)y);
+            maxX = MathF.Max(maxX, (float)x);
+            maxY = MathF.Max(maxY, (float)y);
+        }
+
+        if (!(maxX > minX) || !(maxY > minY)) return false;   // 退化边界（点/线）当没有
+
+        var rect = new SKRect(minX, minY, maxX, maxY);
+        if (ClipDebug)
+            Console.Error.WriteLine($"[clip] H={e.Handle} inv={(invToBlock is not null ? "yes" : "no")} hasToWorld={hasToWorld} rect=({rect.Left:F1},{rect.Top:F1})-({rect.Right:F1},{rect.Bottom:F1})");
+
+        // 只有 1~2 个点（实测 THSYB1-12 的 H=845/H=850 就是 2 点对角）画不出多边形，
+        // 按外接矩形处理：这类记录本身是坏的，但 AutoCAD 照样按它裁 —— 与实体不相交时
+        // 走"按图纸范围裁"的兜底，效果与 AutoCAD 一致（内容被切到图框内）。
+        if (world.Count < 3)
+        {
+            clipPath = RectPath(rect);
+            bounds = rect;
+            isRect = true;
+            return true;
+        }
+
+        // 边界顶点全落在外接矩形的边上 ⇒ 这个多边形就是矩形（轴对齐 XCLIP 的常见情形），
+        // 下游可以走"矩形包含"快路径，不必逐条裁剪。
+        const float eps = 1e-3f;
+        isRect = world.All(pt =>
+            MathF.Abs(pt.X - rect.Left) < eps || MathF.Abs(pt.X - rect.Right) < eps ||
+            MathF.Abs(pt.Y - rect.Top) < eps || MathF.Abs(pt.Y - rect.Bottom) < eps);
+
+        // 顶点顺序不可信时退回外接矩形：自相交 / 面积远小于外接矩形（实测 PE0101 的 11 点
+        // 边界按存储顺序连出来会自交，照它裁会**切掉本该显示的内容** —— 那比多画一点糟得多）。
+        if (!isRect && !IsUsablePolygon(world, rect))
+        {
+            clipPath = RectPath(rect);
+            bounds = rect;
+            isRect = true;
+            return true;
+        }
+
+        var path = new SKPath();
+        path.MoveTo(world[0]);
+        for (int i = 1; i < world.Count; i++) path.LineTo(world[i]);
+        path.Close();
+
+        clipPath = path;
+        bounds = rect;
+        return true;
+    }
+
+    /// <summary>
+    /// 边界顶点能否当作简单多边形用：不自相交，且面积不小于外接矩形的 40%。
+    /// 不满足就退回外接矩形 —— 宁可多画一点，也不按坏顺序把内容切掉。
+    /// </summary>
+    private static bool IsUsablePolygon(List<SKPoint> pts, SKRect rect)
+    {
+        int n = pts.Count;
+        if (n < 3) return false;
+
+        // 1) 自相交检测（跳过共端点的相邻边）
+        for (int i = 0; i < n; i++)
+        {
+            var a1 = pts[i];
+            var a2 = pts[(i + 1) % n];
+            for (int j = i + 2; j < n; j++)
+            {
+                if (i == 0 && j == n - 1) continue;          // 首尾相邻
+                var b1 = pts[j];
+                var b2 = pts[(j + 1) % n];
+                if (SegmentsCross(a1, a2, b1, b2)) return false;
+            }
+        }
+
+        // 2) 面积占比（鞋带公式）
+        double area = 0;
+        for (int i = 0; i < n; i++)
+        {
+            var a = pts[i];
+            var b = pts[(i + 1) % n];
+            area += (double)a.X * b.Y - (double)b.X * a.Y;
+        }
+        area = Math.Abs(area) * 0.5;
+        double bboxArea = (double)rect.Width * rect.Height;
+        return bboxArea > 0 && area >= bboxArea * 0.4;
+    }
+
+    private static bool SegmentsCross(SKPoint p1, SKPoint p2, SKPoint p3, SKPoint p4)
+    {
+        static float Cross(SKPoint o, SKPoint a, SKPoint b)
+            => (a.X - o.X) * (b.Y - o.Y) - (a.Y - o.Y) * (b.X - o.X);
+
+        float d1 = Cross(p3, p4, p1);
+        float d2 = Cross(p3, p4, p2);
+        float d3 = Cross(p1, p2, p3);
+        float d4 = Cross(p1, p2, p4);
+        return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0))
+            && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+    }
+
+    /// <summary>实体包围盒（世界坐标）；空盒/取不到时返回 false（此时不参与裁剪判定）。</summary>
+    private static bool TryGetEntityBounds(Entity e, out SKRect bounds)
+    {
+        bounds = default;
+        BoundingBox bb;
+        try { bb = e.GetBoundingBox(); }
+        catch { return false; }
+
+        double x0 = bb.Min.X, y0 = bb.Min.Y, x1 = bb.Max.X, y1 = bb.Max.Y;
+        if (double.IsNaN(x0) || double.IsNaN(y0) || double.IsNaN(x1) || double.IsNaN(y1)) return false;
+        if (double.IsInfinity(x0) || double.IsInfinity(y0) || double.IsInfinity(x1) || double.IsInfinity(y1)) return false;
+        if (x1 < x0) (x0, x1) = (x1, x0);
+        if (y1 < y0) (y0, y1) = (y1, y0);
+
+        bounds = SKRect.Create((float)x0, (float)y0, (float)(x1 - x0), (float)(y1 - y0));
+        return true;
+    }
+
+    private static bool IsIdentityMatrix(in Matrix4 m)
+    {
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++)
+                if (Math.Abs(m[r, c] - (r == c ? 1.0 : 0.0)) > 1e-9) return false;
+        return true;
+    }
+
+    /// <summary>两个裁剪矩形的交集（空集时退化成零面积矩形，效果等于"全裁掉"）。</summary>
+    private static SKRect IntersectRect(SKRect a, SKRect b)
+    {
+        float left = MathF.Max(a.Left, b.Left);
+        float top = MathF.Max(a.Top, b.Top);
+        float right = MathF.Max(left, MathF.Min(a.Right, b.Right));
+        float bottom = MathF.Max(top, MathF.Min(a.Bottom, b.Bottom));
+        return new SKRect(left, top, right, bottom);
     }
 
     // ---------- 基础实体 ----------
@@ -1348,19 +2020,42 @@ public sealed class GeometryConverter
     /// 锚点按 <c>AttachmentPoint</c> 的 9 宫格换算成「基线左端」，与 TEXT 走同一条对齐管线。
     /// （换行/断行见 P2-4，本步不做宽度断行。）
     /// </summary>
-    private void AddMText(MText mt, string? raw, in SKMatrix m, uint color)
+    private void AddMText(MText mt, string? raw, in SKMatrix m, uint color, in MTextFormatResult fmt)
     {
-        // MText 没有宽度因子字段（宽度由 RectangleWidth 决定，见下方断行）；
-        // 样式参数同样不参与渲染，理由见 AddText 的实测说明。
-        double widthFactor = 1.0;
+        // MTEXT 没有"字宽因子"字段，宽度靠内联码 \W（字宽）与 \T（字间距）表达。
+        // **\T 不进字宽**：AutoCAD 的 \T 只压字与字之间的间隙，不压字形本身。
+        // 受控基准 `mt.dxf`（`\W0.8\T0.75;` / `\W0.8;` / 无 / `\T0.75;` 四条同一句话）
+        // 以 ODA 反解（按 30 字高的行距归一化到世界单位）：
+        //   \W0.8 把宽度压到 0.80，\T0.75 只压到 0.936 —— 说明它作用在"字距"上，
+        //   而折进字宽会压到 0.75，比 AutoCAD 窄 20%（图签整段会明显偏瘦）。
+        //
+        // **没写 \W 时必须回落到 STYLE 的组码 41**（2026-11-14 受控基准 `.compare/mtstyle.dxf`）：
+        //   M1 样式1.0 无\W → ODA 300｜M2 样式0.5 无\W → ODA 150（我方当时画 300，宽一倍）
+        //   M3 样式1.0 \W0.5 → ODA 150｜M4 样式0.5 \W0.5 → ODA 150
+        //   → \W 是**覆盖**样式宽度，不是叠乘。同图 9---陶板节点 (05).dwg 的标注样式 SGT-S
+        //     宽度 0.300、全部 DIMENSION 的 MTEXT 都没写 \W，于是"30/100/DIM"被画宽 3.3 倍。
+        double wfWidth = fmt.WidthExplicit
+            ? Math.Max(0.05, fmt.WidthFactor)
+            : Math.Max(0.05, StyleWidthOf(mt));
+        double widthFactor = s_mtextFoldTracking ? Math.Max(0.05, wfWidth * fmt.Tracking) : wfWidth;
         double oblique = 0;
-        double height = mt.Height;
+        double height = mt.Height * Math.Max(0.05, fmt.HeightFactor);
 
         // ---- 断行：组码 41（RectangleWidth）是 AutoCAD 的排版栏宽，超过就折行 ----
+        // 断行按**本条文字实际会用的字体**逐字量宽：用默认字体的宽度断行，
+        // 换成宋体之后行会断得太早（宋体比雅黑窄两成），排版立刻跑偏。
         var text = raw ?? string.Empty;
+        var (wrapAnsi, wrapBig, _) = StyleFontsOf(mt);
+        var textFont = TextFontLibrary.Resolve(wrapAnsi, wrapBig, text);
         float rectWidth = (float)mt.RectangleWidth;
         if (rectWidth > 0 && height > 0 && text.Length > 0)
-            text = TextWrap.Wrap(text, (float)height, rectWidth);
+            // 断行必须带 **\W 字宽因子**：栏宽是"排版宽度"，而字宽被 \W 压缩后同样的栏宽
+            // 能放更多字。忽略 \W 会让整段提前折行 —— 实测 52陶板节点/9---陶板节点 (05).dwg
+            // 图签"备注"块：\W0.8 时每行只排 21 字（应为 25 字），整块多出 7 行、长度多 43%，
+            // 与 ODA 差出半个图签格。\T（字间距）不参与：CJK 字距本来就是全角，
+            // ODA 反解得 \W0.8 的每字步进 = em×0.8，没有 \T 那一层。
+            // 宽度用 wfWidth（\W 优先、否则样式 41），与下面真正画字时的字宽同源。
+            text = TextWrap.Wrap(text, (float)height, rectWidth, (float)wfWidth, textFont);
 
         // 行距：AutoCAD 单倍 = 1.667 × 字高；组码 44（LineSpacing）是倍数，默认 1.0
         float spacingFactor = TextMetrics.LineSpacingFactor
@@ -1399,7 +2094,7 @@ public sealed class GeometryConverter
         AddTextEntity(text, mt.InsertPoint, mt.InsertPoint, height, mt.Rotation,
             widthFactor, oblique, h, v, mt, m, color,
             lineCount: lineCount, lineSpacingFactor: spacingFactor,
-            lineAlign: lineAlign, alignPerLine: true);
+            lineAlign: lineAlign, alignPerLine: true, font: textFont);
     }
 
     /// <summary>
@@ -1411,12 +2106,14 @@ public sealed class GeometryConverter
         ACadSharp.Entities.TextHorizontalAlignment h, TextVerticalAlignmentType v,
         Entity e, in SKMatrix m, uint color,
         int lineCount = 1, float lineSpacingFactor = TextMetrics.LineSpacingFactor,
-        TextLineAlign lineAlign = TextLineAlign.Left, bool alignPerLine = false)
+        TextLineAlign lineAlign = TextLineAlign.Left, bool alignPerLine = false,
+        TextFont? font = null)
     {
         if (string.IsNullOrWhiteSpace(raw) || height <= 0) { Skipped++; return; }
 
-        // 统一换行符，供测量与渲染共用（MTEXT 的 \P 已在 CleanMText 中转为 \n）
-        var text = raw.Replace("\r\n", "\n").Replace('\r', '\n');
+        // 统一换行符，供测量与渲染共用（MTEXT 的 \P 已在 CleanMText 中转为 \n）；
+        // %% 控制码也在这里展开，保证"量宽度"和"描边"看到的是同一串字符。
+        var text = TextCodes.Expand(raw.Replace("\r\n", "\n").Replace('\r', '\n'));
         if (text.TrimEnd('\n').Length == 0) { Skipped++; return; }
 
         float wf = (float)(widthFactor > 0 ? widthFactor : 1.0);
@@ -1459,6 +2156,11 @@ public sealed class GeometryConverter
         // 样式指向可用的 .shx 时必须走它：TTF 回退的字宽与字形都对不上（受控基准实测
         // 数字窄 17.5%、W 宽 20%），而 SHX 本身就是折线，描出来就是 AutoCAD 的形状。
         var (styleFont, styleBig, styleVertical) = StyleFontsOf(e);
+
+        // TTF 字体族（P2-16）：样式写的就是 TTF、或 SHX 缺字库落到这条路上时，
+        // 按样式解析出真正的字体（含"要不要中文字形"的判断）。
+        // 这份对象一路带到 TextDraw，保证**包围盒与字形用的是同一份度量**。
+        font ??= TextFontLibrary.Resolve(styleFont, styleBig, text);
         // 样式写 TTF（ARIAL.TTF / simhei.ttf）的不算 SHX，也不该记"缺字库"
         bool wantsShx = ShxFontLibrary.IsShxName(styleFont) || ShxFontLibrary.IsShxName(styleBig);
         // 竖排：样式勾了"垂直"才排竖排，且要求字体支持（西文看 modes bit2，大字体都支持）。
@@ -1469,7 +2171,7 @@ public sealed class GeometryConverter
             ShxFontLibrary.TryMeasure(text, styleFont, styleBig, capE, out shxWidth, vertical);
         if (wantsShx && !shxMeasured) ShxTextMissingFont++;
 
-        float measured = (shxMeasured ? shxWidth : TextMetrics.MeasureWidth(text, capE)) * wf;
+        float measured = (shxMeasured ? shxWidth : font.MeasureWidth(text, capE)) * wf;
         if (alignWidth > 0 && measured > 1e-6f && !vertical)
         {
             float ratio = alignWidth / measured;
@@ -1487,7 +2189,9 @@ public sealed class GeometryConverter
             }
         }
 
-        float desc = TextMetrics.DescenderDepth(text, capE);
+        // 降部深度只影响"底部对齐"的上抬量与块高；SHX 那条路仍用默认字体的比例
+        // （SHX 字库自己的 below 已在字形里，包围盒口径不能跟着换，否则老断言全变）
+        float desc = shxMeasured ? TextMetrics.DescenderDepth(text, capE) : font.DescenderDepth(text, capE);
 
         // ---- 9 宫格局部偏移（世界坐标，y 向上；文本从基线左端向右上延伸）----
         // 逐行对齐时水平量由渲染端按行分配（MTEXT），这里不再偏移，
@@ -1590,6 +2294,9 @@ public sealed class GeometryConverter
             return;
         }
 
+        // 走到这儿说明用的是 TTF 那条路 —— 记一笔，报告里能看到每张图实际用了哪些字体
+        NoteFontUse(font);
+
         // 逐行对齐时包围盒按"整块矩形"算（各行首尾落在 ±块宽/2 或 −块宽 上）；
         // 否则沿用字形级精确包围盒（TEXT 的口径不变，历史断言依赖它）。
         SKRect local;
@@ -1602,12 +2309,12 @@ public sealed class GeometryConverter
                 _ => 0f,
             };
             float bottomLocal = -(lineCount - 1) * (worldCap * lineSpacingFactor)
-                                - TextMetrics.DescenderDepth(text, worldCap);
+                                - font.DescenderDepth(text, worldCap);
             local = new SKRect(left, bottomLocal, left + measured, worldCap);
         }
         else
         {
-            local = TextMetrics.MeasureLocalBounds(text, worldCap, wf, obl);
+            local = font.MeasureLocalBounds(text, worldCap, wf, obl);
         }
         var bounds = TextMetrics.ToWorldBounds(local, worldPos, rotTotal);
 
@@ -1631,6 +2338,7 @@ public sealed class GeometryConverter
                 ObliqueRadians = obl,
                 LineSpacingFactor = lineSpacingFactor,
                 LineAlign = lineAlign,
+                Font = font,
             },
             Bounds = bounds,
         });
@@ -1651,6 +2359,17 @@ public sealed class GeometryConverter
 
     private void CacheLayerColors(CadDocument doc)
     {
+        // 不打印图层的判据要先看整表占比：ACadSharp 对部分文件（Revit/外部导出）会把
+        // 大部分甚至**全部**图层读成 PlotFlag=false（实证 AD-103-三层平面图 58/58），
+        // 照此隐藏会整张图空白。超过 3/4 就认为这份 PlotFlag 不可信，整表放弃。
+        int layerTotal = 0, noPlotTotal = 0;
+        foreach (var layer in doc.Layers)
+        {
+            layerTotal++;
+            if (!layer.PlotFlag) noPlotTotal++;
+        }
+        bool trustPlotFlag = HideNonPlotLayers && noPlotTotal * 4 <= layerTotal * 3;
+
         foreach (var layer in doc.Layers)
         {
             var name = layer.Name ?? string.Empty;
@@ -1661,10 +2380,12 @@ public sealed class GeometryConverter
             int lw = Mm100(layer.LineWeight);
             _layerWeights[name] = lw > 0 ? lw : DefaultLineWeightMm100;
 
+            if (!layer.PlotFlag) NonPlottingLayers++;
+
             // 图层被关闭（IsOn=false）或冻结 → 打开图纸时默认隐藏
             if (!layer.IsOn || layer.Flags.HasFlag(LayerFlags.Frozen))
                 _initiallyHidden.Add(name);
-            else if (!layer.PlotFlag)
+            else if (trustPlotFlag && !layer.PlotFlag)
             {
                 // 不打印图层（AutoCAD 的 DEFPOINTS 就是这一类）→ 也默认隐藏。
                 //
@@ -1673,8 +2394,10 @@ public sealed class GeometryConverter
                 // 画出来是满屏的点阵 —— 说明参照实现走的是**打印语义**。
                 // 处理成"默认隐藏、可在图层面板打开"，比直接丢弃更保守：
                 // 编辑器里核对时仍能看到，也能随时对比有无。
+                //
+                // 2026-10-23：加整表占比守卫（见 trustPlotFlag）。ACadSharp 对部分外部导出图
+                // 会把全部图层读成不打印，照此隐藏会整张空白；Teigha 对这类图照样显示内容。
                 _initiallyHidden.Add(name);
-                NonPlottingLayers++;
             }
         }
     }
@@ -1691,6 +2414,7 @@ public sealed class GeometryConverter
     private void CacheTextStyles(CadDocument doc)
     {
         _styleFonts.Clear();
+        _styleWidths.Clear();
         try
         {
             foreach (var st in doc.TextStyles)
@@ -1701,6 +2425,8 @@ public sealed class GeometryConverter
                 // '@' 那套是 TrueType 字体的约定，SHX 靠这个标志位 + 字体自带的 modes bit2。
                 bool vertical = (st.Flags & StyleFlags.VerticalText) != 0;
                 _styleFonts[name] = (st.Filename ?? string.Empty, st.BigFontFilename ?? string.Empty, vertical);
+                // 组码 41 = 宽度因子；0/负数在 AutoCAD 里按 1.0 处理
+                _styleWidths[name] = st.Width > 0.01f ? (float)Math.Clamp(st.Width, 0.01f, 100f) : 1f;
             }
         }
         catch
@@ -1712,16 +2438,45 @@ public sealed class GeometryConverter
     /// <summary>取实体所用样式的 (字体, 大字体, 竖排) ；取不到返回空串 + 非竖排。</summary>
     private (string Font, string Big, bool Vertical) StyleFontsOf(Entity e)
     {
-        string styleName = e switch
+        string styleName = StyleNameOf(e);
+        return styleName.Length > 0 && _styleFonts.TryGetValue(styleName, out var f)
+            ? f
+            : (string.Empty, string.Empty, false);
+    }
+
+    /// <summary>取实体所用样式名（DWG 实体只带名字，样式表才有效）。</summary>
+    private static string StyleNameOf(Entity e)
+        => (e switch
         {
             AttributeEntity a => a.Style?.Name,   // 必须排在 TextEntity 前面：它是其子类
             TextEntity t => t.Style?.Name,
             MText m => m.Style?.Name,
             _ => null,
-        } ?? string.Empty;
-        return styleName.Length > 0 && _styleFonts.TryGetValue(styleName, out var f)
-            ? f
-            : (string.Empty, string.Empty, false);
+        }) ?? string.Empty;
+
+    /// <summary>
+    /// 取实体所用样式的宽度因子（组码 41）；样式缺失时返回 1.0。
+    /// 只给 MTEXT 用 —— TEXT/ATTDEF 有实体级 41，样式值在 AutoCAD 建字时已抄进实体。
+    /// </summary>
+    private float StyleWidthOf(Entity e)
+    {
+        string styleName = StyleNameOf(e);
+        return styleName.Length > 0 && _styleWidths.TryGetValue(styleName, out var w) ? w : 1f;
+    }
+
+    /// <summary>
+    /// 记一条"某个字体画了多少条文字"。名字按来源标注，报告里一眼能看出有没有落到兜底。
+    /// </summary>
+    private void NoteFontUse(TextFont font)
+    {
+        string key = font.Kind switch
+        {
+            TextFontKind.TrueType => font.Name,
+            TextFontKind.ShxStandIn => $"{font.Name}（SHX 替身）",
+            TextFontKind.Substitute => $"{font.Name}（顶替）",
+            _ => $"{font.Name}（默认兜底）",
+        };
+        _fontUsage[key] = _fontUsage.TryGetValue(key, out var n) ? n + 1 : 1;
     }
 
     /// <summary>
@@ -1824,9 +2579,8 @@ public sealed class GeometryConverter
         var ocs = CadGeometry.OcsToWcs(e);
         if (!ocs.IsIdentity) path.Transform(ocs);
         path.Transform(m);
-        var clipped = ApplyViewportClip(path);
-        if (clipped is null) return;
-        path = clipped;
+        // 裁剪不在转换期做（SKPath.Op 会把开放的线条整段删掉），改为给图元挂裁剪区域、
+        // 渲染期用画布裁剪 —— 见 ApplyScopeClip / CadEntity.ClipPath。
         var bounds = path.Bounds;
         if (float.IsNaN(bounds.Left)) { path.Dispose(); Skipped++; return; }
 
@@ -1854,14 +2608,27 @@ public sealed class GeometryConverter
     /// </summary>
     public float WorldUnitsPerMm { get; set; } = 1f;
 
+    private static bool IsByLayerLineType(ACadSharp.Tables.LineType? lt)
+    {
+        if (lt is null) return true;
+        var n = lt.Name;
+        return string.IsNullOrEmpty(n) || n.Equals("ByLayer", StringComparison.OrdinalIgnoreCase);
+    }
+
     /// <summary>
     /// 解析实体的显示线型为 Skia 虚线间隔（on/off 交替，世界单位）。
     /// 实线（Continuous / ByBlock / 无段 / 全为实段）返回 null。
+    ///
+    /// <para>**ByLayer 必须回落到图层的线型**：ACadSharp 对组码 6 = <c>ByLayer</c> 的实体
+    /// 返回一个**名叫 ByLayer、段表为空**的 Linetype 对象（不是 null），照着它算就是"实线"。
+    /// 实测 `9---陶板节点 (05).dwg` 的 `00-SGT-透视虚线`：86 处隐藏边全部画成实线，
+    /// 而图层线型是 DASHED —— 剖面图里最显眼的那批虚线整批丢失。</para>
     /// </summary>
     private float[]? ResolveDashPattern(Entity e, in SKMatrix m)
     {
         var lt = e.LineType;
-        if (lt == null || lt.Segments == null) return null;
+        if (IsByLayerLineType(lt)) lt = e.Layer?.LineType;   // 组码 6 = ByLayer → 用图层线型
+        if (lt == null || IsByLayerLineType(lt) || lt.Segments == null) return null;
 
         double unit = _globalLtScale * (e.LineTypeScale > 0 ? e.LineTypeScale : 1.0);
         double det = Math.Abs((double)m.ScaleX * m.ScaleY - (double)m.SkewX * m.SkewY);
@@ -1909,9 +2676,8 @@ public sealed class GeometryConverter
         var ocs = CadGeometry.OcsToWcs(e);
         if (!ocs.IsIdentity) path.Transform(ocs);
         path.Transform(m);
-        var clipped = ApplyViewportClip(path);
-        if (clipped is null) return;
-        path = clipped;
+        // 裁剪不在转换期做（SKPath.Op 会把开放的线条整段删掉），改为给图元挂裁剪区域、
+        // 渲染期用画布裁剪 —— 见 ApplyScopeClip / CadEntity.ClipPath。
         var bounds = path.Bounds;
         if (float.IsNaN(bounds.Left)) { path.Dispose(); Skipped++; return; }
         _entities.Add(new CadEntity

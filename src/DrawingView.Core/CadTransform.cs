@@ -68,7 +68,20 @@ public static class CadTransform
 
         var m = Scale(sx, sy);
         m = Mul(m, Rotate((float)ins.Rotation));
-        m = Mul(m, Translate((float)ins.InsertPoint.X - bp.X, (float)ins.InsertPoint.Y - bp.Y));
+
+        // 挤出方向（组码 210）：法向为 (0,0,-1) 的 INSERT，其插入点与块内几何存的是 **OCS** 坐标，
+        // 必须经 OCS→WCS 才能落到正确位置。任意轴算法在 N=(0,0,-1) 时退化为「X 取反、Y 不动」。
+        // 实测（竖剖节点陶板.dwg：INSERT H=12421 块内嵌套 INSERT H=2379，法向 (0,0,-1)）：
+        // 不做这步，那个螺栓被画到世界 x≈-535510（AutoCAD 在 -200067），整图范围左边界
+        // 从 -200690 被撑到 -535553，自适应出图直接缩成一条缝。同类图纸 24 张里 4 张受影响。
+        var n = ins.Normal;
+        bool flipX = n.Z < -1e-9 && System.Math.Abs(n.X) < 1e-9 && System.Math.Abs(n.Y) < 1e-9;
+        if (flipX) m = Mul(m, Scale(-1f, 1f));
+
+        var tx = (float)ins.InsertPoint.X - bp.X;
+        var ty = (float)ins.InsertPoint.Y - bp.Y;
+        if (flipX) tx = -tx;      // 平移量同样在 OCS 里，X 一起取反
+        m = Mul(m, Translate(tx, ty));
         matrix = m;
         return true;
     }

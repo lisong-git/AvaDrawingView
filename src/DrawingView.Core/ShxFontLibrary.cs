@@ -88,7 +88,10 @@ public static class ShxFontLibrary
     /// 按样式里的文件名找字体。文件名可能是 "simplex.shx"、"SIMPLEX" 或 "simplex"，
     /// 一律补 .shx 后逐个目录找。找不到返回 null。
     /// </summary>
-    public static ShxFont? Resolve(string? fileName)
+    /// <param name="preferBig">
+    /// 这是大字体（CJK）槽位。原名查不到时优先拿中文字库顶替 —— 否则中文会整批变成缺字方框。
+    /// </param>
+    public static ShxFont? Resolve(string? fileName, bool preferBig = false)
     {
         if (string.IsNullOrWhiteSpace(fileName)) return null;
         string name = fileName.Trim().Trim('"');
@@ -102,21 +105,54 @@ public static class ShxFontLibrary
         string key = name;
         if (ByName.TryGetValue(key, out var cached)) return cached;
 
-        ShxFont? found = null;
+        ShxFont? found = FindByName(name);
+        if (found is null && FontAliases.TryGetValue(Stem(name), out var subs))
+            foreach (string alt in subs)
+                if ((found = FindByName(alt)) is not null) break;
+
+        ByName[key] = found;
+        return found;
+    }
+
+    private static ShxFont? FindByName(string name)
+    {
         foreach (string dir in Directories)
         {
             foreach (string candidate in Candidates(name))
             {
                 string p = Path.Combine(dir, candidate);
                 if (!File.Exists(p)) continue;
-                found = ShxFont.TryLoad(p, out _);
-                if (found is not null) break;
+                var font = ShxFont.TryLoad(p, out _);
+                if (font is not null) return font;
             }
-            if (found is not null) break;
         }
-        ByName[key] = found;
-        return found;
+        return null;
     }
+
+    private static string Stem(string name)
+    {
+        int dot = name.LastIndexOf('.');
+        return dot < 0 ? name : name[..dot];
+    }
+
+    /// <summary>字库名 → 近似替代（原名缺库时按序试）。</summary>
+    private static readonly Dictionary<string, string[]> FontAliases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["txt"] = ["simplex"],
+        ["monotxt"] = ["simplex"],
+        ["isocp"] = ["simplex"],
+        ["isocpeur"] = ["simplex"],
+        ["complex"] = ["romans"],
+        ["italic"] = ["romans"],
+        ["romand"] = ["romans"],
+        ["romant"] = ["romans"],
+        ["hztxt_e"] = ["hztxt"],
+        ["hzdx"] = ["hztxt"],
+        ["hzfs"] = ["hztxt"],
+        ["hzk"] = ["hztxt"],
+        ["hztxts"] = ["hztxt"],
+        ["gbcbig"] = ["hztxt"],
+    };
 
     private static IEnumerable<string> Candidates(string name)
     {
@@ -132,7 +168,7 @@ public static class ShxFontLibrary
 
     /// <summary>样式 → (西文字体, 大字体)。两个都可能为 null。</summary>
     public static (ShxFont? Ansi, ShxFont? Big) ResolveStyle(string? fontFile, string? bigFontFile)
-        => (Resolve(fontFile), Resolve(bigFontFile));
+        => (Resolve(fontFile), Resolve(bigFontFile, preferBig: true));
 
     /// <summary>
     /// 这个样式能不能真排竖排。
@@ -264,12 +300,17 @@ public static class ShxFontLibrary
                 }
                 if (glyph.Polylines.Count > 0)
                 {
+                    // 有的字库把汉字画在基线下方（hztxt），要靠字库标定的抬升量挪回来，
+                    // 否则整串中文比西文低一个字高，跟 Teigha 差出一行。
+                    float lift = font.Kind == ShxFont.FontKind.BigFont
+                        ? font.BaselineLiftUnits * scale
+                        : 0f;
                     foreach (var poly in glyph.Polylines)
                     {
                         if (poly.Length < 2) continue;
-                        path.MoveTo(penX + poly[0].X * scale, baseY + poly[0].Y * scale);
+                        path.MoveTo(penX + poly[0].X * scale, baseY + lift + poly[0].Y * scale);
                         for (int k = 1; k < poly.Length; k++)
-                            path.LineTo(penX + poly[k].X * scale, baseY + poly[k].Y * scale);
+                            path.LineTo(penX + poly[k].X * scale, baseY + lift + poly[k].Y * scale);
                     }
                     drawn++;
                 }
@@ -353,7 +394,10 @@ public static class ShxFontLibrary
         // **有记录就算"有字"，不能要求"有墨迹"** —— 空格的字形是空的，但它有前进量
         // （simplex 空格 19 单位 = 0.905 em）；按 Polylines.Count > 0 判定会把空格当缺字，
         // 落到"半个字高"的兜底上，于是每个空格窄 45%（ODA 基准：整串 "WAVE 2026" 差 4.7%）。
-        if (c < 0x80)
+        // 分界放在 0x100 而不是 0x80：Latin-1 补充区（°±Ø 这些，%% 控制码展开后就会落到这里）
+        // 在 AutoCAD 里仍由**主字体**出字形，而大字体按单字节查根本是别的字
+        // （hztxt 的 0xB0 查出来是一坨宽 32 单位的乱形）。汉字在 .NET 里都 > 0xFF，不受影响。
+        if (c < 0x100)
         {
             if (ansi?.GetGlyph(c, vertical) is { } ga) return (ansi, ga, ansiScale);
             if (big?.GetGlyph(c, vertical) is { } gb) return (big, gb, bigScale);

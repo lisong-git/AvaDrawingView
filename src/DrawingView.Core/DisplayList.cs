@@ -92,6 +92,25 @@ public sealed class DisplayList : IDisposable
     /// <summary>ACIS 载荷无法解析、只能跳过的 REGION 数。</summary>
     public int RegionUnresolved { get; init; }
 
+    /// <summary>被实体级空间过滤器（ACAD_FILTER/SPATIAL，XCLIP 一类）整块裁掉的实体数。</summary>
+    public int SpatialClipped { get; init; }
+
+    /// <summary>被转换期图层过滤（<see cref="GeometryConvertOptions.HideLayers"/>）跳过的实体数。</summary>
+    public int LayerFiltered { get; init; }
+
+    /// <summary>
+    /// 本图 TTF 文字用到的字体（字体名 → 条数，含"SHX 替身 / 顶替 / 默认兜底"标注，P2-16）。
+    /// 空 = 没有 TTF 文字（全走 SHX 描边）或数据来自旧版本。
+    /// </summary>
+    public IReadOnlyDictionary<string, int> FontUsage { get; init; } = new Dictionary<string, int>();
+
+    /// <summary>
+    /// 本图用到的裁剪区域（世界坐标闭合多边形，P2-17）。**所有权在本实例**：
+    /// 转换器建好后交过来，图元通过 <see cref="CadEntity.ClipPath"/> 共享引用，
+    /// 释放时按引用去重，避免同一对象被 Dispose 两次。
+    /// </summary>
+    public IReadOnlyList<SKPath> ClipPaths { get; init; } = Array.Empty<SKPath>();
+
     /// <summary>是否图纸空间（布局）。线宽显示口径按空间区分，渲染期要用。</summary>
     public bool IsPaperSpace => !string.Equals(ActiveSpace, "Model", StringComparison.OrdinalIgnoreCase);
 
@@ -166,6 +185,16 @@ public sealed class DisplayList : IDisposable
         {
             e.Path?.Dispose();
             e.FillPath?.Dispose();
+        }
+
+        // 裁剪区域是**共享**的（同一个 XCLIP 边界下所有图元引用同一条 SKPath），
+        // 所有权归转换器，经 ClipPaths 一次性交过来 —— 这里按引用去重后释放。
+        if (ClipPaths.Count > 0)
+        {
+            HashSet<SKPath>? seen = null;
+            foreach (var clip in ClipPaths)
+                if ((seen ??= new HashSet<SKPath>(ReferenceEqualityComparer.Instance)).Add(clip))
+                    clip.Dispose();
         }
         Baked?.Dispose();
 

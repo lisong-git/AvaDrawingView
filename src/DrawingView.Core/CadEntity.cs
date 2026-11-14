@@ -38,6 +38,14 @@ public sealed class TextDraw
     /// 与 <see cref="Position"/> 的关系：Position 是第 1 行的基线起点，其余行按本对齐方式在水平方向对齐。
     /// </summary>
     public TextLineAlign LineAlign { get; init; } = TextLineAlign.Left;
+
+    /// <summary>
+    /// 该文字实际使用的字体（P2-16：由样式解析而来）。
+    /// **转换阶段的包围盒与渲染阶段的字形必须用同一份字体**，所以这里把解析结果带下来，
+    /// 渲染端不允许再按全局默认字体重算 —— 换字体就换 cap/em 比例，包围盒立刻与墨迹错位。
+    /// 缺省是默认字体，保证没有样式信息的调用点（编辑器临时文本、测试夹具）行为不变。
+    /// </summary>
+    public TextFont Font { get; init; } = TextFont.Default;
 }
 
 /// <summary>多行文本的行对齐（MTEXT 用）。单行 TEXT 恒为 Left —— 它的对齐已经在 Position 里折好了。</summary>
@@ -120,6 +128,30 @@ public sealed class CadEntity
     /// 值已含 LTSCALE、实体线型比例与块变换缩放，渲染时直接作为 Skia 路径效果使用。
     /// </summary>
     public float[]? DashPattern { get; init; }
-    /// <summary>世界坐标包围盒（用于空间索引与视口裁剪）。</summary>
-    public SKRect Bounds { get; init; }
+
+    /// <summary>
+    /// 该图元要裁到的区域（世界坐标，闭合多边形；null = 不裁，P2-17）。
+    ///
+    /// <para><b>为什么用"渲染期画布裁剪"而不是转换期做布尔求交</b>：Skia 的
+    /// <c>SKPath.Op</c> 按**填充区域**求交，开放路径（LINE/ARC/PLINE）面积为零，
+    /// 求交结果直接是空路径 —— 实测 <c>line.Op(rect, Intersect)</c> 返回 0 个点。
+    /// 之前布局视口的裁剪就是这么写的，等价于把视口里的线条**全部删掉**。
+    /// 画布裁剪对标边、填充、文字一视同仁，结果与 AutoCAD 一致。</para>
+    ///
+    /// <para>代价：带裁剪的图元不能进批次（<c>BakedGeometry</c> 会把它们留在
+    /// <c>UnbatchedEntities</c>），所以只有**真正跨边界**的图元才挂这个字段，
+    /// 完全在区域内的照常合批。</para>
+    ///
+    /// <para>可写：转换器在 <c>ConvertEntity</c> 收尾时统一给本层新增的图元挂上，
+    /// 这里不逐个分支改。</para>
+    /// </summary>
+    public SKPath? ClipPath { get; set; }
+
+    /// <summary>
+    /// 世界坐标包围盒（用于空间索引与视口裁剪）。
+    ///
+    /// <para>可写：被裁剪的图元在转换收尾时要把包围盒收窄到裁剪区域，
+    /// 否则自适应范围会把框外内容算进去（"适应窗口"缩成一小块）。</para>
+    /// </summary>
+    public SKRect Bounds { get; set; }
 }

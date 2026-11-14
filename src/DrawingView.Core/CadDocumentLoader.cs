@@ -21,6 +21,10 @@ public static class CadDocumentLoader
         try { ShxFontLibrary.SetDrawingDirectory(Path.GetDirectoryName(Path.GetFullPath(path))); }
         catch { }
 
+        // TTF 字体族查找同理（P2-16）：图纸自带的 .ttf 优先于系统字体
+        try { TextFontLibrary.SetDrawingDirectory(Path.GetDirectoryName(Path.GetFullPath(path))); }
+        catch { }
+
         progress?.Report("转换几何…");
         ct.ThrowIfCancellationRequested();
         var converter = new GeometryConverter();
@@ -63,6 +67,16 @@ public static class CadDocumentLoader
         if (converter.NonPlottingLayers > 0)
             progress?.Report($"不打印图层：{converter.NonPlottingLayers} 个已默认隐藏"
                              + "（对应 AutoCAD 的 DEFPOINTS，可在图层面板打开）");
+        if (converter.SpatialClipped > 0)
+            progress?.Report($"裁剪边界：{converter.SpatialClipped} 个带空间过滤器的实体在框外，已按 AutoCAD 语义隐藏");
+        if (converter.FontUsage.Count > 0)
+        {
+            // 一眼看出"这张图到底用了哪些字体、有没有落到兜底"（P2-16）
+            var top = converter.FontUsage.OrderByDescending(kv => kv.Value).Take(3)
+                .Select(kv => $"{kv.Key} {kv.Value} 条");
+            int rest = converter.FontUsage.Count - 3;
+            progress?.Report($"字体：{string.Join("，", top)}" + (rest > 0 ? $"，另 {rest} 种" : ""));
+        }
         if (converter.RationalSplineEntities > 0)
             progress?.Report($"有理样条：{converter.RationalSplineEntities} 条（按权重求值）");
         if (converter.WidePolylineEntities > 0)
@@ -101,6 +115,10 @@ public static class CadDocumentLoader
             RegionEntities = converter.RegionEntities,
             RegionLoops = converter.RegionLoops,
             RegionUnresolved = converter.RegionUnresolved,
+            SpatialClipped = converter.SpatialClipped,
+            LayerFiltered = converter.LayerFiltered,
+            FontUsage = new Dictionary<string, int>(converter.FontUsage),
+            ClipPaths = converter.ClipPaths,
             WorldUnitsPerMm = converter.WorldUnitsPerMm,
         };
     }
@@ -117,13 +135,44 @@ public static class CadDocumentLoader
         {
             case ".dwg":
                 using (var reader = new DwgReader(path))
-                    return reader.Read();
+                {
+                    var doc = reader.Read();
+                    AttachAcisFromDataStorage(doc);
+                    return doc;
+                }
             case ".dxf":
                 using (var reader = new DxfReader(path))
                     return reader.Read();
             default:
                 throw new NotSupportedException($"不支持的文件格式: {ext}");
         }
+    }
+
+    private static void AttachAcisFromDataStorage(ACadSharp.CadDocument doc)
+    {
+        var storage = doc.DataStorage;
+        if (storage is null) return;
+
+        void Walk(IEnumerable<ACadSharp.Entities.Entity> entities)
+        {
+            foreach (var e in entities)
+            {
+                if (e is not ACadSharp.Entities.ModelerGeometry mg) continue;
+                if (mg.AcisData is { Length: > 0 }) continue;
+                try
+                {
+                    if (storage.TryGetDataByHandle(e.Handle, out var blob) && blob is { Length: > 0 })
+                        mg.AcisData = blob;
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        Walk(doc.ModelSpace.Entities);
+        Walk(doc.PaperSpace.Entities);
+        foreach (var block in doc.BlockRecords) Walk(block.Entities);
     }
 
     private static SKRect ComputeExtents(IReadOnlyList<CadEntity> entities)
@@ -180,7 +229,7 @@ public static class CadDocumentLoader
     }
 
     /// <summary>文件头记录的模型空间范围（EXTMIN/EXTMAX）；不可用（未填/退化）时返回 null。</summary>
-    private static SKRect? HeaderModelSpaceRect(ACadSharp.CadDocument doc)
+    internal static SKRect? HeaderModelSpaceRect(ACadSharp.CadDocument doc)
     {
         try
         {

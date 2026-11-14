@@ -96,6 +96,64 @@ public sealed class ShxFont
     /// <summary>该字体能不能竖排：大字体（中文）都行，西文字体看 modes 的 bit2。</summary>
     public bool SupportsVertical => Kind == FontKind.BigFont || (Modes & 2) != 0;
 
+    /// <summary>
+    /// 已标定的大字体（字体单位）：<c>Cap</c> = 一个文字高度对应多少单位，
+    /// <c>Adv</c> = 一个字的固定前进量，<c>Lift</c> = 画之前要把字形整体上抬多少。
+    ///
+    /// <para><b>为什么要标定</b>：大字体的字身框在字库里没有声明（头部没有 above/below），
+    /// 只能反推；而各家字库的画法并不统一 —— <c>gbcbig</c> 的字形挂在基线上方、左右居中；
+    /// <c>hztxt</c> 的字形从基线**往下**画（上沿只有 5、下沿 −115），前进量还是 1 em
+    /// 而不是字身墨迹宽。用统一启发式反推 hztxt 会得到"字高 1/40"这类离谱值，
+    /// 整串中文被压成一个点，屏幕上等于没画。</para>
+    ///
+    /// <para><b>数值来源</b>：<c>.compare/gen_adv_cjk.py</c> 生成"同字 n=9 与 n=10"
+    /// 的基准 DXF（字高 400，simplex + 大字体），交给 ODA 渲染后量两行墨迹：
+    /// 前进量 = 两行宽度差，字高换算 = 400 / (墨迹高 / 该字在字库里的字身高度)，
+    /// 抬升 = 墨迹下沿与基线的差。<c>hztxt</c> 实测前进量 400 = 字高 1 em、
+    /// 字身 100 单位对应 316 世界单位、墨迹下沿在基线上方 44（即字库画法低了约 106 单位）；
+    /// <c>gbcbig</c> 实测前进量 0.73 em、字身 90 单位、基线无偏移。</para>
+    ///
+    /// <para>表里没有的字库仍走反推启发式（行为与加表之前一致），抬升按 0 处理。</para>
+    /// </summary>
+    private static readonly Dictionary<string, (float Cap, float Adv, float Lift)> BigFontKnown =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["gbcbig"] = (87.3f, 63.5f, -5.8f),
+            ["hztxt"] = (126f, 126f, -10.8f),
+        };
+
+    private (float Cap, float Adv, float Lift)? Known
+    {
+        get
+        {
+            if (Kind != FontKind.BigFont) return null;
+            if (string.IsNullOrEmpty(Path)) return null;
+            string stem = System.IO.Path.GetFileNameWithoutExtension(Path);
+            return BigFontKnown.TryGetValue(stem, out var v) ? v : null;
+        }
+    }
+
+    /// <summary>
+    /// 画字形前要整体上抬的字体单位数（见 <see cref="BigFontKnown"/>）。
+    /// 0 = 该字库的字形本来就挂在基线上方。
+    /// </summary>
+    public float BaselineLiftUnits => Known?.Lift ?? 0f;
+
+    /// <summary>
+    /// 记录里 <c>07</c>（DRAW_SUBSHAPE）操作数占几个字节：unifont 恒为 2；
+    /// 大字体各编码器不一致 —— <c>hztxt</c> 是 1（<c>07 01 08 …</c>），
+    /// <c>gbcbig</c> 是 2（<c>07 8e 05 …</c>）。
+    ///
+    /// <para><b>读错的后果不是"少画一个子形"，而是整条命令流错位一个字节</b>：
+    /// <c>hztxt</c> 按 2 字节读，<c>07 01 09</c> 后面的 <c>05 04 06 04 07</c> 会被当成
+    /// 连续 MUL，比例放大到 42 倍；<c>月</c> 只剩一个小勾、<c>大</c> 直接拉到图外，
+    /// 屏幕上就是"这几个字不见了／变成乱线"。所以按字形自检结果定，不写死。</para>
+    /// </summary>
+    private readonly int _subBytes;
+
+    /// <summary>自检期间临时指定的操作数宽度（0 = 用 <see cref="_subBytes"/>）。</summary>
+    private int _subProbe;
+
     private ShxFont(string path, FontKind kind, Dictionary<int, byte[]> raw, int above, int below, int modes, string name)
     {
         Path = path;
@@ -106,6 +164,48 @@ public sealed class ShxFont
         Modes = modes;
         Name = name;
         _gbk = kind == FontKind.BigFont ? TryGetGbk() : null;
+        _subBytes = kind == FontKind.Unifont ? 2 : 1;
+        if (kind is FontKind.BigFont or FontKind.Shapes) _subBytes = DetectSubShapeBytes();
+    }
+
+    /// <summary>
+    /// 用两种操作数宽度各解一批字形，取"字形落在字身框内"比例高的那种。
+    /// 合格判据：至少 2 段、全部端点落在 [-40,200]² 内（正常大字体字形是 0..100 上下）。
+    /// </summary>
+    private int DetectSubShapeBytes()
+    {
+        int best = 1;
+        double bestScore = -1;
+        for (int n = 1; n <= 2; n++)
+        {
+            _subProbe = n;
+            int ok = 0, total = 0;
+            foreach (var kv in _raw)
+            {
+                if (kv.Value.Length < 3) continue;
+                // 均匀抽样，避免只看开头几个字（开头多是标点）
+                if (++total % 7 != 0) continue;
+                if (ScoreGlyph(kv.Value)) ok++;
+                if (total > 1200) break;
+            }
+            double score = total == 0 ? 0 : (double)ok / Math.Max(1, total / 7);
+            if (score > bestScore) { bestScore = score; best = n; }
+        }
+        _subProbe = 0;
+        return best;
+    }
+
+    private bool ScoreGlyph(byte[] body)
+    {
+        var pen = new Pen { Scale = 1f };
+        try { Run(body, pen, 0); }
+        catch { return false; }
+        pen.Flush();
+        if (pen.Polys.Count < 2) return false;
+        foreach (var poly in pen.Polys)
+            foreach (var p in poly)
+                if (p.X < -40f || p.X > 200f || p.Y < -40f || p.Y > 200f) return false;
+        return true;
     }
 
     // ---------- 载入 ----------
@@ -235,26 +335,45 @@ public sealed class ShxFont
     private static byte[] StripGlyphPrefix(byte[] d, int off, int len, int code)
     {
         int start = off, end = off + len;
-        if (end - start > 6 && d[start] == (byte)(code >> 8) && d[start + 1] == (byte)(code & 0xFF) && d[start + 2] == 0)
-            start += 6;
-        else
-        {
-            if (d[start] is >= 0x20 and <= 0x7E)
-            {
-                for (int k = start; k < Math.Min(start + 3, end); k++)
-                {
-                    if (d[k] != 0) continue;
-                    start = k + 1;
-                    break;
-                }
-            }
-            int z = 0;
-            while (z < 2 && start + z < end && d[start + z] == 0) z++;
-            start += z;
-        }
+        const int NameLimit = 48;
+        int z = -1;
+        for (int k = start, lim = Math.Min(end, start + NameLimit); k < lim; k++)
+            if (d[k] == 0) { z = k; break; }
+        if (z >= 0 && LooksLikePrefix(d, start, z, code)) start = z + 1;
         var body = new byte[end - start];
         Array.Copy(d, start, body, 0, body.Length);
         return body;
+    }
+
+    /// <summary>
+    /// 第一个 0x00 之前的那几个字节是不是"前缀"而不是命令流。
+    ///
+    /// <para>三类合法前缀：① 可打印 ASCII 的字形名（unifont 的 <c>"EQUALS SIGN"</c>、
+    /// hztxt 的 <c>'0'</c>）；② 与内码相同的两字节（gbcbig 的 <c>CC EF 00</c>）；
+    /// ③ 全部 ≥ 0x80 的字节 —— 单字节旧内码（simplex 西里尔 0x0410 的前缀是 CP866 的
+    /// <c>80 00</c>、gbenor 0x00FF 的 <c>FF 00</c>）或 GBK 注释（gbcbig 0x8E/0x8F 的
+    /// 32 字节"起始描述(…)"）。</para>
+    ///
+    /// <para><b>不能只要见到 0x00 就当前缀</b>：命令流里的 XY 位移常常是 <c>08 00 00</c>
+    /// （dx=0）或 <c>02 08 00 00</c>（抬笔到原点），照这个剥会把整条字形砍成空。
+    /// 与 ③ 的分界：真实命令流的第一段必有 <c>&lt;0x80</c> 的指令字节（落笔/抬笔/位移）
+    /// 打头，前缀字节全 ≥ 0x80 的只有内码和注释；合成字库记录 <c>02 08 00 00</c> 的
+    /// <c>02 08</c> 就因含 0x02 被正确拒绝。</para>
+    /// </summary>
+    private static bool LooksLikePrefix(byte[] d, int start, int z, int code)
+    {
+        int n = z - start;
+        if (n == 0) return true;                                   // 直接以 0x00 开头
+        bool ascii = true, high = true;
+        for (int k = start; k < z; k++)
+        {
+            byte b = d[k];
+            if (b < 0x20 || b > 0x7E) ascii = false;
+            if (b < 0x80) high = false;
+        }
+        if (ascii || high) return true;
+        // 内码前缀：两个字节必须**正好**等于该记录的内码
+        return n == 2 && d[start] == (byte)(code >> 8) && d[start + 1] == (byte)(code & 0xFF);
     }
 
     private static uint ReadU32(byte[] d, int i)
@@ -273,27 +392,66 @@ public sealed class ShxFont
     /// 字符里 78 个精确命中），说明 AutoCAD 口径是"按 above 缩放"，不是"按大写字高"。  </para>
     ///
     /// <para><b>bigfont 用实测上沿</b>：大字体头部没有 above/below，ODA 自己用的是
-    /// 90.67 单位（gbcbig 反推，14 个汉字完全一致），与实测"中"上沿 90 差 0.7%。</para>
+    /// 90.67 单位（gbcbig 反推，14 个汉字完全一致），与实测"中"上沿 90 差 0.7%。
+    /// 已知字库走 <see cref="BigFontKnown"/> 的标定值，其余才用这个启发式。</para>
     /// </summary>
     public float CapUnits
     {
         get
         {
             if (_capUnits is { } v) return v;
+            if (Known is { } kn) { _capUnits = kn.Cap; return kn.Cap; }
 
             ReadOnlySpan<char> sample = Kind == FontKind.BigFont
                 ? "国工日中田山大小上建设说明平面图口"
                 : "HEXN0A";
-            float max = 0f;
+            var tops = new List<float>(sample.Length);
+            var heights = new List<float>(sample.Length);
             foreach (char c in sample)
             {
                 if (GetGlyph(c) is not { } g) continue;
+                float top = float.MinValue, bot = float.MaxValue;
                 foreach (var poly in g.Polylines)
                 foreach (var p in poly)
-                    if (p.Y > max) max = p.Y;
+                {
+                    if (p.Y > top) top = p.Y;
+                    if (p.Y < bot) bot = p.Y;
+                }
+                if (top <= float.MinValue) continue;
+                tops.Add(top);
+                heights.Add(top - bot);
+            }
+
+            float max = 0f;
+            if (tops.Count > 0)
+            {
+                max = tops[0];
+                for (int i = 1; i < tops.Count; i++) if (tops[i] > max) max = tops[i];
             }
 
             float cap = max;
+            if (Kind == FontKind.BigFont && heights.Count >= 4)
+            {
+                // 大字体用"稳健字身":整表最大值会被个别坏字形带飞（hztxt 里混进了
+                // y=3942 的字形，正常汉字都在 100 上下，照最大值算整串中文会被压成
+                // 1/40 大小 → 屏幕上什么都不剩）。取字身高度中位数圈出正常量级：
+                //   · gbcbig 这类字形都挂在基线上方 → 上沿(90) 就是口径，保持原值；
+                //   · hztxt 这类字形从基线**往下**画（上沿只有 5、下沿 -115）→
+                //     上沿没意义，退回"字身高度中位数"。
+                var sortedH = new List<float>(heights);
+                sortedH.Sort();
+                float medH = sortedH[sortedH.Count / 2];
+                if (medH < 1f) medH = 1f;
+                float robustTop = 0f;
+                for (int i = 0; i < tops.Count; i++)
+                {
+                    float h = heights[i];
+                    if (h < medH * 0.6f || h > medH * 1.6f) continue;   // 离群字形不参与
+                    if (tops[i] <= medH * 1.6f && tops[i] > robustTop) robustTop = tops[i];
+                }
+                cap = robustTop >= medH * 0.3f ? robustTop : medH;
+            }
+
             if (Kind == FontKind.Unifont && Above > 0)
             {
                 // 兜底：above 明显不合理时（比如坏字库里写成 0 或离谱的大值）仍用实测上沿。
@@ -316,9 +474,12 @@ public sealed class ShxFont
     /// <b>也不能用字高</b>：gbcbig 是压缩大字体，字身框宽 ≈ 66 单位而字高 ≈ 90 单位
     /// （0.73 em），按 1 em 走每行宽出 37%。</para>
     ///
-    /// <para>这里利用"汉字在字身框内水平居中"这一点反推框宽 = 左沿中位数 + 右沿中位数
+    /// <para>取"左沿中位数 + 右沿中位数"：汉字在字身框内水平居中时，这个和就是格宽
     /// （gbcbig 实测 5 + 61 = 66，与 ODA 参考渲染反推的 65.6 差 0.6%）。中位数对
     /// 标点/窄字和少量超宽字形都稳健；采样 240 个字形就够（顺序采样，结果可复现）。</para>
+    ///
+    /// <para>居中的前提不是所有大字体都成立（hztxt 的字形左右偏置各不相同，反推只有 53
+    /// 而实测前进量是 126），这类字库走 <see cref="BigFontKnown"/> 的标定值。</para>
     ///
     /// <para>非大字体返回 0，表示"按每个字形自己的 Advance 走"。</para>
     /// </summary>
@@ -328,6 +489,7 @@ public sealed class ShxFont
         {
             if (_advanceUnits is { } v) return v;
             if (Kind != FontKind.BigFont) { _advanceUnits = 0f; return 0f; }
+            if (Known is { } kna) { _advanceUnits = kna.Adv; return kna.Adv; }
 
             const int Sample = 240;
             var codes = new int[_raw.Count];
@@ -669,21 +831,10 @@ public sealed class ShxFont
 
                 case 0x7:   // DRAW_SUBSHAPE
                 {
+                    // 操作数宽度按字体实测（见 SubShapeBytes）：hztxt 1 字节、gbcbig 2 字节。
                     int sub = -1;
-                    if (Kind == FontKind.Unifont)
+                    if ((_subProbe != 0 ? _subProbe : _subBytes) >= 2)
                     {
-                        if (i + 1 >= g.Length) return;
-                        sub = (g[i] << 8) | g[i + 1];
-                        i += 2;
-                    }
-                    else if (Kind == FontKind.BigFont)
-                    {
-                        // 大字体子形是**双字节内码**，且找不到就"不画"，不能退回单字节。
-                        //
-                        // gbcbig 的每条记录是 "<内码> 00 07 8e 05 <命令流> 07 8f 00"（7016/7018 条
-                        // 尾部都是这 3 个字节），其中 0x8F00 / 0x8E05 都不是有效内码 —— 是编码器
-                        // 留下的空子形引用。若退回单字节读成 0x8F，会命中 0x008F（"静夜思"整首诗
-                        // 的字形），于是每个汉字底下多出一坨星形图案。
                         if (i + 1 >= g.Length) return;
                         sub = (g[i] << 8) | g[i + 1];
                         i += 2;
@@ -693,7 +844,11 @@ public sealed class ShxFont
                         if (i >= g.Length) return;
                         sub = g[i++];
                     }
-                    if (run && sub >= 0 && _raw.TryGetValue(sub, out var sg)) Run(sg, pen, depth + 1);
+                    // 子形本身只在 unifont 里画：大字体的子形引用要么是空引用，要么是
+                    // "说明文字"记录（gbcbig 的 0x8E/0x8F 是整首《静夜思》），画出来就是
+                    // 每个汉字底下多一坨星形。
+                    if (run && sub >= 0 && Kind == FontKind.Unifont && _raw.TryGetValue(sub, out var sg))
+                        Run(sg, pen, depth + 1);
                     break;
                 }
 

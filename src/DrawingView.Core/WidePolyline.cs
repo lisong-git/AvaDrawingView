@@ -113,7 +113,20 @@ public static class WidePolyline
         var path = new SKPath();
         path.MoveTo(left[0]);
         for (int i = 1; i < left.Count; i++) path.LineTo(left[i]);
-        for (int i = right.Count - 1; i >= 0; i--) path.LineTo(right[i]);
+        if (closed)
+        {
+            // 闭合折线：左、右两条偏移链必须各自绕回起点，否则收尾那一段的带宽两侧边全丢
+            // （轮廓退化成 C 形开口，只剩另外三个方向有带宽）。两条接缝落在同一个顶点上、
+            // 方向相反，winding 相互抵消，孔洞仍然正确。
+            path.LineTo(left[0]);
+            path.LineTo(right[0]);
+            for (int i = right.Count - 1; i >= 1; i--) path.LineTo(right[i]);
+            path.LineTo(right[0]);
+        }
+        else
+        {
+            for (int i = right.Count - 1; i >= 0; i--) path.LineTo(right[i]);
+        }
         path.Close();
         return path;
     }

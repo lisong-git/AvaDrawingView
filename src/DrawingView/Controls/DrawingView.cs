@@ -29,10 +29,17 @@ public class DrawingView : Control
     private static readonly HashSet<string> NoHiddenLayers = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// 文本像素高度下限（ReadCAD 的 MinTextPixelSize 取 5）：低于此值不绘制。
-    /// 文字在 5px 以下不可读，绘制它只会白白消耗时间。
+    /// 文本大写字高的屏幕像素下限：低于此值不再按字形绘制，改画等宽色条。
+    ///
+    /// 完全跳过（老做法）的后果是整块文字区"凭空消失"：
+    /// 中文图纸字高大都在 200–500 单位，整图适配时 capPx 只有 1~2px，
+    /// 一屏几千条字全被吃掉，对照 ODA 少了三成以上墨量。
+    /// 色条是 AutoCAD/ODA 缩到极限时的观感（字已经不可读，但"那里有字"必须还在）。
     /// </summary>
-    public const float DefaultMinTextPixelSize = 5f;
+    public const float DefaultMinTextPixelSize = 2f;
+
+    /// <summary>色条也不画的下限：再小连一像素都占不满，画了只会把图糊成一片。</summary>
+    public const float DefaultMinTextBarPixelSize = 0.1f;
 
     /// <summary>
     /// 几何实体像素尺寸下限（对应 ReadCAD 的 MinEntityPixelSize）。
@@ -50,6 +57,9 @@ public class DrawingView : Control
     /// 想进一步提速可随 ReadCAD 调到 3.0，代价是屏幕上 1~3px 的细碎构件不再绘制。
     /// </summary>
     public float MinEntityPixelSize { get; set; } = 1.5f;
+
+    /// <summary>逐实体路径的填充绘制计数（诊断用：seen 进入 / lodSkip 被 LOD 剔 / drawn 实际下发）。</summary>
+    public static int DiagFillSeen, DiagFillLodSkip, DiagFillDrawn;
 
     private bool _showLineWeights;
 
@@ -117,6 +127,7 @@ public class DrawingView : Control
     private SKPoint _panOffsetStart;
     private Point? _lastMiddlePress;
     private long _lastMiddlePressTicks;
+    private KeyModifiers _modsAtPress;
 
     // ---------- 选择（步骤 B：点选 / 高亮 / zoom-to） ----------
     // 渲染线程读 _selectedSnapshot，UI 线程写入：替换引用而非原地改列表（不可变快照原则）。
@@ -143,6 +154,48 @@ public class DrawingView : Control
     /// <summary>当前选中实体（不可变快照）。</summary>
     public IReadOnlyList<CadEntity> SelectedEntities => _selectedSnapshot;
 
+    // ---------- 淡化 / 禁止拾取（在位面域打标签） ----------
+    // 与选中集合同一套交付方式：整个引用替换，渲染线程只读。
+    // 语义 = 「这组图元只当背景」：画布上冲淡，点选 / 框选都跳它。
+    private (ulong Outer, ulong Inner)[] _dimmedSnapshot = Array.Empty<(ulong, ulong)>();
+
+    /// <summary>
+    /// 置为「淡化且不可拾取」的实体集合（<c>(最外层句柄, 自身句柄)</c>，Inner = 0 = 整个外层）。
+    /// 已在选中集里的会被摘掉 —— 淡化的图元同时是选中项的话，用户会以为它还能操作。
+    /// </summary>
+    public void SetDimmedTargets(IEnumerable<(ulong Outer, ulong Inner)> targets)
+    {
+        _dimmedSnapshot = targets?.Where(t => t.Outer != 0).Distinct().ToArray()
+                          ?? Array.Empty<(ulong, ulong)>();
+        var selected = _selectedSnapshot;
+        if (_dimmedSnapshot.Length > 0 && selected.Count > 0)
+        {
+            var keep = selected.Where(e => !IsDimmedEntity(e)).ToArray();
+            if (keep.Length != selected.Count)
+            {
+                _selectedSnapshot = keep;
+                SelectionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+        InvalidateVisual();
+    }
+
+    /// <summary>当前淡化 / 不可拾取的实体组数（自检与诊断用）。</summary>
+    public int DimmedCount => _dimmedSnapshot.Length;
+
+    /// <summary>该图元是否处于淡化 / 不可拾取状态。</summary>
+    public bool IsDimmedEntity(CadEntity e)    {
+        var dimmed = _dimmedSnapshot;
+        if (dimmed.Length == 0 || e is null) return false;
+        foreach (var t in dimmed)
+        {
+            if (e.Handle != t.Outer) continue;
+            // 顶层面域 OwnHandle == Handle，Inner 传真实句柄或 0 都应命中
+            if (t.Inner == 0 || e.OwnHandle == t.Inner || e.OwnHandle == t.Outer) return true;
+        }
+        return false;
+    }
+
     private List<SubEntityPick> _subPicks;
     private bool _subPickOwnsOverlay;
 
@@ -151,6 +204,15 @@ public class DrawingView : Control
 
     /// <summary>二级拾取集合变化时触发（含框选清空时的空列表。UI 线程）。</summary>
     public event EventHandler<IReadOnlyList<SubEntityPick>>? SubEntitiesPicked;
+
+    /// <summary>
+    /// 显式定位（按句柄 / 目标集合 / 叠加层跳转）完成后触发，带目标的世界与屏幕矩形。
+    ///
+    /// <para>只在这些"用户动作引起的跳转"上发；首屏适应窗口、换图、滚轮缩放、拖拽平移都不发
+    /// —— 那些是视图自身行为，弹提示反而干扰。宿主接这个事件去画"已定位"反馈
+    /// （<see cref="LocateMarker"/>），反馈层重绘不触发本控件的绘制操作。</para>
+    /// </summary>
+    public event EventHandler<ViewportLocatedEventArgs>? Located;
 
     /// <summary>
     /// 二级拾取解析器：命中实体被「再次点击」或 Ctrl+点击时调用。
@@ -168,7 +230,12 @@ public class DrawingView : Control
     public Func<SKRect, bool, IReadOnlyList<SubEntityPick>>? SubEntitiesInRectResolver { get; set; }
 
     /// <summary>单点拾取（屏幕坐标）：容差内最近的实体；无命中返回 null。</summary>
-    public CadEntity? HitTest(SKPoint screenPoint, float tolerancePx = 5f)
+    /// <param name="includeDimmed">
+    /// true 时连「淡化 / 不可拾取」的实体一起参与命中。只给子图元拾取用 ——
+    /// 在位面域模式下面域本体不能进选中集，但它仍是「轮廓环 / 边」的拾取入口，
+    /// 跳过它等于连子图元都选不出来。
+    /// </param>
+    public CadEntity? HitTest(SKPoint screenPoint, float tolerancePx = 5f, bool includeDimmed = false)
     {
         if (_display is null) return null;
         var world = Viewport.ScreenToWorld(screenPoint);
@@ -181,6 +248,7 @@ public class DrawingView : Control
         foreach (var e in candidates)
         {
             if (_hidden.Count > 0 && _hidden.Contains(e.Layer)) continue;
+            if (!includeDimmed && IsDimmedEntity(e)) continue;   // 在位面域模式：面域本体只当背景
             if (!e.Bounds.IntersectsWith(rect)) continue;
             double d = DistanceToEntity(e, world, tolWorld);
             if (d < bestDist)
@@ -236,12 +304,32 @@ public class DrawingView : Control
         InvalidateVisual();
     }
 
-    /// <summary>单选切换（点击命中调用）。</summary>
-    private void SelectAt(Point p, bool subRequested)
+    /// <summary>单选切换（点击命中调用）。<paramref name="additive"/> = Shift：只往选择集里加，不切换。</summary>
+    private void SelectAt(Point p, bool subRequested, bool additive)
     {
-        var hit = HitTest(new SKPoint((float)p.X, (float)p.Y));
+        var screen = new SKPoint((float)p.X, (float)p.Y);
+        var hit = HitTest(screen);
         if (hit is null)
         {
+            // 在位面域模式：面域本体被排除在选中之外，但点它仍然是「选轮廓环 / 边」的入口。
+            // 这里用含淡化项的命中再问一次二级拾取 —— 拿到子图元就只设子图元，不设选中集。
+            if (SubEntityResolver != null)
+            {
+                var soft = HitTest(screen, 5f, includeDimmed: true);
+                if (soft != null && IsDimmedEntity(soft))
+                {
+                    var sw = Viewport.ScreenToWorld(screen);
+                    var stol = 5f / MathF.Max(Viewport.Zoom, 1e-6f);
+                    var spick = SubEntityResolver(soft, sw, stol);
+                    if (spick != null)
+                    {
+                        if (additive) AddSubPick(spick);
+                        else if (subRequested) ToggleSubPick(spick);
+                        else SetSubPicks(new[] { spick });
+                        return;
+                    }
+                }
+            }
             ClearSelection();
             return;
         }
@@ -255,7 +343,9 @@ public class DrawingView : Control
             if (pick != null)
             {
                 // Ctrl+点 = 切换：已选中的子图元再次 Ctrl+点取消，未选的加入（可与框选混用）
-                if (subRequested) ToggleSubPick(pick);
+                // Shift+点 = 只增：重复点同一条保持不变，绝不把已有的挤掉
+                if (additive) AddSubPick(pick);
+                else if (subRequested) ToggleSubPick(pick);
                 else SetSubPicks(new[] { pick });
                 return;
             }
@@ -293,8 +383,7 @@ public class DrawingView : Control
         {
             foreach (var q in _subPicks)
             {
-                if (q.Handle == pick.Handle && q.OwnHandle == pick.OwnHandle
-                    && string.Equals(q.SubPath, pick.SubPath, System.StringComparison.Ordinal))
+                if (SameSubPick(q, pick))
                 {
                     removed = true;   // 直接丢弃：其几何随旧叠加层延迟释放一并回收
                     continue;
@@ -306,6 +395,62 @@ public class DrawingView : Control
             next.Add(pick);
         SetSubPicks(next);
     }
+
+    /// <summary>
+    /// Shift+点追加：已在集合中的同一子图元保持原位（不取消），其余全部保留。
+    /// </summary>
+    private void AddSubPick(SubEntityPick pick) => AddSubEntityPicks(new[] { pick });
+
+    /// <summary>
+    /// 程序化追加二级拾取（与 Shift+点同一条合成规则）：按 (Handle, OwnHandle, SubPath)
+    /// 去重，已存在的不再重复加入、也不移除。空集合 / 全部重复时不改动现有拾取。
+    /// </summary>
+    public void AddSubEntityPicks(IReadOnlyList<SubEntityPick> picks)
+    {
+        if (picks == null || picks.Count == 0) return;
+        var next = new List<SubEntityPick>();
+        if (_subPicks is { Count: > 0 })
+        {
+            foreach (var q in _subPicks)
+                next.Add(ClonePick(q));
+        }
+        var changed = false;
+        foreach (var p in picks)
+        {
+            if (p == null) continue;
+            if (next.Exists(q => SameSubPick(q, p)))
+            {
+                // 这一份是高亮几何的唯一持有者：不进叠加层就得自己放掉
+                if (!IsLivePick(p)) DisposePick(p);
+                continue;
+            }
+            next.Add(p);
+            changed = true;
+        }
+        if (changed)
+            SetSubPicks(next);
+        else
+            SubEntitiesPicked?.Invoke(this, CurrentSubPicks);   // 无变化也要回一次状态（宿主提示用）
+    }
+
+    private bool IsLivePick(SubEntityPick p)
+    {
+        if (_subPicks == null) return false;
+        foreach (var q in _subPicks)
+            if (ReferenceEquals(q, p)) return true;
+        return false;
+    }
+
+    private static void DisposePick(SubEntityPick p)
+    {
+        if (p?.Highlight == null) return;
+        foreach (var s in p.Highlight)
+            s?.Path?.Dispose();
+    }
+
+    private static bool SameSubPick(SubEntityPick a, SubEntityPick b)
+        => a.Handle == b.Handle && a.OwnHandle == b.OwnHandle
+           && string.Equals(a.SubPath, b.SubPath, System.StringComparison.Ordinal);
 
     /// <summary>
     /// 复用既有拾取必须深拷贝高亮几何：旧叠加层 Release 后（含延迟释放窗口）
@@ -380,6 +525,7 @@ public class DrawingView : Control
         foreach (var e in _display.Index.Query(worldRect))
         {
             if (_hidden.Count > 0 && _hidden.Contains(e.Layer)) continue;
+            if (IsDimmedEntity(e)) continue;      // 框选同样跳过淡化的面域本体
             bool hit = window ? worldRect.Contains(e.Bounds) : worldRect.IntersectsWith(e.Bounds);
             if (hit) hits.Add(e);
         }
@@ -389,8 +535,10 @@ public class DrawingView : Control
 
     /// <summary>
     /// 缩放到世界矩形（padding &gt; 1 时留白）。对应 WPF/Teigha 的 Zoom(Extents3d, scale)。
+    /// <paramref name="notify"/> = true 时视口落定后触发 <see cref="Located"/>
+    /// （用户显式跳转用；首屏适应窗口、换图不传）。
     /// </summary>
-    public void ZoomTo(SKRect worldRect, float padding = 1.2f)
+    public void ZoomTo(SKRect worldRect, float padding = 1.2f, bool notify = false)
     {
         float padX = worldRect.Width * (padding - 1f) / 2f;
         float padY = worldRect.Height * (padding - 1f) / 2f;
@@ -399,10 +547,12 @@ public class DrawingView : Control
             worldRect.Right + padX, worldRect.Bottom + padY);
         Viewport.Fit(inflated, (float)Bounds.Width, (float)Bounds.Height);
         InvalidateVisual();
+        // 先落视口再算屏幕矩形：环要套在目标上，不能套在跳转前的位置
+        if (notify) RaiseLocated(worldRect);
     }
 
     /// <summary>缩放到实体集合包围盒（对应 WPF 版 Zoom(ObjectId[])）。</summary>
-    public void ZoomTo(IEnumerable<CadEntity> entities, float padding = 1.2f)
+    public void ZoomTo(IEnumerable<CadEntity> entities, float padding = 1.2f, bool notify = false)
     {
         bool any = false;
         float l = float.MaxValue, t = float.MaxValue, r = float.MinValue, btm = float.MinValue;
@@ -412,7 +562,7 @@ public class DrawingView : Control
             l = MathF.Min(l, e.Bounds.Left); t = MathF.Min(t, e.Bounds.Top);
             r = MathF.Max(r, e.Bounds.Right); btm = MathF.Max(btm, e.Bounds.Bottom);
         }
-        if (any) ZoomTo(SKRect.Create(l, t, r - l, btm - t), padding);
+        if (any) ZoomTo(SKRect.Create(l, t, r - l, btm - t), padding, notify);
     }
 
     /// <summary>按 ACadSharp 句柄定位（标注面板点击跳转用）；命中返回 true。</summary>
@@ -420,8 +570,28 @@ public class DrawingView : Control
     {
         if (_display is null || handle == 0) return false;
         if (!_display.HandleBounds.TryGetValue(handle, out var rect)) return false;
-        ZoomTo(rect, padding);
+        ZoomTo(rect, padding, notify: true);
         return true;
+    }
+
+    /// <summary>把世界矩形换算成控件坐标（Y 轴翻转后取包围盒）。</summary>
+    public Rect WorldToScreen(SKRect world)
+    {
+        var a = Viewport.WorldToScreen(new SKPoint(world.Left, world.Top));
+        var b = Viewport.WorldToScreen(new SKPoint(world.Right, world.Bottom));
+        return new Rect(
+            Math.Min(a.X, b.X), Math.Min(a.Y, b.Y),
+            Math.Abs(b.X - a.X), Math.Abs(b.Y - a.Y));
+    }
+
+    /// <summary>触发 <see cref="Located"/>：目标世界矩形 → 屏幕矩形。</summary>
+    private void RaiseLocated(SKRect world)
+    {
+        var handler = Located;
+        if (handler is null) return;
+        if (!float.IsFinite(world.Left) || !float.IsFinite(world.Top)
+            || !float.IsFinite(world.Width) || !float.IsFinite(world.Height)) return;
+        handler(this, new ViewportLocatedEventArgs(world, WorldToScreen(world), Viewport.Zoom));
     }
 
     /// <summary>按句柄集合设置选中高亮（标注面板联动用）；返回实际命中的实体数。</summary>
@@ -483,7 +653,7 @@ public class DrawingView : Control
         var list = targets as IReadOnlyCollection<(ulong Outer, ulong Inner)> ?? targets.ToArray();
         if (list.Count == 0) return false;
         if (SetSelectionBySubTargets(list) == 0) return false;
-        ZoomTo(_selectedSnapshot, padding);
+        ZoomTo(_selectedSnapshot, padding, notify: true);
         return true;
     }
 
@@ -560,7 +730,7 @@ public class DrawingView : Control
             r = MathF.Max(r, box.Right); b = MathF.Max(b, box.Bottom);
         }
         if (!any) return false;
-        ZoomTo(SKRect.Create(l, t, r - l, b - t), padding);
+        ZoomTo(SKRect.Create(l, t, r - l, b - t), padding, notify: true);
         return true;
     }
 
@@ -655,8 +825,11 @@ public class DrawingView : Control
 
     public ViewportState Viewport { get; } = new();
 
-    /// <summary>文本绘制的最小像素高度，低于此值跳过。</summary>
+    /// <summary>文本按字形绘制的最小像素高度，低于此值改画等宽色条。</summary>
     public float MinTextPixelSize { get; set; } = DefaultMinTextPixelSize;
+
+    /// <summary>低于此像素高度连色条也不画（完全亚像素的字，画了只会糊成一团）。</summary>
+    public float MinTextBarPixelSize { get; set; } = DefaultMinTextBarPixelSize;
 
     public DrawingView()
     {
@@ -688,6 +861,9 @@ public class DrawingView : Control
 
         // 换图后旧实体的选择无意义：清空（不再触发 SelectionChanged，调用方自己感知换图）
         _selectedSnapshot = Array.Empty<CadEntity>();
+
+        // 淡化集合同样按图存在：句柄属于上一张图，留着会把新图的图元误判成背景
+        _dimmedSnapshot = Array.Empty<(ulong, ulong)>();
 
         // 叠加高亮同样按图存在：其几何是上一张图的世界坐标，留着只会画到错误的位置
         ClearOverlay();
@@ -813,6 +989,9 @@ public class DrawingView : Control
     protected override void OnPointerPressed(PointerPressedEventArgs e)
     {
         var pt = e.GetCurrentPoint(this);
+        // 修饰键以按下瞬间为准：抬起时才读 e.KeyModifiers 会被"先松修饰键再松鼠标"打空
+        // （注入式点击尤其明显：WM_LBUTTONUP 与 WM_KEYUP 都在队列里，处理时 Shift 已被抬起）
+        _modsAtPress = e.KeyModifiers;
         if (pt.Properties.IsMiddleButtonPressed || pt.Properties.IsRightButtonPressed)
         {
             if (pt.Properties.IsMiddleButtonPressed && IsMiddleDoubleClick(pt.Position))
@@ -904,13 +1083,16 @@ public class DrawingView : Control
             var dx = p.X - bs.X; var dy = p.Y - bs.Y;
             if (dx * dx + dy * dy <= 16)
             {
-                SelectAt(p, e.KeyModifiers.HasFlag(KeyModifiers.Control));
+                var ctrl = _modsAtPress.HasFlag(KeyModifiers.Control);
+                var shift = _modsAtPress.HasFlag(KeyModifiers.Shift);
+                SelectAt(p, ctrl || shift, shift);
             }
             else if (e.KeyModifiers.HasFlag(KeyModifiers.Control)
                      && SubEntitiesInRectResolver != null
-                     && _selectedSnapshot.Count > 0)
+                     && (_selectedSnapshot.Count > 0 || _dimmedSnapshot.Length > 0))
             {
                 // Ctrl+框选：只框「已选中目标」的子图元（多段线段 / 块内子实体）。
+                // 在位面域模式下面域被排除出选中集，此时用淡化项当种子（宿主侧兜底）。
                 // 空结果 = 清除二级拾取（事件带空列表，宿主同步清状态）。
                 var wa = Viewport.ScreenToWorld(new SKPoint(
                     (float)Math.Min(bs.X, p.X), (float)Math.Min(bs.Y, p.Y)));
@@ -958,7 +1140,7 @@ public class DrawingView : Control
 
         context.Custom(new CadDrawOperation(
             this, new Rect(Bounds.Size), _display, Viewport.Zoom, Viewport.Offset,
-            _hiddenSnapshot, MinTextPixelSize, MinEntityPixelSize, _overlaySnapshot));
+            _hiddenSnapshot, MinTextPixelSize, MinTextBarPixelSize, MinEntityPixelSize, _overlaySnapshot));
 
         if (_bandActive && _bandStart is { } bs)
         {
@@ -980,12 +1162,13 @@ public class DrawingView : Control
         private readonly SKPoint _offset;
         private readonly HashSet<string> _hidden;
         private readonly float _minTextPx;
+        private readonly float _minTextBarPx;
         private readonly float _minEntityPx;
         private readonly OverlayLayer? _overlay;
         private readonly SKColor _bg;
 
         public CadDrawOperation(DrawingView owner, Rect bounds, DisplayList list, float zoom, SKPoint offset,
-                                HashSet<string> hidden, float minTextPx, float minEntityPx,
+                                HashSet<string> hidden, float minTextPx, float minTextBarPx, float minEntityPx,
                                 OverlayLayer? overlay)
         {
             _owner = owner;
@@ -996,6 +1179,7 @@ public class DrawingView : Control
             _offset = offset;
             _hidden = hidden;
             _minTextPx = minTextPx;
+            _minTextBarPx = minTextBarPx;
             _minEntityPx = minEntityPx;
             _overlay = overlay;
             // 绘制操作的生命周期由 Avalonia 管理，而 UI 线程随时可能 SetDisplay 换图。
@@ -1056,6 +1240,8 @@ public class DrawingView : Control
             canvas.ClipRect(SKRect.Create(0, 0, w, h));
             canvas.Clear(_bg);
 
+            DiagFillSeen = DiagFillLodSkip = DiagFillDrawn = 0;
+
             var worldToScreen = new SKMatrix(_zoom, 0, _offset.X, 0, -_zoom, _offset.Y, 0, 0, 1);
             var worldRect = ScreenRectToWorld(w, h);
             float hairline = 1f / MathF.Max(_zoom, 1e-6f);
@@ -1080,6 +1266,9 @@ public class DrawingView : Control
                 canvas.Save();
                 canvas.Concat(worldToScreen);
                 DrawBuckets(canvas, stroke, fill, baked, worldRect, hairline);
+                // 未合批的不只是文字/点：带裁剪区域（XCLIP）的几何也走这条，必须在这里补画，
+                // 否则一旦切到批次路径，被裁剪块里的线条会整块消失（P2-17）。
+                DrawStrokeEntities(canvas, stroke, fill, baked.UnbatchedEntities, hairline);
                 canvas.Restore();
                 if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tBucket = n - tMark; tMark = n; }
                 DrawTexts(canvas, textPaint, baked.UnbatchedEntities, worldRect);
@@ -1102,6 +1291,49 @@ public class DrawingView : Control
                 DrawPointMarks(canvas, visible, worldRect, h);
                 DrawTextStrokes(canvas, stroke, visible, worldRect, worldToScreen, hairline);
                 if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tPoint = n - tMark; tMark = n; }
+            }
+
+            // ---- 淡化 pass：在位面域打标签时，面域本体只当背景 ----
+            // 先用背景色沿轮廓覆盖一遍（抹掉原线），再以低不透明度重描。
+            // 不能走真正的 per-entity alpha：批次把同层同色路径合并成一次 DrawPath，
+            // 单个实体的透明度在批里改不了。覆盖只作用于面域自己那条线（hairline 量级），
+            // 被它压住的其它图元最多损失一条细线，观感上与"整体淡化"一致。
+            var dimmed = _owner._dimmedSnapshot;
+            if (dimmed.Length > 0)
+            {
+                using var dimCover = new SKPaint
+                {
+                    IsAntialias = true,
+                    Style = SKPaintStyle.Stroke,
+                    Color = _bg,
+                    StrokeWidth = hairline * 3,
+                };
+                using var dimDraw = new SKPaint
+                {
+                    IsAntialias = true,
+                    Style = SKPaintStyle.Stroke,
+                    StrokeWidth = hairline,
+                };
+                canvas.Save();
+                canvas.Concat(worldToScreen);
+                foreach (var e in _list.Index.Query(worldRect))
+                {
+                    if (!_owner.IsDimmedEntity(e)) continue;
+                    if (_owner._hiddenSnapshot.Count > 0 && _owner._hiddenSnapshot.Contains(e.Layer)) continue;
+                    if (e.FillPath is { } dimFill)
+                    {
+                        dimCover.Style = SKPaintStyle.Fill;
+                        canvas.DrawPath(dimFill, dimCover);
+                        dimCover.Style = SKPaintStyle.Stroke;
+                    }
+                    if (e.Path is { } dimPath)
+                    {
+                        canvas.DrawPath(dimPath, dimCover);
+                        dimDraw.Color = new SKColor(e.ColorArgb).WithAlpha(56);
+                        canvas.DrawPath(dimPath, dimDraw);
+                    }
+                }
+                canvas.Restore();
             }
 
             // ---- 选中高亮 pass：叠加在最上层，不走 LOD（选中了就要看得见）----
@@ -1279,13 +1511,15 @@ public class DrawingView : Control
         }
 
         private void DrawStrokeEntities(SKCanvas canvas, SKPaint stroke, SKPaint fill,
-                                        IList<CadEntity> visible, float hairline)
+                                        IEnumerable<CadEntity> visible, float hairline)
         {
             bool lw = _owner.ShowLineWeights;
             stroke.StrokeWidth = hairline;
             foreach (var ent in visible)
             {
                 if (_hidden.Contains(ent.Layer)) continue;
+                // SHX 文字笔画由 DrawTextStrokes 单独画（这里再画一次就重了）
+                if (ent.TextStrokes) continue;
                 if (ent.Path is not null)
                 {
                     if (!PassesEntityLod(ent.Bounds)) continue;
@@ -1293,16 +1527,39 @@ public class DrawingView : Control
                     float w = lw ? LineWidthWorld(ent.LineWeightMm100) : hairline;
                     stroke.StrokeWidth = w;
                     stroke.PathEffect = _owner.DashEffectOf(ent.DashPattern, _zoom);
-                    canvas.DrawPath(ent.Path, stroke);
+                    DrawClipped(canvas, ent.Path, stroke, ent.ClipPath);
                 }
                 if (ent.FillPath is not null)
                 {
-                    if (!PassesEntityLod(ent.Bounds)) continue;
+                    DiagFillSeen++;
+                    if (!PassesEntityLod(ent.Bounds)) { DiagFillLodSkip++; continue; }
                     fill.Color = new SKColor(ResolveColor(ent.ColorArgb));
-                    canvas.DrawPath(ent.FillPath, fill);
+                    DrawClipped(canvas, ent.FillPath, fill, ent.ClipPath);
+                    DiagFillDrawn++;
                 }
             }
             stroke.StrokeWidth = hairline;
+        }
+
+        /// <summary>
+        /// 画一条路径，必要时先挂**画布裁剪**（P2-17：XCLIP / 视口边界）。
+        ///
+        /// <para>裁剪路径是世界坐标，而本函数在世界矩阵里调用（画笔已 <c>Concat(worldToScreen)</c>），
+        /// 所以直接 <c>ClipPath</c> 即可，标边/填充都适用。转换期不做布尔求交 ——
+        /// <c>SKPath.Op</c> 对开放路径返回空，会把线条整段删掉。</para>
+        /// </summary>
+        private static void DrawClipped(SKCanvas canvas, SKPath geometry, SKPaint paint, SKPath? clip)
+        {
+            if (clip is null)
+            {
+                canvas.DrawPath(geometry, paint);
+                return;
+            }
+
+            canvas.Save();
+            canvas.ClipPath(clip, SKClipOperation.Intersect, antialias: true);
+            canvas.DrawPath(geometry, paint);
+            canvas.Restore();
         }
 
         /// <summary>
@@ -1329,7 +1586,7 @@ public class DrawingView : Control
                 if (_hidden.Contains(ent.Layer)) continue;
                 if (!ent.Bounds.IntersectsWith(worldRect)) continue;
                 stroke.Color = new SKColor(ResolveColor(ent.ColorArgb));
-                canvas.DrawPath(ent.Path, stroke);
+                DrawClipped(canvas, ent.Path, stroke, ent.ClipPath);
             }
             canvas.Restore();
         }
@@ -1466,7 +1723,7 @@ public class DrawingView : Control
                 if (ent.Text is null) continue;
                 if (hasHidden && _hidden.Contains(ent.Layer)) continue;
                 if (!ent.Bounds.IntersectsWith(worldRect)) continue;
-                DrawText(canvas, paint, ent.Text, ResolveColor(ent.ColorArgb));
+                DrawText(canvas, paint, ent.Text, ResolveColor(ent.ColorArgb), ent.ClipPath);
             }
         }
 
@@ -1487,6 +1744,18 @@ public class DrawingView : Control
             if (bgLuma < 128)
                 return (color & 0x00FFFFFF) == 0x00000000u ? 0xFFFFFFFFu : color;
             return (color & 0x00FFFFFF) == 0x00FFFFFFu ? 0xFF000000u : color;
+        }
+
+        /// <summary>
+        /// 世界 → 屏幕矩阵。与各绘制路径里的 <c>x·zoom + offsetX</c> / <c>-y·zoom + offsetY</c>
+        /// 必须完全一致 —— 裁剪路径要靠它换算到屏幕空间（P2-17）。
+        /// </summary>
+        private SKMatrix WorldToScreenMatrix()
+        {
+            var m = SKMatrix.CreateScale(_zoom, -_zoom);
+            m.TransX = _offset.X;
+            m.TransY = _offset.Y;
+            return m;
         }
 
         private SKRect ScreenRectToWorld(float w, float h)
@@ -1513,50 +1782,159 @@ public class DrawingView : Control
         /// （单倍 = 1.667 × 字高），水平对齐按 <see cref="TextDraw.LineAlign"/> **逐行**处理：
         /// AutoCAD 的 MTEXT 居中/右对齐作用于每一行而不是整块，块级偏移在转换阶段已按整块算过。
         /// </summary>
-        private void DrawText(SKCanvas canvas, SKPaint paint, TextDraw td, uint color)
+        private void DrawText(SKCanvas canvas, SKPaint paint, TextDraw td, uint color, SKPath? clip = null)
         {
             float capPx = td.Height * _zoom;
-            if (capPx < _minTextPx) return;
+            if (capPx < _minTextPx)
+            {
+                if (capPx >= _minTextBarPx) DrawTextBar(canvas, paint, td, capPx, color, clip);
+                return;
+            }
 
-            var font = TextMetrics.FontForCapHeight(capPx, out float fontScale);
+            // 裁剪（P2-17）：文字是屏幕空间绘制的，裁剪路径是世界坐标，先换算到屏幕再挂。
+            // 少了这一步，被 XCLIP 的图签文字会整条画到框外面去（AutoCAD 是切掉的）。
+            SKPath? screenClip = null;
+            if (clip is not null)
+            {
+                screenClip = new SKPath(clip);
+                screenClip.Transform(WorldToScreenMatrix());
+                canvas.Save();
+                canvas.ClipPath(screenClip, SKClipOperation.Intersect, antialias: true);
+            }
+
+            try
+            {
+                DrawTextCore(canvas, paint, td, color, capPx);
+            }
+            finally
+            {
+                if (screenClip is not null)
+                {
+                    canvas.Restore();
+                    screenClip.Dispose();
+                }
+            }
+        }
+
+        /// <summary>文字本体（已在外层处理好剪裁）。</summary>
+        private void DrawTextCore(SKCanvas canvas, SKPaint paint, TextDraw td, uint color, float capPx)
+        {
+
+            // 字体由转换阶段按样式解析好带在实体上（P2-16）：这里若换成全局默认字体重算，
+            // 包围盒（按样式字体量的）会与墨迹错位。字号换算也走同一份 cap/em 比例。
+            var font = td.Font.FontForCapHeight(capPx, out float fontScale);
 
             paint.Color = new SKColor(color);
             float sx = td.Position.X * _zoom + _offset.X;
             float sy = -td.Position.Y * _zoom + _offset.Y;
-            canvas.Save();
-            canvas.Translate(sx, sy);
-            canvas.RotateDegrees(td.RotationRadians * 180f / MathF.PI);
+            float deg = td.RotationRadians * 180f / MathF.PI;
 
+            if (td.Text.IndexOf('\n') < 0)
+            {
+                canvas.Save();
+                canvas.Translate(sx, sy);
+                canvas.RotateDegrees(-deg);
+                ApplyTextShape(canvas, td, fontScale);
+                canvas.DrawText(td.Text, 0, 0, font, paint);
+                canvas.Restore();
+                return;
+            }
+
+            // 多行：行推进方向必须按**世界**方向 (sin r, -cos r)，换成屏幕坐标（y 翻转）是
+            // (sin r, cos r)。原来直接在旋转后的局部坐标系里加 (0, i·行距)，等价于
+            // (-sin r, cos r) —— 平时（r=0/180°）看不出来，竖排 MTEXT（r=±90°）的行序整个镜像：
+            // 实测 rot.dxf 四组同一句话，R90/R270 我们画到锚点的另一侧（与 ODA 相反）。
+            float stepX = MathF.Sin(td.RotationRadians);
+            float stepY = MathF.Cos(td.RotationRadians);
+            float spacingPx = capPx * td.LineSpacingFactor;
+
+            var lines = td.Text.Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                canvas.Save();
+                canvas.Translate(sx + stepX * spacingPx * i, sy + stepY * spacingPx * i);
+                canvas.RotateDegrees(-deg);
+                ApplyTextShape(canvas, td, fontScale);
+
+                float dx = 0f;
+                if (td.LineAlign != TextLineAlign.Left && lines[i].Length > 0)
+                {
+                    // 行宽按**世界单位**量再换到局部：局部 x 同时被宽度因子与 fontScale 缩放。
+                    // 目标屏幕宽度 = W·zoom·wf，局部宽度 = W·zoom/fontScale（wf 两端约掉）。
+                    float w = td.Font.MeasureWidth(lines[i], td.Height) * _zoom / fontScale;
+                    dx = td.LineAlign == TextLineAlign.Center ? -w * 0.5f : -w;
+                }
+                canvas.DrawText(lines[i], dx, 0, font, paint);
+                canvas.Restore();
+            }
+        }
+
+        /// <summary>文字形变（倾斜 → 宽度因子 → 字体上限放大），三条文本路径共用。</summary>
+        private static void ApplyTextShape(SKCanvas canvas, TextDraw td, float fontScale)
+        {
             if (MathF.Abs(td.ObliqueRadians) > 1e-6f)
                 canvas.Skew(-MathF.Tan(td.ObliqueRadians), 0f);
             if (td.WidthFactor > 0 && MathF.Abs(td.WidthFactor - 1f) > 1e-6f)
                 canvas.Scale(td.WidthFactor, 1f);
             if (MathF.Abs(fontScale - 1f) > 1e-6f)
                 canvas.Scale(fontScale, fontScale);   // 超大字号走"上限字体 + 画布放大"
+        }
 
-            if (td.Text.IndexOf('\n') < 0)
+        /// <summary>
+        /// 亚像素文字：按外接框画一条等宽色条。
+        /// 字已经不可读，但"那里有字"必须留在画面上 —— 否则整图适配时成片的
+        /// 表格/标注区会凭空消失（对照 ODA 少三成墨量）。
+        /// 宽度走 <see cref="TextMetrics.MeasureWidth"/>（世界单位），乘 zoom 得到屏幕宽度；
+        /// 不套 fontScale 与倾斜：这个尺寸下两者都看不出来，套了反而要按 fontScale 除回去。
+        /// </summary>
+        private void DrawTextBar(SKCanvas canvas, SKPaint paint, TextDraw td, float capPx, uint color,
+                                 SKPath? clip = null)
+        {
+            // 亚像素文字同样要裁（否则框外会出现"色条拖尾"）
+            SKPath? screenClip = null;
+            if (clip is not null)
             {
-                canvas.DrawText(td.Text, 0, 0, font, paint);
+                screenClip = new SKPath(clip);
+                screenClip.Transform(WorldToScreenMatrix());
+                canvas.Save();
+                canvas.ClipPath(screenClip, SKClipOperation.Intersect, antialias: true);
             }
-            else
+
+            try { DrawTextBarCore(canvas, paint, td, capPx, color); }
+            finally
             {
-                // 行距按实体值（MTEXT 组码 44 已折算进 LineSpacingFactor）。
-                // 注意：这些偏移处在画布**局部**坐标系里，纵向被 fontScale 放大过，
-                // 必须除回去 —— 否则超大字号（> MaxCachedCapHeight）时行距会被连带放大好几倍。
-                float spacing = capPx * td.LineSpacingFactor / fontScale;
-                var lines = td.Text.Split('\n');
-                for (int i = 0; i < lines.Length; i++)
+                if (screenClip is not null)
                 {
-                    float dx = 0f;
-                    if (td.LineAlign != TextLineAlign.Left && lines[i].Length > 0)
-                    {
-                        // 行宽按**世界单位**量再换到局部：局部 x 同时被宽度因子与 fontScale 缩放。
-                        // 目标屏幕宽度 = W·zoom·wf，局部宽度 = W·zoom/fontScale（wf 两端约掉）。
-                        float w = TextMetrics.MeasureWidth(lines[i], td.Height) * _zoom / fontScale;
-                        dx = td.LineAlign == TextLineAlign.Center ? -w * 0.5f : -w;
-                    }
-                    canvas.DrawText(lines[i], dx, i * spacing, font, paint);
+                    canvas.Restore();
+                    screenClip.Dispose();
                 }
+            }
+        }
+
+        private void DrawTextBarCore(SKCanvas canvas, SKPaint paint, TextDraw td, float capPx, uint color)
+        {
+            float thick = MathF.Max(capPx, 0.6f);
+            float sx = td.Position.X * _zoom + _offset.X;
+            float sy = -td.Position.Y * _zoom + _offset.Y;
+            float wf = td.WidthFactor > 0f ? td.WidthFactor : 1f;
+            float wfZoom = _zoom * wf;
+
+            paint.Color = new SKColor(color);
+            canvas.Save();
+            canvas.Translate(sx, sy);
+            canvas.RotateDegrees(-td.RotationRadians * 180f / MathF.PI);
+            var lines = td.Text.Split('\n');
+            float spacing = capPx * td.LineSpacingFactor;
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (lines[i].Length == 0) continue;
+                float w = td.Font.MeasureWidth(lines[i], td.Height) * wfZoom;
+                if (w <= 0f) continue;
+                float dx = 0f;
+                if (td.LineAlign == TextLineAlign.Center) dx = -w * 0.5f;
+                else if (td.LineAlign == TextLineAlign.Right) dx = -w;
+                float y = i * spacing;
+                canvas.DrawRect(new SKRect(dx, y - thick, dx + MathF.Max(w, thick * 0.5f), y), paint);
             }
             canvas.Restore();
         }
