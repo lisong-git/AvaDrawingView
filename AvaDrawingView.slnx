@@ -8,6 +8,7 @@
     <Project Path="tools/UiSmokeTest/UiSmokeTest.csproj" />
     <Project Path="tools/PerfProbe/PerfProbe.csproj" />
     <Project Path="tools/SampleGen/SampleGen.csproj" />
+    <Project Path="tools/MTextGen/MTextGen.csproj" />
     <Project Path="tools/BlockExport/BlockExport.csproj" />
     <Project Path="tools/ShapeExport/ShapeExport.csproj" />
     <Project Path="tools/DwgCapture/DwgCapture.csproj" />

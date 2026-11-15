@@ -740,11 +740,20 @@ world = parent(父链) × selfInsert(自身插入) × inverse(boundaryPoints)
 
 ### 21. MTEXT 行距与内联 `\H`：基准测出的口径，但(05)的备注块反着来（2026-11-15，未改代码）
 
-**夹具**：`.compare/genmt`（ACadSharp `DxfWriter` 写 AC1015）+ `.compare/fixture_mt_lh2.dxf`。
+**夹具（已入库，一条命令可复现）**：`tools/MTextGen`（ACadSharp `DxfWriter` 写 AC1015）出三份：
+
+| 文件 | 内容 |
+|---|---|
+| `samples/sample_mtext_line_spacing.dxf` | A 无 `\H` / B `{\H0.5x;…}` / C 实体 h=20 / D LS(44)=0.96 |
+| `samples/sample_mtext_cjk_h.dxf` | 汉字 `{\H0.76x;田田…}` 与不带 `\H` 的对照 |
+| `samples/sample_mtext_block_h.dxf` | 块内 height=2.2 + `\H0.76x`，插入 scale=2 rot=−90（复刻图签备注块） |
+
+再生成：`dotnet run --project tools/MTextGen -c Release`（可带一个参数指定输出目录，默认 `samples/`）。
 尺度靠 L 形四条直线标定（墨迹 bbox 即 (0,0)-(3000,1800)，x/y 两个方向都能反解 px 每世界单位）。
-汉字版 `fixture_mt_cjk.dxf` 是把 ACadSharp 写出的 `MARK1\MARK2` 占位替成 **GBK 字节**再改
-`$DWGCODEPAGE` 为 `ANSI_936` —— ODA 与我方都能正确显示（R12 的 `.dxf` 里 ODA 不画 MTEXT，
-所以夹具必须是 AC1015）。
+三条踩坑：**R12(AC1009) 的 DXF 里 ODA 根本不画 MTEXT**（只出图框），夹具必须 AC1015；
+**Polyline 画的外框在 ODA 里 bbox 比例不对**（1219×465），必须用独立 LINE 才能标定；
+ACadSharp 写 DXF 会把中文写成 `?`，所以汉字走"占位符 + 事后按字节替成 GBK、`$DWGCODEPAGE`
+改 `ANSI_936`"—— ODA 与我方都能正确显示。
 
 实测（h=40，`txt.shx`，单位=世界）：
 
@@ -758,6 +767,9 @@ world = parent(父链) × selfInsert(自身插入) × inverse(boundaryPoints)
 
 两条：①**行距 = 1.667 × 实体字高 × LS**，我们的常数没错（D 组 0.96 倍精确对上）；
 ②**ODA 的 `\H` 只缩字、不缩行距**，我们却按 `\H` 后的字高算行距（B、E 两行数）。
+
+> 入库版把 E 组从 x=2200 挪到 x=200，复测 ODA 行距仍是 **66.6**、字高 37.0（上表 34.5，
+> 差来自亚像素对齐与笔画粗细，不是口径变化），A–D 四组与上表逐项一致。
 
 **但拿②去改 `AddMText`，(05) 反而变差**：94.7 / 98.8 / 漏 8,611 / 多 2,089 →
 94.5 / 98.4 / 漏 8,904 / 多 2,751，已回滚。用自相关测图签备注格的真实行距：ODA **14 px**、
