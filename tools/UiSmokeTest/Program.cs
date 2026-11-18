@@ -333,6 +333,30 @@ int Run(string[] argv)
     view.SelectionGlowLimit = 2000;
     view.ClearSelection();
 
+    // ---------- 8d. 双击由宿主接管后，画布必须吞掉这次点击 ----------
+    // 双击的第二次按下同时也是「单击」。宿主把双击当成「进入」动作（进块 / 进面域）时，
+    // 若松手仍走点选，用户刚进作用域就会在光标处顺手选中一个子图元。
+    view.FitToContent();
+    view.ClearSelection();
+    var dblWorld = new SKPoint(secondList.Entities[0].Bounds.MidX, secondList.Entities[0].Bounds.MidY);
+    var dblScreen = view.Viewport.WorldToScreen(dblWorld);
+    var dblPt = new Point(dblScreen.X, dblScreen.Y);
+    int dblHits = 0;
+    void OnDbl(object? s, CanvasDoubleClickEventArgs e) { dblHits++; e.Handled = true; }
+    view.CanvasDoubleClicked += OnDbl;
+    window.MouseDown(dblPt, MouseButton.Left);
+    window.MouseUp(dblPt, MouseButton.Left);
+    int selAfterFirst = view.SelectedEntities.Count;
+    window.MouseDown(dblPt, MouseButton.Left);
+    window.MouseUp(dblPt, MouseButton.Left);
+    window.CaptureRenderedFrame();
+    Check(dblHits == 1, $"连按两次触发一次双击事件（{dblHits}）");
+    Check(selAfterFirst >= 1, $"第一次点击已选中目标（{selAfterFirst}）");
+    Check(view.SelectedEntities.Count == selAfterFirst,
+          $"接管后第二次点击不再改动选中（{selAfterFirst} → {view.SelectedEntities.Count}）");
+    view.CanvasDoubleClicked -= OnDbl;
+    view.ClearSelection();
+
     // ---------- 12. 线宽显示（B3）：像素级口径 ----------
     // 判据全部落在"屏幕上多少像素"，因为线宽的两种显示口径的差别**只**体现在像素上：
     //   模型空间 = 固定像素宽（不随缩放变化）；图纸空间 = 真实单位（随缩放变化）。

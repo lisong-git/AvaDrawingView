@@ -194,6 +194,7 @@ public class DrawingView : Control
     private Point? _bandStart;
     private Point _bandCurrent;
     private bool _bandActive;
+    private bool _suppressReleaseClick;
 
     private static readonly SolidColorBrush BandWindowFill = new(Color.FromArgb(36, 68, 138, 255));
     private static readonly SolidColorBrush BandWindowBorder = new(Color.FromRgb(68, 138, 255));
@@ -217,6 +218,25 @@ public class DrawingView : Control
 
     /// <summary>选中集合变化（含清空）。UI 线程触发。</summary>
     public event EventHandler? SelectionChanged;
+
+    /// <summary>
+    /// 左键双击（连击计数由输入层给）。宿主可用于「进入」类动作（进块 / 进面域）；
+    /// 置 <see cref="CanvasDoubleClickEventArgs.Handled"/> 后画布会吞掉这次点击。
+    /// </summary>
+    public event EventHandler<CanvasDoubleClickEventArgs>? CanvasDoubleClicked;
+
+    /// <summary>自检用：不经过真实连击，直接按一次双击派发（无头平台很难稳定产出 ClickCount=2）。</summary>
+    public void RaiseDoubleClickForTest(Point position)
+    {
+        var args = new CanvasDoubleClickEventArgs(position);
+        CanvasDoubleClicked?.Invoke(this, args);
+        if (args.Handled)
+        {
+            _bandStart = null;
+            _bandActive = false;
+            _suppressReleaseClick = true;
+        }
+    }
 
     /// <summary>当前选中实体（不可变快照）。</summary>
     public IReadOnlyList<CadEntity> SelectedEntities => _selectedSnapshot;
@@ -1540,6 +1560,22 @@ public class DrawingView : Control
         }
         else if (pt.Properties.IsLeftButtonPressed)
         {
+            // 双击的第二次按下同时也是「单击」。先给宿主一次接管理由（进块 / 进面域），
+            // 接管了就不再把这次点击当成框选起点 —— 否则松手会在新作用域里误选一个子图元。
+            if (e.ClickCount >= 2 && CanvasDoubleClicked is { } dbl)
+            {
+                var args = new CanvasDoubleClickEventArgs(pt.Position);
+                dbl(this, args);
+                if (args.Handled)
+                {
+                    _bandStart = null;
+                    _bandActive = false;
+                    _suppressReleaseClick = true;
+                    e.Handled = true;
+                    base.OnPointerPressed(e);
+                    return;
+                }
+            }
             _bandStart = pt.Position;
             _bandCurrent = pt.Position;
             e.Pointer.Capture(this);
@@ -1608,6 +1644,16 @@ public class DrawingView : Control
 
     protected override void OnPointerReleased(PointerReleasedEventArgs e)
     {
+        // 宿主已接管的双击：松手不再落到画布上（见 OnPointerPressed 的双击分支）
+        if (_suppressReleaseClick)
+        {
+            _suppressReleaseClick = false;
+            _bandStart = null;
+            _bandActive = false;
+            e.Pointer.Capture(null);
+            base.OnPointerReleased(e);
+            return;
+        }
         if (_bandStart is { } bs)
         {
             var p = e.GetCurrentPoint(this).Position;
