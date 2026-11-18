@@ -134,10 +134,55 @@ public class DrawingView : Control
     private IReadOnlyList<CadEntity> _selectedSnapshot = Array.Empty<CadEntity>();
 
     /// <summary>
+    /// 上一次单击是否抬升到了<b>整个块引用</b>（非 0 = 该 INSERT 的句柄）。
+    ///
+    /// <para>显示层把块展平了：块内每个图元都是独立 <see cref="CadEntity"/>，
+    /// <see cref="CadEntity.Handle"/> 指向最外层 INSERT，<see cref="CadEntity.OwnHandle"/>
+    /// 指向自己，而 INSERT 本身没有几何条目。所以"选了整块"只能表现为
+    /// "选中了同一 Handle 的全部条目"，这个量本身无法从集合反推（框选也可能恰好框全），
+    /// 必须显式记下来给宿主上报目标用。</para>
+    /// </summary>
+    private ulong _blockScopeHandle;
+    private ulong _blockScopeInner;
+
+    /// <summary>
+    /// 当前选中是否代表「整个块引用」；非 0 时宿主应把它当成一个整块目标
+    /// （<c>OwnHandle = 0</c>），不要按选中条目逐条上报，否则一次单击会派生出
+    /// "块内每个图元各一个目标"。见 <see cref="SelectAt"/> 的抬升分支。
+    /// </summary>
+    public ulong BlockScopeHandle => _blockScopeHandle;
+
+    /// <summary>
+    /// 抬升到的块实例自身句柄：<c>0</c> = 最外层块引用（整块），非 0 = 块内嵌套块实例。
+    /// 显示层是扁平的，嵌套 INSERT 没有几何条目，所以"选了哪个嵌套块"也只能这样带出来。
+    /// </summary>
+    public ulong BlockScopeInner => _blockScopeInner;
+
+    /// <summary>
+    /// 块抬升决策（宿主提供）：给定命中的显示层图元，返回要一起选中的条目与块实例身份
+    /// （<see cref="BlockLift"/>）。<c>null</c> = 用默认策略（同一 <c>Handle</c> 的全部条目，
+    /// 粒度 = 最外层块引用）。在位编辑块时宿主靠它把粒度收窄到「当前作用域内最内层那个块」。
+    /// </summary>
+    public Func<CadEntity, BlockLift?>? BlockLiftResolver { get; set; }
+
+    /// <summary>
+    /// 单击块内图元时是否抬升到整个块引用（默认开，AutoCAD 语义：点块选块）。
+    /// 关掉则保持"点到哪个图元就选哪个图元"。
+    /// </summary>
+    public bool SelectWholeBlockOnClick { get; set; } = true;
+
+    /// <summary>
     /// 叠加高亮层（世界坐标临时几何）。与选中集合同一套交付方式：整个引用替换，
     /// 渲染线程只读快照，不做部分更新。
     /// </summary>
     private OverlayLayer? _overlaySnapshot;
+
+    /// <summary>
+    /// 作用域骨架层（弱色底图）：进入面域子对象模式时铺出该面域全部环 / 边。
+    /// 与 <see cref="_overlaySnapshot"/> 分开存放 —— 二级拾取每次点选都整层替换，
+    /// 骨架挂在同一层里会被一次点击冲掉。
+    /// </summary>
+    private OverlayLayer? _scopeSkeletonSnapshot;
     private Point? _bandStart;
     private Point _bandCurrent;
     private bool _bandActive;
@@ -183,17 +228,130 @@ public class DrawingView : Control
     /// <summary>当前淡化 / 不可拾取的实体组数（自检与诊断用）。</summary>
     public int DimmedCount => _dimmedSnapshot.Length;
 
-    /// <summary>该图元是否处于淡化 / 不可拾取状态。</summary>
-    public bool IsDimmedEntity(CadEntity e)    {
-        var dimmed = _dimmedSnapshot;
-        if (dimmed.Length == 0 || e is null) return false;
-        foreach (var t in dimmed)
+    // ---------- 在位编辑块作用域 ----------
+    // 「只允许拾取这一个块实例内的图元」：作用域外一律淡化且不进选中集。
+    // 与 _dimmedSnapshot 分开是因为粒度不同 —— 面域模式点的是「几条要淡化的」，
+    // 块模式点的是「一整个块里除它全要淡化」，按名单反推会退化成 O(实体数) 的集合，
+    // 命中测试逐帧都要问一次。这里用 (外层句柄, 允许的自身句柄集合) 判 O(1)。
+    private ulong _pickScopeOuter;
+    private HashSet<ulong>? _pickScopeOwns;
+
+    /// <summary>
+    /// 限定可拾取范围：只有 <paramref name="outer"/> 这层里、自身句柄在
+    /// <paramref name="owns"/> 中的图元正常；其余淡化且不可拾取。
+    /// <paramref name="owns"/> 传 null = 该外层句柄下的全部图元（整块）。<c>outer = 0</c> = 取消作用域。
+    /// </summary>
+    public void SetPickScope(ulong outer, IEnumerable<ulong>? owns)
+    {
+        _pickScopeOuter = outer;
+        _pickScopeOwns = outer == 0 ? null : (owns == null ? null : new HashSet<ulong>(owns));
+        var selected = _selectedSnapshot;
+        if (selected.Count > 0)
         {
-            if (e.Handle != t.Outer) continue;
-            // 顶层面域 OwnHandle == Handle，Inner 传真实句柄或 0 都应命中
-            if (t.Inner == 0 || e.OwnHandle == t.Inner || e.OwnHandle == t.Outer) return true;
+            var keep = selected.Where(e => !IsDimmedEntity(e)).ToArray();
+            if (keep.Length != selected.Count)
+            {
+                _selectedSnapshot = keep;
+                SelectionChanged?.Invoke(this, EventArgs.Empty);
+            }
         }
-        return false;
+        InvalidateVisual();
+    }
+
+    /// <summary>是否处于「限定拾取范围」状态。</summary>
+    public bool HasPickScope => _pickScopeOuter != 0;
+
+    /// <summary>作用域外层句柄（0 = 无）。</summary>
+    public ulong PickScopeOuter => _pickScopeOuter;
+
+    /// <summary>作用域内允许的自身句柄数；整个外层块允许时为 -1。</summary>
+    public int PickScopeCount => _pickScopeOuter == 0 ? 0 : (_pickScopeOwns?.Count ?? -1);
+
+    /// <summary>
+    /// 作用域内单击即进二级拾取（多段线打标签：点线就是选那一段，不必先选中整条再点）。
+    /// 块作用域不要开这个 —— 那里单击要先走块抬升。
+    /// </summary>
+    public bool SubPickOnScopeClick { get; set; }
+
+    /// <summary>
+    /// 框选直接产出子图元（面域 / 多段线的子图元模式）：普通框选走
+    /// <see cref="SubEntitiesInRectResolver"/>，不再选「整条实体」。
+    /// 与 <see cref="SubPickOnScopeClick"/> 是同一层级的粒度切换，一个管单击一个管框选。
+    /// </summary>
+    public bool SubPickOnBand { get; set; }
+
+    // ---------- 作用域本体 ----------
+    // 「正在被编辑的那一个」：完整显示、不参与选中、普通命中跳过，但仍是软命中的子对象入口。
+    // 与淡化名单分开是因为这两件事被绑在同一个谓词上时互相拖累 —— 面域模式为了让本体
+    // 不可拾取而把它塞进淡化名单，结果可编辑范围自己只剩 22% 不透明度，什么都看不清。
+    private ulong _scopeBodyOuter;
+    private ulong _scopeBodyInner;
+
+    /// <summary>作用域本体填充的不透明度：留色感，但不能盖住环 / 边。</summary>
+    private const byte ScopeBodyFillAlpha = 40;
+
+    /// <summary>
+    /// 标记作用域本体（<paramref name="outer"/> = 外层句柄，<paramref name="inner"/> = 自身句柄，0 = 整层）。
+    /// 传 0 清除。设置时把它从选中集摘掉：本体是编辑上下文，不是选中项。
+    /// </summary>
+    public void SetScopeBody(ulong outer, ulong inner)
+    {
+        _scopeBodyOuter = outer;
+        _scopeBodyInner = inner;
+        var selected = _selectedSnapshot;
+        if (_scopeBodyOuter != 0 && selected.Count > 0)
+        {
+            var keep = selected.Where(e => !IsScopeBody(e)).ToArray();
+            if (keep.Length != selected.Count)
+            {
+                _selectedSnapshot = keep;
+                SelectionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+        InvalidateVisual();
+    }
+
+    /// <summary>该图元是否就是当前作用域本体（块被多处插入时每一处实例都算）。</summary>
+    public bool IsScopeBody(CadEntity? e)
+    {
+        if (_scopeBodyOuter == 0 || e is null || e.Handle != _scopeBodyOuter) return false;
+        if (_scopeBodyInner == 0) return true;
+        return e.OwnHandle == _scopeBodyInner || e.OwnHandle == e.Handle;
+    }
+
+    /// <summary>作用域本体外层句柄（0 = 无）。</summary>
+    public ulong ScopeBodyOuter => _scopeBodyOuter;
+
+    /// <summary>该图元是否处于淡化 / 不可拾取状态。</summary>
+    public bool IsDimmedEntity(CadEntity e) => DimAlphaOf(e) != 0;
+
+    /// <summary>
+    /// 淡化强度（0 = 不淡化）。名单与拾取作用域两档：名单 = 56（面域本体当背景，
+    /// 还要看得出形状），作用域外 = 30（进子级别后那些图元只剩方位参考的作用，
+    /// 用同一个 56 时亮色线条仍然抢眼，看不出来"只留这一支"）。
+    /// </summary>
+    internal int DimAlphaOf(CadEntity e)
+    {
+        if (e is null) return 0;
+        // 作用域本体永不禁淡化：它是可编辑范围的骨架，糊掉就看不出能点哪里
+        if (IsScopeBody(e)) return 0;
+        var dimmed = _dimmedSnapshot;
+        if (dimmed.Length > 0)
+        {
+            foreach (var t in dimmed)
+            {
+                if (e.Handle != t.Outer) continue;
+                // 顶层面域 OwnHandle == Handle，Inner 传真实句柄或 0 都应命中
+                if (t.Inner == 0 || e.OwnHandle == t.Inner || e.OwnHandle == t.Outer) return 56;
+            }
+        }
+        if (_pickScopeOuter != 0)
+        {
+            if (e.Handle != _pickScopeOuter) return 30;
+            if (_pickScopeOwns == null) return 0;
+            return _pickScopeOwns.Contains(e.OwnHandle != 0 ? e.OwnHandle : e.Handle) ? 0 : 30;
+        }
+        return 0;
     }
 
     private List<SubEntityPick> _subPicks;
@@ -248,7 +406,8 @@ public class DrawingView : Control
         foreach (var e in candidates)
         {
             if (_hidden.Count > 0 && _hidden.Contains(e.Layer)) continue;
-            if (!includeDimmed && IsDimmedEntity(e)) continue;   // 在位面域模式：面域本体只当背景
+            // 作用域本体：看得见但不可作为整体拾取（点它要落到环 / 边）
+            if (!includeDimmed && (IsDimmedEntity(e) || IsScopeBody(e))) continue;
             if (!e.Bounds.IntersectsWith(rect)) continue;
             double d = DistanceToEntity(e, world, tolWorld);
             if (d < bestDist)
@@ -289,6 +448,7 @@ public class DrawingView : Control
     public void SetSelection(IEnumerable<CadEntity> entities)
     {
         ClearSubPick();
+        ResetBlockScope();
         _selectedSnapshot = entities.ToArray();
         SelectionChanged?.Invoke(this, EventArgs.Empty);
         InvalidateVisual();
@@ -298,10 +458,25 @@ public class DrawingView : Control
     public void ClearSelection()
     {
         ClearSubPick();
+        ResetBlockScope();
         if (_selectedSnapshot.Count == 0) return;
         _selectedSnapshot = Array.Empty<CadEntity>();
         SelectionChanged?.Invoke(this, EventArgs.Empty);
         InvalidateVisual();
+    }
+
+    /// <summary>
+    /// 按世界坐标执行一次「单击选中」，路径与鼠标左键点击完全相同
+    /// （命中测试 → 淡化 / 拾取作用域过滤 → 二级拾取 → 块抬升 → <see cref="SelectionChanged"/>）。
+    /// 供自检与诊断脚本驱动：验证点击链路不必去合成指针事件与屏幕坐标。
+    /// 返回点击后的选中条目数。
+    /// </summary>
+    public int SelectAtWorld(SKPoint world, bool subRequested = false, bool additive = false)
+    {
+        if (_display is null) return 0;
+        var screen = Viewport.WorldToScreen(world);
+        SelectAt(new Point(screen.X, screen.Y), subRequested, additive);
+        return _selectedSnapshot.Count;
     }
 
     /// <summary>单选切换（点击命中调用）。<paramref name="additive"/> = Shift：只往选择集里加，不切换。</summary>
@@ -316,7 +491,7 @@ public class DrawingView : Control
             if (SubEntityResolver != null)
             {
                 var soft = HitTest(screen, 5f, includeDimmed: true);
-                if (soft != null && IsDimmedEntity(soft))
+                if (soft != null && (IsDimmedEntity(soft) || IsScopeBody(soft)))
                 {
                     var sw = Viewport.ScreenToWorld(screen);
                     var stol = 5f / MathF.Max(Viewport.Zoom, 1e-6f);
@@ -334,8 +509,9 @@ public class DrawingView : Control
             return;
         }
         var current = _selectedSnapshot;
-        if (SubEntityResolver != null
-            && (subRequested || (current.Count == 1 && ReferenceEquals(current[0], hit))))
+        var wantSub = subRequested || (current.Count == 1 && ReferenceEquals(current[0], hit))
+                      || (SubPickOnScopeClick && _pickScopeOuter != 0 && hit.Handle == _pickScopeOuter);
+        if (SubEntityResolver != null && wantSub)
         {
             var world = Viewport.ScreenToWorld(new SKPoint((float)p.X, (float)p.Y));
             var tol = 5f / MathF.Max(Viewport.Zoom, 1e-6f);
@@ -344,22 +520,71 @@ public class DrawingView : Control
             {
                 // Ctrl+点 = 切换：已选中的子图元再次 Ctrl+点取消，未选的加入（可与框选混用）
                 // Shift+点 = 只增：重复点同一条保持不变，绝不把已有的挤掉
+                ResetBlockScope();          // 进了子图元层级，不再是"整块"
                 if (additive) AddSubPick(pick);
                 else if (subRequested) ToggleSubPick(pick);
                 else SetSubPicks(new[] { pick });
                 return;
             }
         }
+        // 作用域本体不可作为整体选中：点环内空白由子图元解析接管（上面那段），
+        // 解析不出子图元 = 落在无效区域（比如有洞的面域内部），什么都不选。
+        if (IsScopeBody(hit)) return;
         // 最小实现：单击命中 = 单选（重复点击已选实体保持选中）
         if (current.Count == 1 && ReferenceEquals(current[0], hit)) return;
         ClearSubPick();
+        // 块内图元：显示层把块展平了，INSERT 自身没有几何条目，所以"点块"只能表现为
+        // "选中同一 Handle 的全部条目"。抬升后记下句柄（集合本身表达不了这个语义：
+        // 框选也可能恰好框全），宿主据此上报整块目标；要标块内具体图元走右键子图元菜单。
+        if (SelectWholeBlockOnClick && !subRequested && !additive
+            && hit.OwnHandle != 0 && hit.OwnHandle != hit.Handle)
+        {
+            var lift = BlockLiftResolver?.Invoke(hit) ?? DefaultBlockLift(hit);
+            if (lift is { Members.Count: > 0 } spec)
+            {
+                if (_blockScopeHandle == spec.Outer && _blockScopeInner == spec.Inner
+                    && current.Count > 0
+                    && current.All(e => e.Handle == spec.Outer))
+                    return;     // 已经是这个块了，别重建选中集（会闪一下）
+                // 不走 SetSelection：它会先发 SelectionChanged，那时粒度还是 0，
+                // 宿主按旧口径上报会退化成"块内每个图元一个目标"。
+                ClearSubPick();
+                _blockScopeHandle = spec.Outer;
+                _blockScopeInner = spec.Inner;
+                _selectedSnapshot = spec.Members;
+                SelectionChanged?.Invoke(this, EventArgs.Empty);
+                InvalidateVisual();
+                return;
+            }
+            // Members 空 = 宿主判定不抬升（在位编辑块里点到的是作用域块的直接子元素）→ 走单选
+        }
+        ResetBlockScope();
         _selectedSnapshot = new[] { hit };
         SelectionChanged?.Invoke(this, EventArgs.Empty);
         InvalidateVisual();
     }
 
+    /// <summary>默认抬升：同一 <c>Handle</c> 的全部条目，粒度 = 最外层块引用。</summary>
+    private BlockLift DefaultBlockLift(CadEntity hit)
+    {
+        if (_display is null) return BlockLift.None;
+        var blockHits = new List<CadEntity>();
+        foreach (var e in _display.Entities)
+            if (e.Handle == hit.Handle) blockHits.Add(e);
+        return blockHits.Count > 0
+            ? new BlockLift(hit.Handle, 0, blockHits)
+            : BlockLift.None;
+    }
+
+    private void ResetBlockScope()
+    {
+        _blockScopeHandle = 0;
+        _blockScopeInner = 0;
+    }
+
     private void SetSubPicks(IReadOnlyList<SubEntityPick> picks)
     {
+        ResetBlockScope();          // 选了子图元就不再代表"整块"（宿主据此上报目标）
         ClearSubPickCore();
         var list = picks?.Where(p => p != null).ToList();
         if (list is { Count: > 0 })
@@ -506,16 +731,42 @@ public class DrawingView : Control
     private void SelectInBand()
     {
         var bs = _bandStart!.Value;
-        double l = Math.Min(bs.X, _bandCurrent.X);
-        double t = Math.Min(bs.Y, _bandCurrent.Y);
-        double r = Math.Max(bs.X, _bandCurrent.X);
-        double b = Math.Max(bs.Y, _bandCurrent.Y);
-        var wa = Viewport.ScreenToWorld(new SKPoint((float)l, (float)t));
-        var wb = Viewport.ScreenToWorld(new SKPoint((float)r, (float)b));
-        var world = SKRect.Create(
+        SelectInRect(WorldRectOf(bs, _bandCurrent), window: _bandCurrent.X >= bs.X,
+                     additive: _modsAtPress.HasFlag(KeyModifiers.Shift));
+    }
+
+    /// <summary>屏幕两角 → 世界矩形（Y 轴翻转后取包围盒）。</summary>
+    private SKRect WorldRectOf(Point a, Point b)
+    {
+        var wa = Viewport.ScreenToWorld(new SKPoint((float)Math.Min(a.X, b.X), (float)Math.Min(a.Y, b.Y)));
+        var wb = Viewport.ScreenToWorld(new SKPoint((float)Math.Max(a.X, b.X), (float)Math.Max(a.Y, b.Y)));
+        return SKRect.Create(
             MathF.Min(wa.X, wb.X), MathF.Min(wa.Y, wb.Y),
             MathF.Abs(wb.X - wa.X), MathF.Abs(wb.Y - wa.Y));
-        SelectByRectangle(world, window: _bandCurrent.X >= bs.X);
+    }
+
+    /// <summary>
+    /// 框选入口（世界矩形）。子图元模式下先问 <see cref="SubEntitiesInRectResolver"/>
+    /// —— 空结果 = 清空选择的子图元与实体；否则走普通整实体框选。
+    /// <paramref name="additive"/> = Shift：追加到已选子图元，不替换。
+    /// 返回本次选中的目标数（子图元模式下是子图元数，否则是实体数）。
+    /// </summary>
+    public int SelectInRect(SKRect worldRect, bool window, bool additive = false)
+    {
+        if (SubPickOnBand && SubEntitiesInRectResolver != null)
+        {
+            var picks = SubEntitiesInRectResolver(worldRect, window);
+            if (picks is not { Count: > 0 })
+            {
+                SetSubPicks(Array.Empty<SubEntityPick>());
+                ClearSelection();
+                return 0;
+            }
+            if (additive) AddSubEntityPicks(picks);
+            else SetSubPicks(picks);
+            return picks.Count;
+        }
+        return SelectByRectangle(worldRect, window);
     }
 
     public int SelectByRectangle(SKRect worldRect, bool window)
@@ -698,6 +949,25 @@ public class DrawingView : Control
         InvalidateVisual();
     }
 
+    /// <summary>当前作用域骨架层的图元数（诊断 / 自检用）。</summary>
+    public int ScopeSkeletonShapeCount => _scopeSkeletonSnapshot?.Shapes.Count ?? 0;
+
+    /// <summary>
+    /// 替换作用域骨架层；传 null 等同于清除。所有权同 <see cref="SetOverlay"/>。
+    ///
+    /// <para>骨架画在二级拾取高亮<b>之下</b>：它表达的是「这些子对象可选」，
+    /// 而拾取层表达「这几个已选」。两层分开后，点击只替换拾取层 ——
+    /// 骨架不需要跟着重算（面域进入一次，环 / 边集合在本次作用域内不变）。</para>
+    /// </summary>
+    public void SetScopeSkeleton(OverlayLayer? layer)
+    {
+        var old = _scopeSkeletonSnapshot;
+        if (ReferenceEquals(old, layer)) return;
+        _scopeSkeletonSnapshot = layer;
+        if (old is not null) old.Release();
+        InvalidateVisual();
+    }
+
     /// <summary>拾取高亮被替换/清除时同步丢弃所有权与清单，并通知 VM 拾取已空。</summary>
     private void ReleaseSubPickOwnership()
     {
@@ -877,6 +1147,8 @@ public class DrawingView : Control
 
         // 淡化集合同样按图存在：句柄属于上一张图，留着会把新图的图元误判成背景
         _dimmedSnapshot = Array.Empty<(ulong, ulong)>();
+        _pickScopeOuter = 0;
+        _pickScopeOwns = null;
 
         // 叠加高亮同样按图存在：其几何是上一张图的世界坐标，留着只会画到错误的位置
         ClearOverlay();
@@ -1100,21 +1372,14 @@ public class DrawingView : Control
                 var shift = _modsAtPress.HasFlag(KeyModifiers.Shift);
                 SelectAt(p, ctrl || shift, shift);
             }
-            else if (e.KeyModifiers.HasFlag(KeyModifiers.Control)
+            else if (_modsAtPress.HasFlag(KeyModifiers.Control) && !SubPickOnBand
                      && SubEntitiesInRectResolver != null
                      && (_selectedSnapshot.Count > 0 || _dimmedSnapshot.Length > 0))
             {
                 // Ctrl+框选：只框「已选中目标」的子图元（多段线段 / 块内子实体）。
                 // 在位面域模式下面域被排除出选中集，此时用淡化项当种子（宿主侧兜底）。
                 // 空结果 = 清除二级拾取（事件带空列表，宿主同步清状态）。
-                var wa = Viewport.ScreenToWorld(new SKPoint(
-                    (float)Math.Min(bs.X, p.X), (float)Math.Min(bs.Y, p.Y)));
-                var wb = Viewport.ScreenToWorld(new SKPoint(
-                    (float)Math.Max(bs.X, p.X), (float)Math.Max(bs.Y, p.Y)));
-                var rect = SKRect.Create(
-                    Math.Min(wa.X, wb.X), Math.Min(wa.Y, wb.Y),
-                    Math.Abs(wb.X - wa.X), Math.Abs(wb.Y - wa.Y));
-                SetSubPicks(SubEntitiesInRectResolver(rect, p.X >= bs.X));
+                SetSubPicks(SubEntitiesInRectResolver(WorldRectOf(bs, p), p.X >= bs.X));
             }
             else
             {
@@ -1153,7 +1418,8 @@ public class DrawingView : Control
 
         context.Custom(new CadDrawOperation(
             this, new Rect(Bounds.Size), _display, Viewport.Zoom, Viewport.Offset,
-            _hiddenSnapshot, MinTextPixelSize, MinTextBarPixelSize, MinEntityPixelSize, _overlaySnapshot));
+            _hiddenSnapshot, MinTextPixelSize, MinTextBarPixelSize, MinEntityPixelSize,
+            _overlaySnapshot, _scopeSkeletonSnapshot));
 
         if (_bandActive && _bandStart is { } bs)
         {
@@ -1178,11 +1444,12 @@ public class DrawingView : Control
         private readonly float _minTextBarPx;
         private readonly float _minEntityPx;
         private readonly OverlayLayer? _overlay;
+        private readonly OverlayLayer? _skeleton;
         private readonly SKColor _bg;
 
         public CadDrawOperation(DrawingView owner, Rect bounds, DisplayList list, float zoom, SKPoint offset,
                                 HashSet<string> hidden, float minTextPx, float minTextBarPx, float minEntityPx,
-                                OverlayLayer? overlay)
+                                OverlayLayer? overlay, OverlayLayer? skeleton)
         {
             _owner = owner;
             _bg = owner.BackgroundColor;
@@ -1195,10 +1462,12 @@ public class DrawingView : Control
             _minTextBarPx = minTextBarPx;
             _minEntityPx = minEntityPx;
             _overlay = overlay;
+            _skeleton = skeleton;
             // 绘制操作的生命周期由 Avalonia 管理，而 UI 线程随时可能 SetDisplay 换图。
             // 持有一份引用（在 Dispose 中归还），保证绘制期间几何不会被提前释放。
             list.AddRef();
             overlay?.AddRef();
+            skeleton?.AddRef();
         }
 
         public Rect Bounds => _bounds;
@@ -1213,6 +1482,7 @@ public class DrawingView : Control
             {
                 _list.Release();
                 _overlay?.Release();
+                _skeleton?.Release();
             }
         }
 
@@ -1311,7 +1581,7 @@ public class DrawingView : Control
             // 单个实体的透明度在批里改不了。覆盖只作用于面域自己那条线（hairline 量级），
             // 被它压住的其它图元最多损失一条细线，观感上与"整体淡化"一致。
             var dimmed = _owner._dimmedSnapshot;
-            if (dimmed.Length > 0)
+            if (dimmed.Length > 0 || _owner._pickScopeOuter != 0 || _owner._scopeBodyOuter != 0)
             {
                 using var dimCover = new SKPaint
                 {
@@ -1330,8 +1600,26 @@ public class DrawingView : Control
                 canvas.Concat(worldToScreen);
                 foreach (var e in _list.Index.Query(worldRect))
                 {
-                    if (!_owner.IsDimmedEntity(e)) continue;
+                    var body = _owner.IsScopeBody(e);
+                    var dimAlpha = body ? 0 : _owner.DimAlphaOf(e);
+                    if (!body && dimAlpha == 0) continue;
                     if (_owner._hiddenSnapshot.Count > 0 && _owner._hiddenSnapshot.Contains(e.Layer)) continue;
+                    if (body)
+                    {
+                        // 作用域本体：描边交给正常 pass 按原色画（不覆盖、不重描）。
+                        // 只有填充要压 —— 原色填充会把面域糊成实心块，盖住里面的环。
+                        if (e.FillPath is { } bodyFill)
+                        {
+                            dimCover.Style = SKPaintStyle.Fill;
+                            canvas.DrawPath(bodyFill, dimCover);
+                            dimCover.Style = SKPaintStyle.Stroke;
+                            dimDraw.Style = SKPaintStyle.Fill;
+                            dimDraw.Color = new SKColor(e.ColorArgb).WithAlpha(ScopeBodyFillAlpha);
+                            canvas.DrawPath(bodyFill, dimDraw);
+                            dimDraw.Style = SKPaintStyle.Stroke;
+                        }
+                        continue;
+                    }
                     if (e.FillPath is { } dimFill)
                     {
                         dimCover.Style = SKPaintStyle.Fill;
@@ -1341,7 +1629,7 @@ public class DrawingView : Control
                     if (e.Path is { } dimPath)
                     {
                         canvas.DrawPath(dimPath, dimCover);
-                        dimDraw.Color = new SKColor(e.ColorArgb).WithAlpha(56);
+                        dimDraw.Color = new SKColor(e.ColorArgb).WithAlpha((byte)dimAlpha);
                         canvas.DrawPath(dimPath, dimDraw);
                     }
                 }
@@ -1390,53 +1678,17 @@ public class DrawingView : Control
                 canvas.Restore();
             }
 
+            // ---- 作用域骨架 pass：可选子对象的弱色底图（在二级拾取高亮之下）----
+            // 面域进入子对象模式时一次铺满全部环 / 边：光标没有 hover 预亮机制时，
+            // 这层是「哪些边能点」的唯一可视线索。
+            if (_skeleton is { Shapes.Count: > 0 })
+                DrawOverlayShapes(canvas, worldToScreen, _skeleton.Shapes, worldRect, hairline);
+
             // ---- 叠加高亮 pass：临时几何（多段线单段 / 填充环 / 块内子实体）----
             // 画在选中高亮之上：叠加层表达的是"当前操作目标"，通常比选中集合更精确，
             // 被选中集盖住就看不见了。与选中高亮一样不走 LOD —— 高亮就得看得见。
-            var overlay = _overlay;
-            if (overlay is { Shapes.Count: > 0 })
-            {
-                using var ovStroke = new SKPaint
-                {
-                    IsAntialias = Antialias,
-                    Style = SKPaintStyle.Stroke,
-                };
-                using var ovFill = new SKPaint { IsAntialias = Antialias, Style = SKPaintStyle.Fill };
-
-                // 虚线段长按世界单位给（hairline 的倍数）→ 屏幕观感不随缩放变化。
-                SKPathEffect? dash = null;
-                try
-                {
-                    canvas.Save();
-                    canvas.Concat(worldToScreen);
-                    foreach (var shape in overlay.Shapes)
-                    {
-                        if (shape?.Path is null) continue;
-                        var color = new SKColor(shape.ColorArgb);
-                        float sw = shape.StrokeWidthWorld > 0 ? shape.StrokeWidthWorld : hairline * 2;
-
-                        if (shape.Dashed && dash is null)
-                            dash = SKPathEffect.CreateDash(new[] { hairline * 12, hairline * 8 }, 0);
-                        ovStroke.PathEffect = shape.Dashed ? dash : null;
-                        ovStroke.Color = color;
-                        ovStroke.StrokeWidth = sw;
-
-                        if (shape.Fill)
-                        {
-                            ovFill.Color = color.WithAlpha(shape.FillAlpha);
-                            canvas.DrawPath(shape.Path, ovFill);
-                        }
-                        canvas.DrawPath(shape.Path, ovStroke);
-                    }
-                    canvas.Restore();
-                }
-                finally
-                {
-                    // ovStroke 仍持有该 effect 的原生引用，此处只是归还本方法的引用，不会悬空。
-                    ovStroke.PathEffect = null;
-                    dash?.Dispose();
-                }
-            }
+            if (_overlay is { Shapes.Count: > 0 })
+                DrawOverlayShapes(canvas, worldToScreen, _overlay.Shapes, worldRect, hairline);
 
             if (diag)
             {
@@ -1449,6 +1701,71 @@ public class DrawingView : Control
             }
 
             canvas.Restore();
+        }
+
+        /// <summary>
+        /// 画一层临时几何（世界坐标 → 屏幕）。骨架层与二级拾取层共用。
+        ///
+        /// <para>逐条按视口剔除：一个面域可以有上千条轮廓边，整层画会白跑几十万个
+        /// 落在窗口外的像素。剔除用闭区间重叠判定 —— 竖直 / 水平的零宽包围盒
+        /// 用 <see cref="SKRect.IntersectsWith(SKRect)"/> 恒判否，会整条消失。</para>
+        /// </summary>
+        private void DrawOverlayShapes(SKCanvas canvas, SKMatrix worldToScreen,
+                                       IReadOnlyList<OverlayShape> shapes, SKRect worldRect, float hairline)
+        {
+            using var ovStroke = new SKPaint
+            {
+                IsAntialias = Antialias,
+                Style = SKPaintStyle.Stroke,
+            };
+            using var ovFill = new SKPaint { IsAntialias = Antialias, Style = SKPaintStyle.Fill };
+
+            // 虚线段长按世界单位给（hairline 的倍数）→ 屏幕观感不随缩放变化。
+            SKPathEffect? dash = null;
+            try
+            {
+                canvas.Save();
+                canvas.Concat(worldToScreen);
+                foreach (var shape in shapes)
+                {
+                    if (shape?.Path is null) continue;
+                    if (!TouchesViewport(shape.Path, worldRect)) continue;
+                    var color = new SKColor(shape.ColorArgb);
+                    float sw = shape.StrokePixelWidth > 0
+                        ? shape.StrokePixelWidth / MathF.Max(_zoom, 1e-6f)
+                        : (shape.StrokeWidthWorld > 0 ? shape.StrokeWidthWorld : hairline * 2);
+
+                    if (shape.Dashed && dash is null)
+                        dash = SKPathEffect.CreateDash(new[] { hairline * 12, hairline * 8 }, 0);
+                    ovStroke.PathEffect = shape.Dashed ? dash : null;
+                    ovStroke.Color = color;
+                    ovStroke.StrokeWidth = sw;
+
+                    if (shape.Fill)
+                    {
+                        ovFill.Color = color.WithAlpha(shape.FillAlpha);
+                        canvas.DrawPath(shape.Path, ovFill);
+                    }
+                    canvas.DrawPath(shape.Path, ovStroke);
+                }
+                canvas.Restore();
+            }
+            finally
+            {
+                // ovStroke 仍持有该 effect 的原生引用，此处只是归还本方法的引用，不会悬空。
+                ovStroke.PathEffect = null;
+                dash?.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// 视口剔除的包围盒重叠判定（闭区间）：零宽 / 零高的退化包围盒也要能参与。
+        /// </summary>
+        private static bool TouchesViewport(SKPath path, SKRect worldRect)
+        {
+            var b = path.Bounds;
+            return b.Left <= worldRect.Right && worldRect.Left <= b.Right
+                   && b.Top <= worldRect.Bottom && worldRect.Top <= b.Bottom;
         }
 
         /// <summary>

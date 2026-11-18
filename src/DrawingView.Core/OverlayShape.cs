@@ -36,6 +36,14 @@ public sealed class OverlayShape
     public float StrokeWidthWorld { get; init; }
 
     /// <summary>
+    /// 描边宽度（<b>屏幕像素</b>）。&gt;0 时优先于 <see cref="StrokeWidthWorld"/>。
+    ///
+    /// <para>用于「弱化底图」这类需要在任意缩放下都比选中高亮细一档的层
+    /// （例如面域的环 / 边骨架：一条条并排铺开时，2px 会把整圈糊成一条粗带）。</para>
+    /// </summary>
+    public float StrokePixelWidth { get; init; }
+
+    /// <summary>
     /// 虚线轮廓。惯例上用于表达"该目标只能整体定位、无法精确到子几何"的降级状态
     /// （例如 Region 在 ACadSharp 上取不到边界，只能整体框住）。
     /// </summary>
