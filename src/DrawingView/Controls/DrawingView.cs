@@ -268,6 +268,29 @@ public class DrawingView : Control
     public int PickScopeCount => _pickScopeOuter == 0 ? 0 : (_pickScopeOwns?.Count ?? -1);
 
     /// <summary>
+    /// 作用域是否仍然有效（宿主判定）。返回 false 时画布立刻丢弃作用域状态。
+    /// <para>作用域由宿主设置，清理却只能靠宿主回调。回调链一旦断过（视图摘下再挂回、
+    /// 宿主那边已经把作用域清成空而画布没收到），画布就停在「作用域外全淡」：
+    /// 整张图发灰、点哪里都选不中，只剩作用域那个块还能点（还按默认策略抬升成整块）。
+    /// 这种残留不报错、不留痕，事后极难归因，所以每次拾取前都问一句 ——
+    /// 让残留最多活到下一次点击，而不是活到用户重开程序。</para>
+    /// </summary>
+    public Func<bool>? PickScopeKeeper { get; set; }
+
+    /// <summary>宿主不再认领作用域时，把作用域相关的画布状态整体丢弃。返回是否丢弃过。</summary>
+    private bool DropPickScopeIfStale()
+    {
+        if (_pickScopeOuter == 0) return false;
+        if (PickScopeKeeper?.Invoke() != false) return false;
+        SetPickScope(0, null);
+        SetScopeBody(0, 0);
+        SetScopeSkeleton(null);
+        SubPickOnScopeClick = false;
+        SubPickOnBand = false;
+        return true;
+    }
+
+    /// <summary>
     /// 作用域内单击即进二级拾取（多段线打标签：点线就是选那一段，不必先选中整条再点）。
     /// 块作用域不要开这个 —— 那里单击要先走块抬升。
     /// </summary>
@@ -490,6 +513,9 @@ public class DrawingView : Control
     /// <summary>单选切换（点击命中调用）。<paramref name="additive"/> = Shift：只往选择集里加，不切换。</summary>
     private void SelectAt(Point p, bool subRequested, bool additive)
     {
+        // 残留作用域先落地：否则这一下点击会被它拦成「作用域外不可拾取」，
+        // 用户看到的就是"点了没反应"
+        DropPickScopeIfStale();
         var screen = new SKPoint((float)p.X, (float)p.Y);
         var hit = HitTest(screen);
         if (hit is null)
@@ -761,6 +787,9 @@ public class DrawingView : Control
     /// </summary>
     public int SelectInRect(SKRect worldRect, bool window, bool additive = false)
     {
+        // 与单击同一条口径：残留作用域会把这些图元全判成"作用域外"，
+        // 框选于是只剩作用域那个块里的条目可选
+        DropPickScopeIfStale();
         if (SubPickOnBand && SubEntitiesInRectResolver != null)
         {
             var picks = SubEntitiesInRectResolver(worldRect, window);
@@ -1157,6 +1186,20 @@ public class DrawingView : Control
         _dimmedSnapshot = Array.Empty<(ulong, ulong)>();
         _pickScopeOuter = 0;
         _pickScopeOwns = null;
+
+        // 作用域本体 / 块抬升 / 二级拾取 / 骨架层同样按图存在，句柄和几何都属于上一张图。
+        // 漏清最难受的不是画错，而是「看得见却点不中」：本体句柄在新图里撞上别的图元，
+        // 命中测试会一直跳过它，用户只会说拾取坏了。
+        _scopeBodyOuter = 0;
+        _scopeBodyInner = 0;
+        _blockScopeHandle = 0;
+        _blockScopeInner = 0;
+        ClearSubPickCore();
+        SetScopeSkeleton(null);
+        // 粒度开关也必须跟着图走：留着上张图的「单击即选子图元 / 框选按子图元」，
+        // 新图上框选会绕过整实体框选，表现成"框了没东西"
+        SubPickOnScopeClick = false;
+        SubPickOnBand = false;
 
         // 叠加高亮同样按图存在：其几何是上一张图的世界坐标，留着只会画到错误的位置
         ClearOverlay();
