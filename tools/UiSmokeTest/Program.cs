@@ -403,6 +403,64 @@ int Run(string[] argv)
     Check(solidSel == 1, $"实心填充点内部命中（{solidSel} 条）");
     view.ClearSelection();
 
+    // ---------- 8f. 框选按真实几何判定（AutoCAD 口径） ----------
+    // 包围盒只做预筛：斜线的包围盒四角、闭合轮廓围出的空白、圆角/弧的包围盒空角
+    // 在 AutoCAD 里都不算「窗交碰到」；填充体按「面」算，框在填充区内就算碰到。
+    // 三种图元摆在互不重叠的位置（y≈1000 一档），避免互相污染断言。
+    var diagPath = new SKPath();
+    diagPath.MoveTo(0, 1000);
+    diagPath.LineTo(100, 1100);
+    var ringPath = new SKPath();
+    ringPath.AddRect(new SKRect(200, 1000, 300, 1100));
+    var areaFill = new SKPath();
+    areaFill.AddRect(new SKRect(500, 1000, 560, 1040));
+    CadEntity MakeStroke(ulong handle, SKPath stroke) => new()
+    {
+        Layer = "0",
+        Handle = handle,
+        OwnHandle = handle,
+        Path = stroke,
+        Bounds = stroke.TightBounds,
+    };
+    var diagE = MakeStroke(101, diagPath);
+    var ringE2 = MakeStroke(102, ringPath);
+    var areaE = MakeFilled(103, areaFill);
+    var boxEs = new[] { diagE, ringE2, areaE };
+    var boxList = new DisplayList
+    {
+        Entities = boxEs,
+        Index = SpatialIndex.Build(boxEs),
+        LayerNames = new[] { "0" },
+        Extents = SKRect.Create(0, 1000, 560, 100),
+        CoreExtents = SKRect.Create(0, 1000, 560, 100),
+    };
+    view.SetDisplay(boxList);
+    view.FitToContent();
+    window.CaptureRenderedFrame();
+
+    int Band(SKRect r, bool window) {
+        view.ClearSelection();
+        return view.SelectByRectangle(r, window);
+    }
+    // 斜线包围盒里、离斜线很远的角：包围盒判定会说「碰到」，几何判定说「没碰到」
+    int diagCorner = Band(SKRect.Create(70, 1010, 20, 20), window: false);
+    Check(diagCorner == 0, $"框在斜线包围盒空角里不选中（{diagCorner} 条）");
+    int diagCross = Band(SKRect.Create(45, 1045, 10, 10), window: false);
+    Check(diagCross == 1, $"框压在斜线上选中（{diagCross} 条）");
+    // 闭合矩形轮廓围出的空白：AutoCAD 窗交落在里面什么都不选
+    int ringHole = Band(SKRect.Create(230, 1030, 20, 20), window: false);
+    Check(ringHole == 0, $"框落在闭合轮廓内部空白不选中（{ringHole} 条）");
+    int ringEdge = Band(SKRect.Create(195, 1045, 10, 10), window: false);
+    Check(ringEdge == 1, $"框压在闭合轮廓边上选中（{ringEdge} 条）");
+    // 填充体按面积算：框在填充区内部也算碰到（AutoCAD 点内部能选中 Hatch / SOLID）
+    int solidIn = Band(SKRect.Create(510, 1010, 20, 20), window: false);
+    Check(solidIn == 1, $"框落在实心填充内部选中（{solidIn} 条）");
+    // 窗选用包围盒包含（等价于几何包含）：整条斜线在内要中，矩形轮廓不在框内不中
+    view.ClearSelection();
+    int winSel = view.SelectByRectangle(SKRect.Create(-10, 990, 130, 120), window: true);
+    Check(winSel == 1, $"窗选只收完全包含的斜线（{winSel} 条）");
+    view.ClearSelection();
+
     // ---------- 12. 线宽显示（B3）：像素级口径 ----------
     // 判据全部落在"屏幕上多少像素"，因为线宽的两种显示口径的差别**只**体现在像素上：
     //   模型空间 = 固定像素宽（不随缩放变化）；图纸空间 = 真实单位（随缩放变化）。

@@ -1042,7 +1042,10 @@ public class DrawingView : Control
 
     /// <summary>
     /// 矩形框选整实体（AutoCAD 的「窗选 / 窗交」）。<paramref name="window"/> = 左→右（完全包含），
-    /// false = 右→左（接触即选）。<paramref name="additive"/> / <paramref name="remove"/> 见
+    /// false = 右→左（接触即选）。判定按<b>图元真实几何</b>而不是包围盒（见
+    /// <see cref="RectPick.EntityHit"/>）：圆角矩形的方角、圆弧包围盒的空角、有洞填充的
+    /// 洞内空白都不算命中。窗口内的候选仍由空间索引按包围盒预筛。
+    /// <paramref name="additive"/> / <paramref name="remove"/> 见
     /// <see cref="SelectInRect"/>。返回命中的条目数（不是改动后的选择集大小）。
     /// </summary>
     public int SelectByRectangle(SKRect worldRect, bool window, bool additive = false, bool remove = false)
@@ -1053,8 +1056,8 @@ public class DrawingView : Control
         {
             if (_hidden.Count > 0 && _hidden.Contains(e.Layer)) continue;
             if (IsDimmedEntity(e)) continue;      // 框选同样跳过淡化的面域本体
-            bool hit = window ? worldRect.Contains(e.Bounds) : worldRect.IntersectsWith(e.Bounds);
-            if (hit) hits.Add(e);
+            if (!RectPick.EntityHit(e, worldRect, window)) continue;
+            hits.Add(e);
         }
         if (remove) RemoveFromSelection(hits);
         else if (additive) AddToSelection(hits);
