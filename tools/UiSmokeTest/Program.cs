@@ -461,6 +461,93 @@ int Run(string[] argv)
     Check(winSel == 1, $"窗选只收完全包含的斜线（{winSel} 条）");
     view.ClearSelection();
 
+    // ---------- 8g. 块实例身份：同定义多副本要分得清 ----------
+    // 构造「整张图在一个顶层块里」的形状（真实的陶板验收图就是这样：798 条图元的
+    // Handle 全等于顶层 INSERT 句柄）：
+    //   #1 outer(0x5D6) ─┬─ #2 twin(0x52A) ── #4 bolt(0x390)
+    //                    └─ #3 twin(0x52B)          ← 与 #2 同定义、同 OwnHandle
+    // 句柄完全区分不了 #2/#3，只有 InstanceId 能。
+    var twinInstances = new[]
+    {
+        new InsertInstance { Id = 1, Parent = 0, InsertHandle = 0x5D6, BlockName = "outer" },
+        new InsertInstance { Id = 2, Parent = 1, InsertHandle = 0x52A, BlockName = "twin" },
+        new InsertInstance { Id = 3, Parent = 1, InsertHandle = 0x52B, BlockName = "twin" },
+        new InsertInstance { Id = 4, Parent = 2, InsertHandle = 0x390, BlockName = "bolt" },
+    };
+    SKPath HLine(float x0, float x1, float y)
+    {
+        var p = new SKPath();
+        p.MoveTo(x0, y);
+        p.LineTo(x1, y);
+        return p;
+    }
+    CadEntity MakeMember(SKPath stroke, int instanceId, ulong own) => new()
+    {
+        Layer = "0",
+        Handle = 0x5D6,
+        OwnHandle = own,
+        Path = stroke,
+        Bounds = stroke.TightBounds,
+        InstanceId = instanceId,
+    };
+    var outerE = MakeMember(HLine(0, 100, 20), 1, 0x201);
+    var twinAE = MakeMember(HLine(200, 300, 20), 2, 0x202);
+    var twinBE = MakeMember(HLine(400, 500, 20), 3, 0x202);
+    var boltE = MakeMember(HLine(200, 300, 80), 4, 0x203);
+    var instEs = new[] { outerE, twinAE, twinBE, boltE };
+    var instList = new DisplayList
+    {
+        Entities = instEs,
+        Index = SpatialIndex.Build(instEs),
+        LayerNames = new[] { "0" },
+        Instances = twinInstances,
+        Extents = SKRect.Create(0, 0, 520, 100),
+        CoreExtents = SKRect.Create(0, 0, 520, 100),
+    };
+    view.SetDisplay(instList);
+    view.FitToContent();
+    window.CaptureRenderedFrame();
+
+    Check(instList.IsUnder(4, 2) && instList.IsUnder(2, 2) && !instList.IsUnder(3, 2)
+          && instList.IsUnder(2, 1) && instList.IsUnder(3, 1),
+          "实例祖先链：#4⊂#2⊂#1，#3⊄#2");
+    Check(instList.GetInsertChain(4).SequenceEqual(new ulong[] { 0x5D6, 0x52A, 0x390 }),
+          $"插入链外→内（[{string.Join(",", instList.GetInsertChain(4).Select(h => h.ToString("X")))}]）");
+    Check(instList.TryResolveChain(new ulong[] { 0x5D6, 0x52B }, out int resolved) && resolved == 3,
+          $"句柄链解析到孪生副本 #3（得到 #{resolved}）");
+    Check(!instList.TryResolveChain(new ulong[] { 0x5D6, 0x999 }, out _), "坏链解析失败而不是乱指");
+
+    view.SetPickScopeByInstance(2);
+    Check(view.PickScopeInstance == 2 && view.HasPickScope, $"按实例限定作用域（#{view.PickScopeInstance}）");
+    Check(!view.IsDimmedEntity(twinAE) && !view.IsDimmedEntity(boltE),
+          "作用域内：#2 与其子实例 #4 正常显示");
+    Check(view.IsDimmedEntity(twinBE) && view.IsDimmedEntity(outerE),
+          "作用域外：孪生副本 #3 与顶层 #1 的图元被淡化");
+
+    view.ClearSelection();
+    int twinLift = view.SelectAtWorld(new SKPoint(250, 20));
+    Check(twinLift == 2, $"点 #2 里的图元抬升到该实例（{twinLift} 条，期望 #2+#4）");
+    Check(view.BlockScopes.Count == 1 && view.BlockScopes[0].InstanceId == 2,
+          $"抬升记下的实例身份（{view.BlockScopes.Count} 组，InstanceId={view.BlockScopes.FirstOrDefault().InstanceId}）");
+
+    view.ClearSelection();
+    view.SetPickScope(0, null);
+    int twinBLift = view.SelectAtWorld(new SKPoint(450, 20));
+    Check(twinBLift == 1, $"孪生副本 #3 只抬升自己（{twinBLift} 条，同 OwnHandle 的 #2 不该进来）");
+    Check(view.BlockScopes.Count == 1 && view.BlockScopes[0].InstanceId == 3,
+          $"#3 的实例身份未被 #2 顶替（InstanceId={view.BlockScopes.FirstOrDefault().InstanceId}）");
+
+    view.ClearSelection();
+    view.SetScopeBodyByInstance(3, 0x202);
+    Check(view.IsScopeBody(twinBE) && !view.IsScopeBody(twinAE) && !view.IsScopeBody(outerE),
+          "按实例设本体：只认 #3 里那条同定义图元");
+    view.SetScopeBody(0, 0);
+    Check(!view.IsScopeBody(twinAE) && !view.IsScopeBody(twinBE), "清本体后都不算");
+    view.SetPickScope(0, null);
+    view.SetPickScopeByInstance(0);
+    Check(!view.HasPickScope, "实例 0 = 取消作用域");
+    view.ClearSelection();
+
     // ---------- 12. 线宽显示（B3）：像素级口径 ----------
     // 判据全部落在"屏幕上多少像素"，因为线宽的两种显示口径的差别**只**体现在像素上：
     //   模型空间 = 固定像素宽（不随缩放变化）；图纸空间 = 真实单位（随缩放变化）。

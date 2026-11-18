@@ -297,14 +297,28 @@ public class DrawingView : Control
     private HashSet<ulong>? _pickScopeOwns;
 
     /// <summary>
+    /// 按块实例限定的作用域（0 = 不用实例判定）。
+    /// 与 <see cref="_pickScopeOuter"/> 的区别：同一定义被插多次时，句柄完全相同，
+    /// 只有实例能区分是哪一个副本。
+    /// </summary>
+    private int _pickScopeInstance;
+
+    /// <summary>作用域实例及其全部后代实例 Id（建好查表，淡化判定保持 O(1)）。</summary>
+    private HashSet<int>? _pickScopeInstances;
+
+    /// <summary>
     /// 限定可拾取范围：只有 <paramref name="outer"/> 这层里、自身句柄在
     /// <paramref name="owns"/> 中的图元正常；其余淡化且不可拾取。
     /// <paramref name="owns"/> 传 null = 该外层句柄下的全部图元（整块）。<c>outer = 0</c> = 取消作用域。
+    /// <para>同一块定义被插多次时这个口径会串到全部副本 —— 能拿到实例 Id 时用
+    /// <see cref="SetPickScopeByInstance"/>。</para>
     /// </summary>
     public void SetPickScope(ulong outer, IEnumerable<ulong>? owns)
     {
         _pickScopeOuter = outer;
         _pickScopeOwns = outer == 0 ? null : (owns == null ? null : new HashSet<ulong>(owns));
+        _pickScopeInstance = 0;
+        _pickScopeInstances = null;
         var selected = _selectedSnapshot;
         if (selected.Count > 0)
         {
@@ -318,14 +332,73 @@ public class DrawingView : Control
         InvalidateVisual();
     }
 
+    /// <summary>
+    /// 按块实例限定可拾取范围：只有该实例（含其后代实例）里的图元正常，其余淡化且不可拾取。
+    /// <paramref name="instanceId"/> 为 0 或实例不存在时等价于取消作用域。
+    /// </summary>
+    public void SetPickScopeByInstance(int instanceId)
+    {
+        var instances = CollectInstanceSubtree(instanceId);
+        if (instances is null) { SetPickScope(0, null); return; }
+
+        _pickScopeInstance = instanceId;
+        _pickScopeInstances = instances;
+        // 兼容旧诊断口：外层句柄仍是这条链上最外层 INSERT 的句柄
+        var chain = _display?.GetInsertChain(instanceId);
+        _pickScopeOuter = chain is { Length: > 0 } ? chain[0] : 0;
+        _pickScopeOwns = null;
+
+        var selected = _selectedSnapshot;
+        if (selected.Count > 0)
+        {
+            var keep = selected.Where(e => !IsDimmedEntity(e)).ToArray();
+            if (keep.Length != selected.Count)
+            {
+                _selectedSnapshot = keep;
+                SelectionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+        InvalidateVisual();
+    }
+
+    /// <summary>作用域实例 Id（0 = 不按实例限定）。</summary>
+    public int PickScopeInstance => _pickScopeInstance;
+
+    /// <summary>某实例自身 + 全部后代实例的 Id 集合；实例不存在返回 null。</summary>
+    private HashSet<int>? CollectInstanceSubtree(int instanceId)
+    {
+        if (_display is null || instanceId <= 0 || _display.GetInstance(instanceId) is null) return null;
+        var set = new HashSet<int> { instanceId };
+        foreach (var inst in _display.Instances)
+            if (_display.IsUnder(inst.Id, instanceId)) set.Add(inst.Id);
+        return set;
+    }
+
+    /// <summary>
+    /// 图元是否落在当前作用域内（无作用域时恒 true）。实例口径优先，旧句柄口径兜底。
+    /// </summary>
+    internal bool InPickScope(CadEntity e)
+    {
+        if (_pickScopeInstance != 0)
+        {
+            if (e.InstanceId >= 0 && _pickScopeInstances is { } set) return set.Contains(e.InstanceId);
+            return e.Handle == _pickScopeOuter;
+        }
+        if (_pickScopeOuter == 0) return true;
+        if (e.Handle != _pickScopeOuter) return false;
+        if (_pickScopeOwns is null) return true;
+        return _pickScopeOwns.Contains(e.OwnHandle != 0 ? e.OwnHandle : e.Handle);
+    }
+
     /// <summary>是否处于「限定拾取范围」状态。</summary>
-    public bool HasPickScope => _pickScopeOuter != 0;
+    public bool HasPickScope => _pickScopeOuter != 0 || _pickScopeInstance != 0;
 
     /// <summary>作用域外层句柄（0 = 无）。</summary>
     public ulong PickScopeOuter => _pickScopeOuter;
 
     /// <summary>作用域内允许的自身句柄数；整个外层块允许时为 -1。</summary>
-    public int PickScopeCount => _pickScopeOuter == 0 ? 0 : (_pickScopeOwns?.Count ?? -1);
+    public int PickScopeCount => _pickScopeInstance != 0 ? -1
+        : _pickScopeOuter == 0 ? 0 : (_pickScopeOwns?.Count ?? -1);
 
     /// <summary>
     /// 作用域是否仍然有效（宿主判定）。返回 false 时画布立刻丢弃作用域状态。
@@ -340,7 +413,7 @@ public class DrawingView : Control
     /// <summary>宿主不再认领作用域时，把作用域相关的画布状态整体丢弃。返回是否丢弃过。</summary>
     private bool DropPickScopeIfStale()
     {
-        if (_pickScopeOuter == 0) return false;
+        if (!HasPickScope) return false;
         if (PickScopeKeeper?.Invoke() != false) return false;
         SetPickScope(0, null);
         SetScopeBody(0, 0);
@@ -370,6 +443,9 @@ public class DrawingView : Control
     private ulong _scopeBodyOuter;
     private ulong _scopeBodyInner;
 
+    /// <summary>作用域本体所属块实例（0 = 按句柄判，同定义的全部实例都算本体）。</summary>
+    private int _scopeBodyInstance;
+
     /// <summary>作用域本体填充的不透明度：留色感，但不能盖住环 / 边。</summary>
     private const byte ScopeBodyFillAlpha = 40;
 
@@ -381,8 +457,32 @@ public class DrawingView : Control
     {
         _scopeBodyOuter = outer;
         _scopeBodyInner = inner;
+        _scopeBodyInstance = 0;
+        PruneScopeBodyFromSelection();
+    }
+
+    /// <summary>
+    /// 按块实例标记作用域本体：只认该实例里的这条图元（同定义的其他副本不算），
+    /// 多实例并存的图纸才分得清「正在编辑哪一个」。
+    /// </summary>
+    public void SetScopeBodyByInstance(int instanceId, ulong inner)
+    {
+        if (_display is null || instanceId <= 0 || _display.GetInstance(instanceId) is null)
+        {
+            SetScopeBody(0, 0);
+            return;
+        }
+        _scopeBodyInstance = instanceId;
+        _scopeBodyInner = inner;
+        var chain = _display.GetInsertChain(instanceId);
+        _scopeBodyOuter = chain is { Length: > 0 } ? chain[0] : 0;
+        PruneScopeBodyFromSelection();
+    }
+
+    private void PruneScopeBodyFromSelection()
+    {
         var selected = _selectedSnapshot;
-        if (_scopeBodyOuter != 0 && selected.Count > 0)
+        if ((_scopeBodyOuter != 0 || _scopeBodyInstance != 0) && selected.Count > 0)
         {
             var keep = selected.Where(e => !IsScopeBody(e)).ToArray();
             if (keep.Length != selected.Count)
@@ -394,16 +494,30 @@ public class DrawingView : Control
         InvalidateVisual();
     }
 
-    /// <summary>该图元是否就是当前作用域本体（块被多处插入时每一处实例都算）。</summary>
+    /// <summary>
+    /// 该图元是否就是当前作用域本体。
+    /// <para>句柄口径下「块被多处插入时每一处实例都算」；设了实例（<see cref="SetScopeBodyByInstance"/>）
+    /// 就只认那一个副本。</para>
+    /// </summary>
     public bool IsScopeBody(CadEntity? e)
     {
-        if (_scopeBodyOuter == 0 || e is null || e.Handle != _scopeBodyOuter) return false;
+        if (e is null) return false;
+        if (_scopeBodyInstance != 0)
+        {
+            if (e.InstanceId != _scopeBodyInstance) return false;
+            if (_scopeBodyInner == 0) return true;
+            return e.OwnHandle == _scopeBodyInner || e.OwnHandle == e.Handle;
+        }
+        if (_scopeBodyOuter == 0 || e.Handle != _scopeBodyOuter) return false;
         if (_scopeBodyInner == 0) return true;
         return e.OwnHandle == _scopeBodyInner || e.OwnHandle == e.Handle;
     }
 
     /// <summary>作用域本体外层句柄（0 = 无）。</summary>
     public ulong ScopeBodyOuter => _scopeBodyOuter;
+
+    /// <summary>作用域本体所属实例 Id（0 = 按句柄判）。</summary>
+    public int ScopeBodyInstance => _scopeBodyInstance;
 
     /// <summary>该图元是否处于淡化 / 不可拾取状态。</summary>
     public bool IsDimmedEntity(CadEntity e) => DimAlphaOf(e) != 0;
@@ -436,12 +550,8 @@ public class DrawingView : Control
                 if (t.Inner == 0 || e.OwnHandle == t.Inner || e.OwnHandle == t.Outer) return DimAlphaList;
             }
         }
-        if (_pickScopeOuter != 0)
-        {
-            if (e.Handle != _pickScopeOuter) return DimAlphaOutOfScope;
-            if (_pickScopeOwns == null) return 0;
-            return _pickScopeOwns.Contains(e.OwnHandle != 0 ? e.OwnHandle : e.Handle) ? 0 : DimAlphaOutOfScope;
-        }
+        if (_pickScopeInstance != 0 || _pickScopeOuter != 0)
+            return InPickScope(e) ? 0 : DimAlphaOutOfScope;
         return 0;
     }
 
@@ -678,7 +788,7 @@ public class DrawingView : Control
         // 用户看到的就是"点了没反应"
         DropPickScopeIfStale();
         var screen = new SKPoint((float)p.X, (float)p.Y);
-        var inScope = _pickScopeOuter != 0;
+        var inScope = HasPickScope;
 
         // Ctrl+单击 · 普通浏览 = 循环穿透（AutoCAD 无命令状态的选择循环）。
         // 打标签作用域内 Ctrl 是「子图元」入口，所以只在作用域外走这条。
@@ -718,7 +828,7 @@ public class DrawingView : Control
         // 子图元入口只认两种：作用域内 Ctrl，和作用域内「单击即选子对象」（面域 / 多段线）。
         // 以前还有一条「再点一次已选对象」，与 AutoCAD「单击已选对象 = 保持」冲突，已去掉。
         var wantSub = (ctrl && inScope)
-                      || (SubPickOnScopeClick && inScope && hit.Handle == _pickScopeOuter);
+                      || (SubPickOnScopeClick && inScope && InPickScope(hit));
         if (SubEntityResolver != null && wantSub)
         {
             var world = Viewport.ScreenToWorld(new SKPoint((float)p.X, (float)p.Y));
@@ -763,10 +873,27 @@ public class DrawingView : Control
         AddToSelection(new[] { hit });
     }
 
-    /// <summary>默认抬升：同一 <c>Handle</c> 的全部条目，粒度 = 最外层块引用。</summary>
+    /// <summary>
+    /// 默认抬升：**最内层块实例**（AutoCAD 口径 —— 点块内图元，选中的是那个块本身，
+    /// 不是它被放在哪个更大的容器里）。
+    ///
+    /// <para>按 <c>Handle</c> 收集等于抬到最外层：整张图都在一个顶层 INSERT 里时
+    /// （<c>Handle</c> 全是那个 INSERT 的句柄），点任何图元都变成选中整图。</para>
+    /// </summary>
     private BlockLift DefaultBlockLift(CadEntity hit)
     {
         if (_display is null) return BlockLift.None;
+
+        var subtree = CollectInstanceSubtree(hit.InstanceId);
+        if (subtree is { Count: > 0 })
+        {
+            var instMembers = new List<CadEntity>();
+            foreach (var e in _display.Entities)
+                if (subtree.Contains(e.InstanceId)) instMembers.Add(e);
+            if (instMembers.Count > 0)
+                return new BlockLift(hit.Handle, 0, instMembers, hit.InstanceId);
+        }
+
         var blockHits = new List<CadEntity>();
         foreach (var e in _display.Entities)
             if (e.Handle == hit.Handle) blockHits.Add(e);
@@ -788,7 +915,7 @@ public class DrawingView : Control
     private void AddBlockScope(BlockLift spec)
     {
         foreach (var s in _blockScopes)
-            if (s.Outer == spec.Outer && s.Inner == spec.Inner)
+            if (s.Outer == spec.Outer && s.Inner == spec.Inner && s.InstanceId == spec.InstanceId)
                 return;     // 已经是这个块了，别重建选中集（会闪一下）
         ClearSubPick();
         _blockScopes.Add(spec);
@@ -1430,12 +1557,15 @@ public class DrawingView : Control
         _dimmedSnapshot = Array.Empty<(ulong, ulong)>();
         _pickScopeOuter = 0;
         _pickScopeOwns = null;
+        _pickScopeInstance = 0;
+        _pickScopeInstances = null;
 
         // 作用域本体 / 块抬升 / 二级拾取 / 骨架层同样按图存在，句柄和几何都属于上一张图。
         // 漏清最难受的不是画错，而是「看得见却点不中」：本体句柄在新图里撞上别的图元，
         // 命中测试会一直跳过它，用户只会说拾取坏了。
         _scopeBodyOuter = 0;
         _scopeBodyInner = 0;
+        _scopeBodyInstance = 0;
         _blockScopes.Clear();
         ResetCycle();
         ClearSubPickCore();
@@ -1815,7 +1945,9 @@ public class DrawingView : Control
             _skeleton = skeleton;
             _hasDim = owner._dimmedSnapshot.Length > 0
                       || owner._pickScopeOuter != 0
-                      || owner._scopeBodyOuter != 0;
+                      || owner._pickScopeInstance != 0
+                      || owner._scopeBodyOuter != 0
+                      || owner._scopeBodyInstance != 0;
             // 绘制操作的生命周期由 Avalonia 管理，而 UI 线程随时可能 SetDisplay 换图。
             // 持有一份引用（在 Dispose 中归还），保证绘制期间几何不会被提前释放。
             list.AddRef();

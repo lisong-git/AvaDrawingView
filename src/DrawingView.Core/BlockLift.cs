@@ -13,8 +13,11 @@ namespace DrawingView.Core;
 ///
 /// <para><see cref="Members"/> 为空表示<b>不抬升</b>（就选命中的那一项）：
 /// 宿主在「在位编辑块」模式下靠这个把作用域块的直接子元素留在元素粒度。</para>
+///
+/// <para><see cref="InstanceId"/> 是抬升到的那个块实例（0 = 未知）。
+/// 同一定义被插多次时句柄完全一样，只有它能区分「点中的是哪个副本」。</para>
 /// </summary>
-public readonly record struct BlockLift(ulong Outer, ulong Inner, IReadOnlyList<CadEntity> Members)
+public readonly record struct BlockLift(ulong Outer, ulong Inner, IReadOnlyList<CadEntity> Members, int InstanceId = 0)
 {
     /// <summary>不抬升。</summary>
     public static BlockLift None => new(0, 0, Array.Empty<CadEntity>());
