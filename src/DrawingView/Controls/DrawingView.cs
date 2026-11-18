@@ -334,9 +334,10 @@ public class DrawingView : Control
 
     /// <summary>
     /// 按块实例限定可拾取范围：只有该实例（含其后代实例）里的图元正常，其余淡化且不可拾取。
+    /// <paramref name="owns"/> 非 null 时再收窄到这些自身句柄（多段线 / 面域用）。
     /// <paramref name="instanceId"/> 为 0 或实例不存在时等价于取消作用域。
     /// </summary>
-    public void SetPickScopeByInstance(int instanceId)
+    public void SetPickScopeByInstance(int instanceId, IEnumerable<ulong>? owns = null)
     {
         var instances = CollectInstanceSubtree(instanceId);
         if (instances is null) { SetPickScope(0, null); return; }
@@ -346,7 +347,7 @@ public class DrawingView : Control
         // 兼容旧诊断口：外层句柄仍是这条链上最外层 INSERT 的句柄
         var chain = _display?.GetInsertChain(instanceId);
         _pickScopeOuter = chain is { Length: > 0 } ? chain[0] : 0;
-        _pickScopeOwns = null;
+        _pickScopeOwns = owns is null ? null : new HashSet<ulong>(owns);
 
         var selected = _selectedSnapshot;
         if (selected.Count > 0)
@@ -381,8 +382,12 @@ public class DrawingView : Control
     {
         if (_pickScopeInstance != 0)
         {
-            if (e.InstanceId >= 0 && _pickScopeInstances is { } set) return set.Contains(e.InstanceId);
-            return e.Handle == _pickScopeOuter;
+            bool inInstance = e.InstanceId >= 0 && _pickScopeInstances is { } set
+                ? set.Contains(e.InstanceId)
+                : e.Handle == _pickScopeOuter;
+            if (!inInstance) return false;
+            if (_pickScopeOwns is null) return true;
+            return _pickScopeOwns.Contains(e.OwnHandle != 0 ? e.OwnHandle : e.Handle);
         }
         if (_pickScopeOuter == 0) return true;
         if (e.Handle != _pickScopeOuter) return false;
