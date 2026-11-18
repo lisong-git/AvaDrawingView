@@ -203,6 +203,12 @@ public sealed class DisplayList : IDisposable
     /// </summary>
     public IReadOnlyList<ClipFrame> ClipFrames { get; init; } = Array.Empty<ClipFrame>();
 
+    /// <summary>
+    /// 图纸头里的 <c>$XCLIPFRAME</c>：0 = 不显示，1 = 显示并打印，2 = 显示不打印。
+    /// **每张图各自一份**（同批图纸实测一半 2 一半 0），AutoCAD 只在 ≠ 0 时画裁剪边界。
+    /// </summary>
+    public int ClipFrameMode { get; init; } = 2;
+
     /// <summary>是否图纸空间（布局）。线宽显示口径按空间区分，渲染期要用。</summary>
     public bool IsPaperSpace => !string.Equals(ActiveSpace, "Model", StringComparison.OrdinalIgnoreCase);
 

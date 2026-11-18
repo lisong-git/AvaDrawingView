@@ -570,6 +570,7 @@ int Run(string[] argv)
             Index = SpatialIndex.Build(new[] { bodyE }),
             LayerNames = new[] { "0" },
             ClipFrames = new[] { new ClipFrame { Handle = 0x700, Path = framePath, Bounds = clipRect } },
+            ClipFrameMode = 2,
             Extents = clipRect,
             CoreExtents = clipRect,
         };
@@ -585,6 +586,31 @@ int Run(string[] argv)
         var withFrame = window.CaptureRenderedFrame();
         int frameDiff = PixelDiff(withFrame, noFrame);
         Check(frameDiff > 200, $"裁剪边框被画出来（开关前后 {frameDiff} 像素不同）");
+
+        // 头变量 $XCLIPFRAME=0 = 图纸自己要求不显示（AutoCAD 里默认看不见框，悬停 / 选中才闪现）。
+        // 这条不能靠用户开关兜：图纸一多就是"满屏紫线"，而 AutoCAD 那边是干净的。
+        var quietList = new DisplayList
+        {
+            Entities = new[] { bodyE },
+            Index = SpatialIndex.Build(new[] { bodyE }),
+            LayerNames = new[] { "0" },
+            ClipFrames = new[] { new ClipFrame { Handle = 0x700, Path = framePath, Bounds = clipRect } },
+            ClipFrameMode = 0,
+            Extents = clipRect,
+            CoreExtents = clipRect,
+        };
+        view.SetDisplay(quietList);
+        view.FitToContent();
+        window.CaptureRenderedFrame();
+        window.CaptureRenderedFrame();
+        var modeZero = window.CaptureRenderedFrame();
+        view.SetDisplay(frameList);
+        view.FitToContent();
+        window.CaptureRenderedFrame();
+        window.CaptureRenderedFrame();
+        var modeTwo = window.CaptureRenderedFrame();
+        int modeDiff = PixelDiff(modeTwo, modeZero);
+        Check(modeDiff > 200, $"头变量 XCLIPFRAME=0 时不画边框（与 =2 差 {modeDiff} 像素）");
 
         view.ClearSelection();
         int framePick = view.SelectAtWorld(new SKPoint(clipRect.Right, clipRect.Bottom));

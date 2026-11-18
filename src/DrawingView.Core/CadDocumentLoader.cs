@@ -125,6 +125,7 @@ public static class CadDocumentLoader
             FontUsage = new Dictionary<string, int>(converter.FontUsage),
             ClipPaths = converter.ClipPaths,
             ClipFrames = converter.ClipFrames,
+            ClipFrameMode = converter.XClipFrameMode,
             WorldUnitsPerMm = converter.WorldUnitsPerMm,
         };
     }

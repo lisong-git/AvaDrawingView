@@ -93,8 +93,10 @@ public class DrawingView : Control
     private bool _showClipFrames = true;
 
     /// <summary>
-    /// 是否画块裁剪边界线（AutoCAD 的 <c>XCLIPFRAME</c>，默认 <c>true</c> ≈ 2023 的默认值 2：
-    /// 显示但不打印）。
+    /// 允许画块裁剪边界线（AutoCAD 的 <c>XCLIPFRAME</c>）。这里是**用户总开关**，默认 <c>true</c>；
+    /// 图纸自己是否显示由 <see cref="DisplayList.ClipFrameMode"/>（头变量 <c>$XCLIPFRAME</c>）决定，
+    /// 两者都允许才画 —— 头变量为 0 的图纸（AutoCAD 里默认看不见框，只在悬停 / 选中时闪现）
+    /// 不该一进来就满屏紫色细线。
     ///
     /// <para>边框**不是几何**：它不在实体表里，不参与拾取 / 框选 / 标注 / 打印，只由画布在内容
     /// 之上描一圈落色细线。关掉它不影响任何裁剪行为，只是看不见这条界线。</para>
@@ -2088,9 +2090,10 @@ public class DrawingView : Control
                 if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tPoint = n - tMark; tMark = n; }
             }
 
-            // ---- 裁剪边框 pass：AutoCAD 的 XCLIP 边框（XCLIPFRAME≠0 时显示）----
+            // ---- 裁剪边框 pass：AutoCAD 的 XCLIP 边框 ----
             // 画在内容之上、选中高亮之下：它是"这块被裁到哪儿"的界线，属于底图信息。
-            if (_owner.ShowClipFrames && _list.ClipFrames.Count > 0)
+            // 头变量 $XCLIPFRAME 是每张图自己的设定（0 不显示），图纸说不显示就不显示。
+            if (_owner.ShowClipFrames && _list.ClipFrameMode != 0 && _list.ClipFrames.Count > 0)
                 DrawClipFrames(canvas, worldToScreen, _list.ClipFrames, worldRect, hairline);
 
             // ---- 选中高亮 pass：叠加在最上层，不走 LOD（选中了就要看得见）----

@@ -344,6 +344,13 @@ public sealed class GeometryConverter
     public IReadOnlyList<ClipFrame> ClipFrames => _clipFrames;
 
     /// <summary>
+    /// 图纸头里的 <c>$XCLIPFRAME</c>（0 = 不显示，1 = 显示并打印，2 = 显示不打印）。
+    /// **这是每张图自己的设定**，不是全局默认：同一批图纸里实测一半是 2、一半是 0，
+    /// 所以不能像原来那样一律画出来。
+    /// </summary>
+    public int XClipFrameMode { get; private set; }
+
+    /// <summary>
     /// 图纸范围（文件头 EXTMIN/EXTMAX）。只用于**边界与图形脱节**的兜底：
     /// 裁剪边界经两次变换后仍与实体不相交时，按这个范围裁 —— 与 AutoCAD 的实测表现一致
     /// （见 <see cref="TryGetSpatialClip"/> 的标定说明与 P2-13 条目）。
@@ -449,6 +456,9 @@ public sealed class GeometryConverter
         _clipPaths.Clear();   // 上一轮建的裁剪路径已随旧 DisplayList 释放
         _clipFrames.Clear();
         _sheetRect = CadDocumentLoader.HeaderModelSpaceRect(doc);
+        // $XCLIPFRAME 是每张图自己的设定（0 不显示 / 1 显示并打印 / 2 显示不打印），
+        // AutoCAD 只在 ≠ 0 时画裁剪边界：同一批图纸实测一半 2 一半 0，不能一律画。
+        XClipFrameMode = (int)doc.Header.ExternalReferenceClippingBoundaryType;
         _hideLayers = options?.HideLayers is { Count: > 0 } hl
             ? new HashSet<string>(hl, StringComparer.OrdinalIgnoreCase)
             : null;
