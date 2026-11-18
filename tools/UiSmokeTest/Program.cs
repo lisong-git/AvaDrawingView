@@ -273,6 +273,66 @@ int Run(string[] argv)
     view.MinEntityPixelSize = 1.5f;
     view.MinTextPixelSize = DrawingView.Controls.DrawingView.DefaultMinTextPixelSize;
 
+    // ---------- 8b. 框选带：窗选 / 窗交 的配色与文字提示 ----------
+    // 判据落在光标右下方那个小块里：提示牌摆在框角**之外**（cursor+14/+16），
+    // 摆带之前该区域必是纯背景，所以那里出现的强调色像素只能来自提示文字本身。
+    // 先把普通几何整档剔掉（LOD 阈值抬到不可满足），画面里就只剩带、提示牌与字。
+    view.SetBandForTest(null, default);
+    view.MinEntityPixelSize = 1e9f;
+    view.MinTextPixelSize = 1e9f;
+    view.InvalidateVisual();
+    window.CaptureRenderedFrame();
+    var blank = window.CaptureRenderedFrame();
+    int cueBlue0 = CountHue(blank, 414, 316, 120, 26, bluish: true);
+    int cueGreen0 = CountHue(blank, 414, 316, 120, 26, bluish: false);
+    Check(cueBlue0 == 0 && cueGreen0 == 0, $"提示区摆带前是纯背景（蓝 {cueBlue0} / 绿 {cueGreen0}）");
+
+    view.SetBandForTest(new Point(200, 150), new Point(400, 300));      // 从左往右 = 窗选
+    window.CaptureRenderedFrame();
+    var winBand = window.CaptureRenderedFrame();
+    int winBlue = CountHue(winBand, 414, 316, 120, 26, bluish: true);
+    int winGreen = CountHue(winBand, 414, 316, 120, 26, bluish: false);
+    Check(winBlue > 15, $"窗选提示文字已画出（蓝像素 {cueBlue0} → {winBlue}）");
+    Check(winGreen == 0, $"窗选时提示区没有绿色（{winGreen}）");
+
+    view.SetBandForTest(new Point(620, 120), new Point(400, 300));      // 从右往左 = 窗交
+    window.CaptureRenderedFrame();
+    var crossBand = window.CaptureRenderedFrame();
+    int crossGreen = CountHue(crossBand, 414, 316, 120, 26, bluish: false);
+    int crossBlue = CountHue(crossBand, 414, 316, 120, 26, bluish: true);
+    Check(crossGreen > 15, $"窗交提示文字已画出（绿像素 {cueGreen0} → {crossGreen}）");
+    Check(crossBlue == 0, $"窗交时提示区没有蓝色（{crossBlue}）");
+
+    view.SetBandForTest(null, default);
+    window.CaptureRenderedFrame();
+    var cleared = window.CaptureRenderedFrame();
+    Check(CountHue(cleared, 414, 316, 120, 26, bluish: true)
+          + CountHue(cleared, 414, 316, 120, 26, bluish: false) == 0,
+          "清除框选带后提示不残留");
+
+    // ---------- 8c. 大量选中：高亮降档后依然可见 ----------
+    // 完整样式是每实体三次 DrawPath（外圈 glow + 核心描边 + 填充罩），一次框上万条会吃掉整帧；
+    // 超过 SelectionGlowLimit 只留核心描边 —— 断言两件事：降档后还看得见、且蓝色覆盖确实变少。
+    view.MinEntityPixelSize = 1.5f;
+    view.MinTextPixelSize = DrawingView.Controls.DrawingView.DefaultMinTextPixelSize;
+    view.FitToContent();
+    var pickedMany = secondList.Entities.Take(300).ToArray();
+    view.ClearSelection();
+    window.CaptureRenderedFrame();
+    int hlBase = CountInk(window.CaptureRenderedFrame());
+    view.SetSelection(pickedMany);
+    view.SelectionGlowLimit = 0;
+    window.CaptureRenderedFrame();
+    int hlFull = CountInk(window.CaptureRenderedFrame());
+    view.SelectionGlowLimit = Math.Max(1, pickedMany.Length / 2);
+    window.CaptureRenderedFrame();
+    int hlLean = CountInk(window.CaptureRenderedFrame());
+    Log($"       选中 {pickedMany.Length} 条：无选中 {hlBase} / 完整样式 {hlFull} / 降档后 {hlLean}");
+    Check(hlLean > hlBase, $"降档后选中仍然看得见（墨量 {hlBase} → {hlLean}）");
+    Check(hlFull > hlLean, $"完整样式的覆盖更多（{hlFull} vs {hlLean}）");
+    view.SelectionGlowLimit = 2000;
+    view.ClearSelection();
+
     // ---------- 12. 线宽显示（B3）：像素级口径 ----------
     // 判据全部落在"屏幕上多少像素"，因为线宽的两种显示口径的差别**只**体现在像素上：
     //   模型空间 = 固定像素宽（不随缩放变化）；图纸空间 = 真实单位（随缩放变化）。
@@ -519,6 +579,64 @@ static int CountMagenta(WriteableBitmap? frame)
             byte g = c1;
             byte b = bgra ? c0 : c2;
             if (r >= 200 && b >= 200 && g <= 180) count++;
+        }
+    }
+    return count;
+}
+
+/// <summary>
+/// 统计指定矩形内的强调色像素（框选带提示 / 选中高亮的判据）。
+/// bluish = 蓝通道主导（窗选、AutoCAD 选中高亮）；否则绿色主导（窗交）。
+/// 用通道差而不是精确色值：12px 文字经抗锯齿后只有核心像素是原色，边缘全是与黑底的混合色。
+/// </summary>
+static int CountHue(WriteableBitmap? frame, int x0, int y0, int wRegion, int hRegion, bool bluish)
+{
+    if (frame is null) return -1;
+    using var fb = frame.Lock();
+    bool bgra = fb.Format == PixelFormat.Bgra8888;
+    int w = fb.Size.Width, h = fb.Size.Height, stride = fb.RowBytes;
+    var row = new byte[stride];
+    int count = 0;
+    int xa = Math.Max(0, x0), ya = Math.Max(0, y0);
+    int xb = Math.Min(w, x0 + wRegion), yb = Math.Min(h, y0 + hRegion);
+    for (int y = ya; y < yb; y++)
+    {
+        Marshal.Copy(IntPtr.Add(fb.Address, y * stride), row, 0, stride);
+        for (int x = xa; x < xb; x++)
+        {
+            int o = x * 4;
+            byte c0 = row[o], c1 = row[o + 1], c2 = row[o + 2];
+            byte r = bgra ? c2 : c0;
+            byte g = c1;
+            byte b = bgra ? c0 : c2;
+            if (bluish) { if (b >= 150 && b > r + 60 && b > g + 40) count++; }
+            else { if (g >= 110 && g > r + 30 && g > b + 30) count++; }
+        }
+    }
+    return count;
+}
+
+/// <summary>
+/// 统计非背景像素（黑底上任何通道超过阈值）。用于比较高亮样式：选中高亮的 glow 与
+/// 半透明填充叠在黑底上只是很暗的蓝（(0,33,59) 这类），按"蓝色主导"判会漏掉，
+/// 只能按"有没有墨"来数 —— 叠加样式的影响就是让目标周围多出一圈暗像素。
+/// </summary>
+static int CountInk(WriteableBitmap? frame, int threshold = 16)
+{
+    if (frame is null) return -1;
+    using var fb = frame.Lock();
+    bool bgra = fb.Format == PixelFormat.Bgra8888;
+    int w = fb.Size.Width, h = fb.Size.Height, stride = fb.RowBytes;
+    var row = new byte[stride];
+    int count = 0;
+    for (int y = 0; y < h; y++)
+    {
+        Marshal.Copy(IntPtr.Add(fb.Address, y * stride), row, 0, stride);
+        for (int x = 0; x < w; x++)
+        {
+            int o = x * 4;
+            byte c0 = row[o], c1 = row[o + 1], c2 = row[o + 2];
+            if (Math.Max(c0, Math.Max(c1, c2)) > threshold) count++;
         }
     }
     return count;

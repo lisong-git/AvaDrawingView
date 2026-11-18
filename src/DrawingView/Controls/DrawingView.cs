@@ -198,14 +198,46 @@ public class DrawingView : Control
     private static readonly SolidColorBrush BandWindowFill = new(Color.FromArgb(36, 68, 138, 255));
     private static readonly SolidColorBrush BandWindowBorder = new(Color.FromRgb(68, 138, 255));
     private static readonly SolidColorBrush BandCrossingFill = new(Color.FromArgb(36, 92, 184, 92));
-    private static readonly Pen BandCrossingPen = new(new SolidColorBrush(Color.FromRgb(92, 184, 92)), 1, DashStyle.Dash);
+    private static readonly SolidColorBrush BandCrossingBorder = new(Color.FromRgb(92, 184, 92));
+    private static readonly Pen BandCrossingPen = new(BandCrossingBorder, 1, DashStyle.Dash);
     private static readonly Pen BandWindowPen = new(BandWindowBorder, 1);
+    private static readonly SolidColorBrush BandCuePlate = new(Color.FromArgb(208, 24, 24, 24));
+
+    /// <summary>
+    /// 直接摆出框选带（自检用）：真实拖拽要注入「按下 → 移动 → 抬起」三段输入，
+    /// 无头平台很难稳定停在中间的绘制帧上，窗口模式和窗交模式的提示就没法按像素验。
+    /// </summary>
+    public void SetBandForTest(Point? start, Point current)
+    {
+        _bandStart = start;
+        _bandCurrent = current;
+        _bandActive = start is not null;
+        InvalidateVisual();
+    }
 
     /// <summary>选中集合变化（含清空）。UI 线程触发。</summary>
     public event EventHandler? SelectionChanged;
 
     /// <summary>当前选中实体（不可变快照）。</summary>
     public IReadOnlyList<CadEntity> SelectedEntities => _selectedSnapshot;
+
+    /// <summary>
+    /// 选中高亮走完整样式（外圈 glow + 半透明填充）的条数上限；超过只画核心描边。
+    /// 整图框选动辄上万条，完整样式是每实体多两次 <c>DrawPath</c>，会让这一趟占掉整帧一半。
+    /// 传 0 或负数 = 永不降档（诊断 / 截图对比用）。
+    /// </summary>
+    public int SelectionGlowLimit
+    {
+        get => _selectionGlowLimit;
+        set
+        {
+            if (value == _selectionGlowLimit) return;
+            _selectionGlowLimit = value;
+            InvalidateVisual();
+        }
+    }
+
+    private int _selectionGlowLimit = 2000;
 
     // ---------- 淡化 / 禁止拾取（在位面域打标签） ----------
     // 与选中集合同一套交付方式：整个引用替换，渲染线程只读。
@@ -1643,7 +1675,29 @@ public class DrawingView : Control
             bool window = _bandCurrent.X >= bs.X;
             context.FillRectangle(window ? BandWindowFill : BandCrossingFill, rect);
             context.DrawRectangle(window ? BandWindowPen : BandCrossingPen, rect);
+            DrawBandCue(context, window);
         }
+    }
+
+    /// <summary>
+    /// 框选模式提示：蓝实线 = 窗选（完全落在框内才选中），绿虚线 = 窗交（压到边界即选中）。
+    /// 两种框只差颜色与线型，色弱 / 反色背景下分不清 —— 贴光标补一行字，省掉"框完才发现选多了"。
+    /// </summary>
+    private void DrawBandCue(DrawingContext context, bool window)
+    {
+        var label = new FormattedText(
+            window ? "窗选" : "窗交",
+            System.Globalization.CultureInfo.CurrentCulture, FlowDirection.LeftToRight,
+            Typeface.Default, 12, window ? BandWindowBorder : BandCrossingBorder);
+
+        var maxX = Math.Max(4, Bounds.Width - label.Width - 12);
+        var maxY = Math.Max(4, Bounds.Height - label.Height - 8);
+        var x = Math.Clamp(_bandCurrent.X + 14, 4, maxX);
+        var y = Math.Clamp(_bandCurrent.Y + 16, 4, maxY);
+
+        context.DrawRectangle(BandCuePlate, null,
+            new Rect(x - 5, y - 2, label.Width + 10, label.Height + 4), 3, 3);
+        context.DrawText(label, new Point(x, y));
     }
 
     private sealed class CadDrawOperation : ICustomDrawOperation
@@ -1805,6 +1859,10 @@ public class DrawingView : Control
             var selected = _owner._selectedSnapshot;
             if (selected.Count > 0)
             {
+                // 选中条数过多时降档：glow 外圈 + 半透明罩是每实体多两次 DrawPath，
+                // 一次框选上万条后这一趟能吃掉整帧一半以上；核心描边保留，选中范围照样一眼可见。
+                int glowLimit = _owner.SelectionGlowLimit;
+                bool lean = glowLimit > 0 && selected.Count > glowLimit;
                 using var hlGlow = new SKPaint
                 {
                     IsAntialias = Antialias,
@@ -1831,11 +1889,24 @@ public class DrawingView : Control
                 {
                     // 渲染线程只读不可变快照 _hiddenSnapshot（与主绘制 pass 同一规则）
                     if (_owner._hiddenSnapshot.Count > 0 && _owner._hiddenSnapshot.Contains(e.Layer)) continue;
-                    if (e.FillPath is { } fp) canvas.DrawPath(fp, hlFill);
-                    if (e.Path is { } pth)
+                    // 视口剔除：整图框选会带上大量框外实体，Skia 虽会裁掉像素，路径遍历照跑
+                    // （闭区间判定，零宽零高的直线也要能参与）
+                    var linePath = e.Path;
+                    var fillPath = e.FillPath;
+                    if (linePath is not null && !TouchesViewport(linePath, worldRect)) linePath = null;
+                    if (fillPath is not null && !TouchesViewport(fillPath, worldRect)) fillPath = null;
+                    if (linePath is null && fillPath is null) continue;
+
+                    if (!lean && fillPath is { } fp) canvas.DrawPath(fp, hlFill);
+                    if (linePath is { } pth)
                     {
-                        canvas.DrawPath(pth, hlGlow);
+                        if (!lean) canvas.DrawPath(pth, hlGlow);
                         canvas.DrawPath(pth, hlStroke);
+                    }
+                    else if (fillPath is { } onlyFill)
+                    {
+                        // 只有填充几何的实体（SOLID / 实心箭线）：降档后也不能变成"没选中"
+                        canvas.DrawPath(onlyFill, hlFill);
                     }
                 }
                 canvas.Restore();
