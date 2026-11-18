@@ -513,23 +513,49 @@ public class DrawingView : Control
     /// <summary>
     /// 实体距离（世界单位）：AutoCAD 语义 —— 填充实体点在内部 = 0；描边实体把容差
     /// 膨胀进描边几何后包含点 = 0（拾取框压到线才算，点在矩形/圆内部空白不选中）。
-    /// 无几何（或膨胀失败）才退回包围盒距离。
+    /// 有几何却没压中一律 <see cref="double.MaxValue"/>；只有完全没有几何的实体
+    /// （TTF 文字按 <see cref="CadEntity.Bounds"/> 估）才退回包围盒距离。
     /// </summary>
     private static double DistanceToEntity(CadEntity e, SKPoint world, float tolWorld)
     {
-        if (e.FillPath is { } fp && fp.Contains(world.X, world.Y)) return 0;
-        if (e.Path is { } pth)
+        if (e.FillPath is { } fp) return FillDistance(fp, world, tolWorld);
+        if (e.Path is { } pth) return StrokeDistance(pth, world, tolWorld);
+        return BoundsDistance(e.Bounds, world);
+    }
+
+    /// <summary>
+    /// 填充体命中：落在填充区内 = 0，否则看拾取框是否压到填充边界（膨胀描边后包含点）。
+    /// 洞内部与包围盒内的空白都不命中 —— 填充体常是「有洞的环」，退包围盒会把
+    /// 整张图纸的空白都算成命中区。
+    /// </summary>
+    private static double FillDistance(SKPath fill, SKPoint world, float tolWorld)
+    {
+        if (fill.Contains(world.X, world.Y)) return 0;
+        using var paint = new SKPaint
         {
-            using var paint = new SKPaint
-            {
-                Style = SKPaintStyle.Stroke,
-                StrokeWidth = tolWorld * 2,
-            };
-            using var inflated = new SKPath();
-            if (paint.GetFillPath(pth, inflated))
-                return inflated.Contains(world.X, world.Y) ? 0 : double.MaxValue;
-        }
-        var b = e.Bounds;
+            Style = SKPaintStyle.Stroke,
+            StrokeWidth = tolWorld * 2,
+        };
+        using var outline = new SKPath();
+        if (paint.GetFillPath(fill, outline) && outline.Contains(world.X, world.Y)) return 0;
+        return double.MaxValue;
+    }
+
+    /// <summary>描边命中：路径按拾取框膨胀后包含点 = 0，否则不命中（含退化路径膨胀失败）。</summary>
+    private static double StrokeDistance(SKPath stroke, SKPoint world, float tolWorld)
+    {
+        using var paint = new SKPaint
+        {
+            Style = SKPaintStyle.Stroke,
+            StrokeWidth = tolWorld * 2,
+        };
+        using var inflated = new SKPath();
+        if (!paint.GetFillPath(stroke, inflated)) return double.MaxValue;
+        return inflated.Contains(world.X, world.Y) ? 0 : double.MaxValue;
+    }
+
+    private static double BoundsDistance(SKRect b, SKPoint world)
+    {
         float dx = MathF.Max(MathF.Max(b.Left - world.X, world.X - b.Right), 0);
         float dy = MathF.Max(MathF.Max(b.Top - world.Y, world.Y - b.Bottom), 0);
         return MathF.Sqrt(dx * dx + dy * dy);

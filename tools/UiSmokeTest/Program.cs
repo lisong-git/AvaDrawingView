@@ -357,6 +357,52 @@ int Run(string[] argv)
     view.CanvasDoubleClicked -= OnDbl;
     view.ClearSelection();
 
+    // ---------- 8e. 填充体命中：洞内空白不算选中 ----------
+    // 宽多段线（ConstantWidth）与实心填充只有 FillPath、没有 Path，且常是「有洞的环」。
+    // 一条罩住整张图的外框就能让每次点空白都命中它，再经块抬升变成「选中整张图」。
+    // 这里手工构造同一形状：400×200 外框 + 100×50 起 200×100 的洞。
+    var ringFill = new SKPath();
+    ringFill.AddRect(new SKRect(0, 0, 400, 200));
+    ringFill.AddRect(new SKRect(100, 50, 300, 150), SKPathDirection.CounterClockwise);
+    var solidFill = new SKPath();
+    solidFill.AddRect(new SKRect(460, 0, 520, 40));
+    CadEntity MakeFilled(ulong handle, SKPath fill) => new()
+    {
+        Layer = "0",
+        Handle = handle,
+        OwnHandle = handle,
+        FillPath = fill,
+        Bounds = fill.TightBounds,
+    };
+    var ringE = MakeFilled(1, ringFill);
+    var solidE = MakeFilled(2, solidFill);
+    var fillList = new DisplayList
+    {
+        Entities = new[] { ringE, solidE },
+        Index = SpatialIndex.Build(new[] { ringE, solidE }),
+        LayerNames = new[] { "0" },
+        Extents = SKRect.Create(0, 0, 520, 200),
+        CoreExtents = SKRect.Create(0, 0, 520, 200),
+    };
+    view.SetDisplay(fillList);
+    view.FitToContent();
+    window.CaptureRenderedFrame();
+    Log($"       填充环 zoom={view.Viewport.Zoom:F3}");
+    Check(!ringFill.Contains(200, 100), "构造的环中心确实落在洞里");
+    view.ClearSelection();
+    int holeSel = view.SelectAtWorld(new SKPoint(200, 100));
+    Check(holeSel == 0, $"点环内空白不选中（{holeSel} 条）");
+    view.ClearSelection();
+    int bandSel = view.SelectAtWorld(new SKPoint(50, 100));
+    Check(bandSel == 1, $"点在环带上选中该填充（{bandSel} 条）");
+    view.ClearSelection();
+    int holeEdgeSel = view.SelectAtWorld(new SKPoint(300 - 2 / view.Viewport.Zoom, 100));
+    Check(holeEdgeSel == 1, $"洞边界外 2px（拾取框压到环带）仍命中（{holeEdgeSel} 条）");
+    view.ClearSelection();
+    int solidSel = view.SelectAtWorld(new SKPoint(490, 20));
+    Check(solidSel == 1, $"实心填充点内部命中（{solidSel} 条）");
+    view.ClearSelection();
+
     // ---------- 12. 线宽显示（B3）：像素级口径 ----------
     // 判据全部落在"屏幕上多少像素"，因为线宽的两种显示口径的差别**只**体现在像素上：
     //   模型空间 = 固定像素宽（不随缩放变化）；图纸空间 = 真实单位（随缩放变化）。
