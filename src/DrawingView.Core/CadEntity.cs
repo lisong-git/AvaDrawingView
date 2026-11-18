@@ -91,11 +91,22 @@ public sealed class CadEntity
     /// 最外层 INSERT 的句柄；本字段保留块定义层那个原始句柄，用于还原
     /// 「这个显示图元对应块内哪个子实体」。顶层实体二者相等。</para>
     ///
-    /// <para>0 = 未知（旧数据或未填）。**同一实体被插入多次时会得到多个 CadEntity，
-    /// 它们的 OwnHandle 相同而 Handle 不同** —— 需要区分「哪一个插入」时用
-    /// (Handle, OwnHandle) 组合。</para>
+    /// <para>0 = 未知（旧数据或未填）。**同一块定义被插入多次时，各实例的后代 OwnHandle 相同、
+    /// Handle 也相同**（Handle 只取到最外层 INSERT）—— 想区分「哪一个插入」只能看
+    /// <see cref="InstanceId"/>。</para>
     /// </summary>
     public ulong OwnHandle { get; init; }
+
+    /// <summary>
+    /// 所属**最内层**块实例 Id（见 <see cref="InsertInstance"/>）；0 = 模型空间/图纸空间直属。
+    ///
+    /// <para>转换期用 -1 表示「尚未指派」，<c>GeometryConverter.Convert</c> 收尾会统一归一化为 0，
+    /// 因此构建完成的图纸里不出现负值。</para>
+    /// </summary>
+    public int InstanceId { get; set; } = PendingInstance;
+
+    /// <summary>转换期「尚未指派」标记（不对外出现，见 <see cref="InstanceId"/>）。</summary>
+    public const int PendingInstance = -1;
     /// <summary>描边几何（世界坐标），与 FillPath 互斥使用。</summary>
     public SKPath? Path { get; init; }
     /// <summary>填充几何（世界坐标），如 SOLID。</summary>

@@ -30,6 +30,91 @@ public sealed class DisplayList : IDisposable
 
     /// <summary>句柄 → 首个命中实体的世界包围盒（用于标注 zoom-to-handle；句柄 0 不收录）。</summary>
     public IReadOnlyDictionary<ulong, SKRect> HandleBounds { get; init; } = new Dictionary<ulong, SKRect>();
+
+    /// <summary>
+    /// 块实例表（下标 = <see cref="InsertInstance.Id"/> - 1，Id 连续从 1 起）。
+    /// 图元按 <see cref="CadEntity.InstanceId"/> 反查自己属于哪个插入。
+    /// </summary>
+    public IReadOnlyList<InsertInstance> Instances { get; init; } = Array.Empty<InsertInstance>();
+
+    /// <summary>插入链最大深度（与转换器的块递归上限一致）。</summary>
+    public const int MaxInstanceDepth = 8;
+
+    /// <summary>(父实例, 插入句柄) → 实例 Id 的索引；惰性建，建失败不影响正确性。</summary>
+    private Dictionary<(int Parent, ulong Handle), int>? _instanceIndex;
+
+    /// <summary>按 (父实例, 该 INSERT 在父定义里的句柄) 找子实例 Id；找不到返回 0。</summary>
+    public int FindInstance(int parent, ulong insertHandle)
+    {
+        // 并发首建会各自产出一份内容相同的字典，引用赋值是原子的 —— 不做加锁。
+        var index = _instanceIndex ??= BuildInstanceIndex();
+        return index.TryGetValue((parent, insertHandle), out int id) ? id : 0;
+    }
+
+    private Dictionary<(int Parent, ulong Handle), int> BuildInstanceIndex()
+    {
+        var map = new Dictionary<(int, ulong), int>(Instances.Count);
+        foreach (var inst in Instances) map[(inst.Parent, inst.InsertHandle)] = inst.Id;
+        return map;
+    }
+
+    /// <summary>按 Id 取实例；0 / 越界 / 未知都返回 null。</summary>
+    public InsertInstance? GetInstance(int id)
+        => id >= 1 && id <= Instances.Count && Instances[id - 1].Id == id ? Instances[id - 1] : null;
+
+    /// <summary>
+    /// <paramref name="instanceId"/> 是否等于 <paramref name="ancestorId"/> 或是它的后代。
+    /// <paramref name="ancestorId"/> 为 0（模型空间）时恒 true；未指派的 -1 按 0 处理。
+    /// </summary>
+    public bool IsUnder(int instanceId, int ancestorId)
+    {
+        if (instanceId < 0) instanceId = 0;
+        if (ancestorId <= 0) return true;
+        for (int guard = 0; guard <= MaxInstanceDepth && instanceId > 0; guard++)
+        {
+            if (instanceId == ancestorId) return true;
+            instanceId = GetInstance(instanceId)?.Parent ?? 0;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 实例的插入句柄链，**外→内**（第一项是最外层 INSERT 的句柄）。
+    /// 与标注地址里 `ins:X/ins:Y` 的顺序一致。实例不存在时返回空数组。
+    /// </summary>
+    public ulong[] GetInsertChain(int instanceId)
+    {
+        if (instanceId <= 0) return Array.Empty<ulong>();
+        var chain = new List<ulong>(4);
+        for (int guard = 0; guard <= MaxInstanceDepth; guard++)
+        {
+            var inst = GetInstance(instanceId);
+            if (inst is null) break;
+            chain.Add(inst.InsertHandle);
+            if (inst.Parent == 0) { chain.Reverse(); return chain.ToArray(); }
+            instanceId = inst.Parent;
+        }
+        return Array.Empty<ulong>();
+    }
+
+    /// <summary>
+    /// 把**外→内**的插入句柄链解析成实例 Id。任一段解析不出（图纸改过 / 脏地址）返回 false，
+    /// 调用方应退回按 (Handle, OwnHandle) 取首个实例的旧语义。
+    /// </summary>
+    public bool TryResolveChain(IReadOnlyList<ulong>? chain, out int instanceId)
+    {
+        instanceId = 0;
+        if (chain is null || chain.Count == 0 || chain.Count > MaxInstanceDepth) return false;
+        int parent = 0;
+        for (int i = 0; i < chain.Count; i++)
+        {
+            int next = FindInstance(parent, chain[i]);
+            if (next == 0) { instanceId = 0; return false; }
+            parent = next;
+        }
+        instanceId = parent;
+        return true;
+    }
     /// <summary>图纸范围（世界坐标），空图纸时为默认占位范围。</summary>
     public required SKRect Extents { get; init; }
     /// <summary>

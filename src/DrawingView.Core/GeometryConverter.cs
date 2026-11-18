@@ -72,6 +72,15 @@ public sealed class GeometryConverter
     /// </summary>
     private ulong _currentOwnHandle;
 
+    /// <summary>当前正在展开的块实例 Id（<see cref="CadEntity.PendingInstance"/> 表示未指派）。</summary>
+    private int _currentInstance = CadEntity.PendingInstance;
+
+    /// <summary>本次转换产出的块实例表（Id 从 1 起）。</summary>
+    private readonly List<InsertInstance> _instances = new();
+
+    /// <summary>本次转换的块实例表；<see cref="Convert"/> 每次重建。</summary>
+    public IReadOnlyList<InsertInstance> Instances => _instances;
+
     /// <summary>全局线型比例（LTSCALE，文件头）；<=0 时按 1。</summary>
     private double _globalLtScale = 1.0;
 
@@ -422,6 +431,8 @@ public sealed class GeometryConverter
         _layerOrder.Clear();
         _initiallyHidden.Clear();
         _viewports.Clear();
+        _instances.Clear();
+        _currentInstance = 0;
         _clipRect = null;
         _clipFrozenLayers = null;
         _spatialClipPath = null;
@@ -512,6 +523,12 @@ public sealed class GeometryConverter
         }
 
         DropUnreferencedPlaceholderLayers();
+
+        // 未指派（异常路径或没有 ConvertEntity 包住的产出）统一归到模型空间，对外不出现负值
+        for (int i = 0; i < _entities.Count; i++)
+        {
+            if (_entities[i].InstanceId < 0) _entities[i].InstanceId = 0;
+        }
 
         return _entities;
     }
@@ -719,6 +736,45 @@ public sealed class GeometryConverter
         float hit = MathF.Max(0f, inter.Width) * MathF.Max(0f, inter.Height);
         if (!(area > 0)) return hit > 0 ? 1f : 0f;
         return Math.Clamp(hit / area, 0f, 1f);
+    }
+
+    /// <summary>
+    /// 给 [fromIndex, _entities.Count) 内**尚未认领**的图元挂当前块实例身份。
+    ///
+    /// <para>块内子实体在各自的内层 <c>ConvertEntity</c> 收尾时就已写好自己更内层的实例 Id，
+    /// 这里只补本层直接产出、以及内层因异常没写到的那些 —— 所以判据是「未指派」而不是「本层」。</para>
+    /// </summary>
+    private void ApplyInstance(int fromIndex)
+    {
+        for (int i = fromIndex; i < _entities.Count; i++)
+        {
+            var e = _entities[i];
+            if (e.InstanceId < 0) e.InstanceId = _currentInstance;
+        }
+    }
+
+    /// <summary>
+    /// 登记一个块实例并返回其 Id（同父同句柄重复登记返回已有 Id）。
+    /// MINSERT 阵列只登记**一次**：AutoCAD 里一条阵列插入就是一条实体。
+    /// </summary>
+    private int AddInstance(ulong insertHandle, string? blockName)
+    {
+        int parent = _currentInstance < 0 ? 0 : _currentInstance;
+        for (int i = 0; i < _instances.Count; i++)
+        {
+            var existing = _instances[i];
+            if (existing.Parent == parent && existing.InsertHandle == insertHandle) return existing.Id;
+        }
+
+        int id = _instances.Count + 1;
+        _instances.Add(new InsertInstance
+        {
+            Id = id,
+            Parent = parent,
+            InsertHandle = insertHandle,
+            BlockName = blockName ?? string.Empty,
+        });
+        return id;
     }
 
     /// <summary>
@@ -945,6 +1001,8 @@ public sealed class GeometryConverter
         {
             // 本层新增的图元统一挂裁剪区域、收窄包围盒（含文字/点标记）
             ApplyScopeClip(entityStart);
+            // 身份只填「还没有人认领」的：块内子实体已由内层 ConvertEntity 写成自己的实例
+            ApplyInstance(entityStart);
 
             _currentHandle = prevHandle;
             _currentOwnHandle = prevOwnHandle;
@@ -1540,7 +1598,9 @@ public sealed class GeometryConverter
         // INSERT 自己是 BYLAYER → 解析出图层线宽；自己是 BYBLOCK → 继承外层块引用，层层上溯。
         int outerWeight = _inheritedLineWeight;
         int blockWeight = ResolveLineWeight(ins, outerWeight);
+        int prevInstance = _currentInstance;
         _inheritedLineWeight = blockWeight;
+        _currentInstance = AddInstance(ins.Handle, ins.Block.Name);
         try
         {
             for (int r = 0; r < rows; r++)
@@ -1573,6 +1633,7 @@ public sealed class GeometryConverter
         }
         finally
         {
+            _currentInstance = prevInstance;
             _inheritedLineWeight = outerWeight;
         }
     }
@@ -1585,7 +1646,9 @@ public sealed class GeometryConverter
         uint color = ResolveColor(dim, inheritedColor);
         // 标注块里的几何几乎全是 BYBLOCK：继承标注自身的线宽，否则会掉回 0.25mm 默认值
         int outerWeight = _inheritedLineWeight;
+        int prevInstance = _currentInstance;
         _inheritedLineWeight = ResolveLineWeight(dim, outerWeight);
+        _currentInstance = AddInstance(dim.Handle, block.Name);
         try
         {
             foreach (var child in block.Entities)
@@ -1593,6 +1656,7 @@ public sealed class GeometryConverter
         }
         finally
         {
+            _currentInstance = prevInstance;
             _inheritedLineWeight = outerWeight;
         }
     }

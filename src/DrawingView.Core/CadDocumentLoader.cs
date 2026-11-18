@@ -99,6 +99,7 @@ public static class CadDocumentLoader
             Index = index,
             LayerNames = converter.LayerNames,
             HandleBounds = handleBounds,
+            Instances = converter.Instances.ToArray(),
             Extents = extents,
             CoreExtents = coreExtents,
             Baked = baked,
