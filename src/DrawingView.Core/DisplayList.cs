@@ -196,6 +196,13 @@ public sealed class DisplayList : IDisposable
     /// </summary>
     public IReadOnlyList<SKPath> ClipPaths { get; init; } = Array.Empty<SKPath>();
 
+    /// <summary>
+    /// 裁剪边界线（XCLIP 边框）。**不是几何**：不进 <see cref="Entities"/>、不参与拾取与标注，
+    /// 只在 <see cref="DrawingView.Controls.DrawingView.ShowClipFrames"/> 打开时由画布描一圈细线。
+    /// <see cref="Path"/> 与 <see cref="ClipPaths"/> 里的对象共享所有权，释放按引用去重。
+    /// </summary>
+    public IReadOnlyList<ClipFrame> ClipFrames { get; init; } = Array.Empty<ClipFrame>();
+
     /// <summary>是否图纸空间（布局）。线宽显示口径按空间区分，渲染期要用。</summary>
     public bool IsPaperSpace => !string.Equals(ActiveSpace, "Model", StringComparison.OrdinalIgnoreCase);
 

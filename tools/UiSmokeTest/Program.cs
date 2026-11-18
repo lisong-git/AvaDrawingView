@@ -548,6 +548,53 @@ int Run(string[] argv)
     Check(!view.HasPickScope, "实例 0 = 取消作用域");
     view.ClearSelection();
 
+    // ---------- 8h. 裁剪边框（XCLIP 边框）----------
+    // 边框**不是图元**：不在实体表里，所以点选 / 框选 / 标注都不认它；但它要画出来
+    // （AutoCAD 的 XCLIPFRAME 默认 2 = 显示不打印）。判据用"开关前后像素差"：
+    // 开关只影响这一层，像素差就是边框本身，不必猜颜色。
+    {
+        var bodyE = new CadEntity
+        {
+            Layer = "0",
+            Handle = 0x700,
+            OwnHandle = 0x700,
+            Path = HLine(0, 100, 20),
+            Bounds = SKRect.Create(0, 19, 100, 2),
+        };
+        var clipRect = SKRect.Create(-200, -100, 600, 300);
+        var framePath = new SKPath();
+        framePath.AddRect(clipRect);
+        var frameList = new DisplayList
+        {
+            Entities = new[] { bodyE },
+            Index = SpatialIndex.Build(new[] { bodyE }),
+            LayerNames = new[] { "0" },
+            ClipFrames = new[] { new ClipFrame { Handle = 0x700, Path = framePath, Bounds = clipRect } },
+            Extents = clipRect,
+            CoreExtents = clipRect,
+        };
+        view.SetDisplay(frameList);
+        view.FitToContent();
+        window.CaptureRenderedFrame();
+
+        view.ShowClipFrames = false;
+        window.CaptureRenderedFrame();
+        var noFrame = window.CaptureRenderedFrame();
+        view.ShowClipFrames = true;
+        window.CaptureRenderedFrame();
+        var withFrame = window.CaptureRenderedFrame();
+        int frameDiff = PixelDiff(withFrame, noFrame);
+        Check(frameDiff > 200, $"裁剪边框被画出来（开关前后 {frameDiff} 像素不同）");
+
+        view.ClearSelection();
+        int framePick = view.SelectAtWorld(new SKPoint(clipRect.Right, clipRect.Bottom));
+        Check(framePick == 0 && view.SelectedEntities.Count == 0,
+              $"边框不参与点选（框角命中 {framePick} 条）");
+        Check(frameList.Entities.Count == 1 && frameList.ClipFrames.Count == 1,
+              "边框与实体分表（Entities 1 条 / ClipFrames 1 条）");
+        view.ClearSelection();
+    }
+
     // ---------- 12. 线宽显示（B3）：像素级口径 ----------
     // 判据全部落在"屏幕上多少像素"，因为线宽的两种显示口径的差别**只**体现在像素上：
     //   模型空间 = 固定像素宽（不随缩放变化）；图纸空间 = 真实单位（随缩放变化）。
@@ -775,9 +822,33 @@ static int CountDimInk(WriteableBitmap? frame)
     return count;
 }
 
+static int PixelDiff(WriteableBitmap? a, WriteableBitmap? b)
+{
+    if (a is null || b is null) return -1;
+    using var fa = a.Lock();
+    using var fb = b.Lock();
+    int w = Math.Min(fa.Size.Width, fb.Size.Width), h = Math.Min(fa.Size.Height, fb.Size.Height);
+    var rowA = new byte[fa.RowBytes];
+    var rowB = new byte[fb.RowBytes];
+    int diff = 0;
+    for (int y = 0; y < h; y++)
+    {
+        Marshal.Copy(IntPtr.Add(fa.Address, y * fa.RowBytes), rowA, 0, fa.RowBytes);
+        Marshal.Copy(IntPtr.Add(fb.Address, y * fb.RowBytes), rowB, 0, fb.RowBytes);
+        for (int x = 0; x < w; x++)
+        {
+            int o = x * 4;
+            if (Math.Abs(rowA[o] - rowB[o]) > 8 || Math.Abs(rowA[o + 1] - rowB[o + 1]) > 8
+                || Math.Abs(rowA[o + 2] - rowB[o + 2]) > 8) diff++;
+        }
+    }
+    return diff;
+}
+
 static int CountMagenta(WriteableBitmap? frame)
 {
     if (frame is null) return -1;
+
     using var fb = frame.Lock();
     bool bgra = fb.Format == PixelFormat.Bgra8888;
     int w = fb.Size.Width, h = fb.Size.Height, stride = fb.RowBytes;

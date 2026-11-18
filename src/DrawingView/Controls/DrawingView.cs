@@ -90,6 +90,26 @@ public class DrawingView : Control
         }
     }
 
+    private bool _showClipFrames = true;
+
+    /// <summary>
+    /// 是否画块裁剪边界线（AutoCAD 的 <c>XCLIPFRAME</c>，默认 <c>true</c> ≈ 2023 的默认值 2：
+    /// 显示但不打印）。
+    ///
+    /// <para>边框**不是几何**：它不在实体表里，不参与拾取 / 框选 / 标注 / 打印，只由画布在内容
+    /// 之上描一圈落色细线。关掉它不影响任何裁剪行为，只是看不见这条界线。</para>
+    /// </summary>
+    public bool ShowClipFrames
+    {
+        get => _showClipFrames;
+        set
+        {
+            if (_showClipFrames == value) return;
+            _showClipFrames = value;
+            InvalidateVisual();
+        }
+    }
+
     public static readonly StyledProperty<SKColor> BackgroundColorProperty =
         AvaloniaProperty.Register<DrawingView, SKColor>(nameof(BackgroundColor), SKColors.Black);
 
@@ -1925,6 +1945,9 @@ public class DrawingView : Control
         private readonly OverlayLayer? _skeleton;
         private readonly SKColor _bg;
 
+        /// <summary>裁剪边框色：AutoCAD 暗色主题下 XCLIP 边界是淡紫灰，这里取同色系保证"辅助线"观感。</summary>
+        private static readonly SKColor ClipFrameColor = new(150, 116, 190, 224);
+
         /// <summary>
         /// 本帧是否存在需要按实体改透明度的图元（淡化名单 / 拾取作用域 / 作用域本体）。
         /// 为真时不能走批次：批次把同层同色路径合并成一次 <c>DrawPath</c>，批内改不了
@@ -2065,6 +2088,11 @@ public class DrawingView : Control
                 if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tPoint = n - tMark; tMark = n; }
             }
 
+            // ---- 裁剪边框 pass：AutoCAD 的 XCLIP 边框（XCLIPFRAME≠0 时显示）----
+            // 画在内容之上、选中高亮之下：它是"这块被裁到哪儿"的界线，属于底图信息。
+            if (_owner.ShowClipFrames && _list.ClipFrames.Count > 0)
+                DrawClipFrames(canvas, worldToScreen, _list.ClipFrames, worldRect, hairline);
+
             // ---- 选中高亮 pass：叠加在最上层，不走 LOD（选中了就要看得见）----
             // AutoCAD 默认样式：蓝色 glow（宽半透明外圈 + 实线内芯），
             // 实心填充用半透明蓝罩（与 AutoCAD 的选中半透明着色一致）。
@@ -2202,6 +2230,30 @@ public class DrawingView : Control
                 ovStroke.PathEffect = null;
                 dash?.Dispose();
             }
+        }
+
+        /// <summary>
+        /// 画裁剪边界线（XCLIP 边框）。1px、紫灰、常数透明度 —— 它不随内容淡化/选中变化：
+        /// 界线一旦被淡化就看不出"内容被裁到哪儿"，那正是它存在的意义。
+        /// </summary>
+        private void DrawClipFrames(SKCanvas canvas, SKMatrix worldToScreen,
+                                    IReadOnlyList<ClipFrame> frames, SKRect worldRect, float hairline)
+        {
+            using var frameStroke = new SKPaint
+            {
+                IsAntialias = Antialias,
+                Style = SKPaintStyle.Stroke,
+                Color = ClipFrameColor,
+                StrokeWidth = hairline,
+            };
+            canvas.Save();
+            canvas.Concat(worldToScreen);
+            foreach (var frame in frames)
+            {
+                if (frame.Path is null || !TouchesViewport(frame.Path, worldRect)) continue;
+                canvas.DrawPath(frame.Path, frameStroke);
+            }
+            canvas.Restore();
         }
 
         /// <summary>

@@ -39,7 +39,11 @@ public static class CadDocumentLoader
         var baked = GeometryBaker.Bake(entities, ct);
 
         var extents = ComputeExtents(entities);
-        var coreExtents = ComputeCoreExtents(entities, HeaderModelSpaceRect(doc));
+        // 裁剪边框是**画出来的线**，所以它要参与「适应窗口」：AutoCAD 的 ZOOM E 用
+        // EXTMIN/EXTMAX，而带 XCLIP 的图那两个值正是裁剪框（实测 0陶板节点_块层级验收测试.dwg：
+        // 内容只占框的 1/10，按内容适应会比 AutoCAD 放大 1.8 倍且框跑到画面外）。
+        var coreExtents = ComputeCoreExtents(entities, HeaderModelSpaceRect(doc),
+                                             converter.ClipFrames.Select(f => f.Bounds).ToList());
         if (converter.ActiveSpace != "Model")
             progress?.Report($"图纸空间：{converter.ActiveSpace}（视口裁剪 {converter.ClippedAway} 条）");
         progress?.Report(baked is null
@@ -120,6 +124,7 @@ public static class CadDocumentLoader
             LayerFiltered = converter.LayerFiltered,
             FontUsage = new Dictionary<string, int>(converter.FontUsage),
             ClipPaths = converter.ClipPaths,
+            ClipFrames = converter.ClipFrames,
             WorldUnitsPerMm = converter.WorldUnitsPerMm,
         };
     }
@@ -202,9 +207,10 @@ public static class CadDocumentLoader
     /// 判据都不满足时原样保留（含两端详图的狭长排布等正常图纸不受影响）。
     /// 索引 / 句柄查询 / 打印范围仍用全量 <c>Extents</c>。
     /// </summary>
-    private static SKRect ComputeCoreExtents(IReadOnlyList<CadEntity> entities, SKRect? fileRect)
+    private static SKRect ComputeCoreExtents(IReadOnlyList<CadEntity> entities, SKRect? fileRect,
+                                             IReadOnlyList<SKRect>? frameRects = null)
     {
-        var boxes = new List<SKRect>(entities.Count);
+        var boxes = new List<SKRect>(entities.Count + (frameRects?.Count ?? 0));
         foreach (var e in entities)
         {
             var b = e.Bounds;
@@ -214,6 +220,10 @@ public static class CadDocumentLoader
             if (e.Path == null && e.FillPath == null && e.Text == null) continue;
             boxes.Add(b);
         }
+
+        if (frameRects is { Count: > 0 })
+            foreach (var f in frameRects)
+                if (!float.IsNaN(f.Width) && f.Width > 0 && f.Height > 0) boxes.Add(f);
 
         // 优先按文件存储范围取簇：存盘时的范围是"当时图纸本体"的权威边界，天然不含后来
         // 被插件/复制操作甩到远处的几何。只在切掉的确实是"远处垃圾"时才采用

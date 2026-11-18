@@ -338,6 +338,11 @@ public sealed class GeometryConverter
     /// <summary>本图用到的裁剪区域，交给 <c>DisplayList</c> 统一释放。</summary>
     public IReadOnlyList<SKPath> ClipPaths => _clipPaths;
 
+    private readonly List<ClipFrame> _clipFrames = new();
+
+    /// <summary>裁剪边界线（AutoCAD 的 XCLIP 边框）。只为**边界可信**的裁剪登记，见 TryGetSpatialClip。</summary>
+    public IReadOnlyList<ClipFrame> ClipFrames => _clipFrames;
+
     /// <summary>
     /// 图纸范围（文件头 EXTMIN/EXTMAX）。只用于**边界与图形脱节**的兜底：
     /// 裁剪边界经两次变换后仍与实体不相交时，按这个范围裁 —— 与 AutoCAD 的实测表现一致
@@ -442,6 +447,7 @@ public sealed class GeometryConverter
         _scopeClipBounds = default;
         _scopeClipIsRect = false;
         _clipPaths.Clear();   // 上一轮建的裁剪路径已随旧 DisplayList 释放
+        _clipFrames.Clear();
         _sheetRect = CadDocumentLoader.HeaderModelSpaceRect(doc);
         _hideLayers = options?.HideLayers is { Count: > 0 } hl
             ? new HashSet<string>(hl, StringComparer.OrdinalIgnoreCase)
@@ -891,7 +897,8 @@ public sealed class GeometryConverter
         bool clipChanged = false;
         int entityStart = _entities.Count;
         if (SpatialClipEnabled && (parent.IsIdentity || ClipInBlock) &&
-            TryGetSpatialClip(e, parent, out var clipPath, out var clipBounds, out var clipIsRect))
+            TryGetSpatialClip(e, parent, out var clipPath, out var clipBounds, out var clipIsRect,
+                             out var frameKnown))
         {
             if (TryGetEntityBounds(e, parent, out var entityBounds) && !entityBounds.IntersectsWith(clipBounds))
             {
@@ -925,6 +932,15 @@ public sealed class GeometryConverter
                 _clipPaths.Add(clipPath);
                 _spatialClipBounds = clipBounds;
                 _spatialClipIsRect = clipIsRect;
+                // 边界点可信 = 这就是 AutoCAD 会画出来的 XCLIP 边框（XCLIPFRAME≠0 时）。
+                // 兜底那两条（退回图纸范围 / 坏法向）不算：那不是块自己的框。
+                if (frameKnown)
+                    _clipFrames.Add(new ClipFrame
+                    {
+                        Handle = e.Handle,
+                        Path = clipPath,
+                        Bounds = clipBounds,
+                    });
             }
 
             RebuildScopeClip();
@@ -1044,9 +1060,20 @@ public sealed class GeometryConverter
     /// </summary>
     private bool TryGetSpatialClip(Entity e, in SKMatrix parent, out SKPath clipPath, out SKRect bounds, out bool isRect)
     {
+        return TryGetSpatialClip(e, parent, out clipPath, out bounds, out isRect, out _);
+    }
+
+    /// <param name="frameKnown">
+    /// 裁剪边界是否**来自文件里的边界点**（而不是"边界与内容脱节，退回图纸范围"的兜底）。
+    /// 只有为真时才能把这条边界当 XCLIP 边框画出来 —— 兜底那条是图纸范围，不是块自己的框。
+    /// </param>
+    private bool TryGetSpatialClip(Entity e, in SKMatrix parent, out SKPath clipPath, out SKRect bounds,
+                                   out bool isRect, out bool frameKnown)
+    {
         clipPath = null!;
         bounds = default;
         isRect = false;
+        frameKnown = false;
 
         var xdict = e.XDictionary;
         if (xdict is null) return false;
@@ -1172,6 +1199,7 @@ public sealed class GeometryConverter
             clipPath = RectPath(rect);
             bounds = rect;
             isRect = true;
+            frameKnown = true;
             return true;
         }
 
@@ -1189,6 +1217,7 @@ public sealed class GeometryConverter
             clipPath = RectPath(rect);
             bounds = rect;
             isRect = true;
+            frameKnown = true;
             return true;
         }
 
@@ -1199,6 +1228,7 @@ public sealed class GeometryConverter
 
         clipPath = path;
         bounds = rect;
+        frameKnown = true;
         return true;
     }
 
