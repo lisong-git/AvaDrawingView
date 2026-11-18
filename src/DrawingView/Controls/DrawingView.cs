@@ -325,10 +325,18 @@ public class DrawingView : Control
     /// <summary>该图元是否处于淡化 / 不可拾取状态。</summary>
     public bool IsDimmedEntity(CadEntity e) => DimAlphaOf(e) != 0;
 
+    /// <summary>淡化名单的 alpha（面域当背景：仍要看得出形状）。</summary>
+    private const int DimAlphaList = 110;
+
     /// <summary>
-    /// 淡化强度（0 = 不淡化）。名单与拾取作用域两档：名单 = 56（面域本体当背景，
-    /// 还要看得出形状），作用域外 = 30（进子级别后那些图元只剩方位参考的作用，
-    /// 用同一个 56 时亮色线条仍然抢眼，看不出来"只留这一支"）。
+    /// 拾取作用域外的 alpha。取 90（≈35% 亮度）而不是更暗的档位：30 时黑底上细线的
+    /// 抗锯齿边缘会掉到背景阈值以下，整片线条断续甚至消失（实测 <c>10---陶板节点2.dwg</c>
+    /// 进作用域后 96% 的墨迹落在亮度 21–40 档，原色档几乎清零）。
+    /// </summary>
+    private const int DimAlphaOutOfScope = 90;
+
+    /// <summary>
+    /// 淡化强度（0 = 不淡化）。两档：名单（面域本体当背景）/ 作用域外（只剩方位参考）。
     /// </summary>
     internal int DimAlphaOf(CadEntity e)
     {
@@ -342,14 +350,14 @@ public class DrawingView : Control
             {
                 if (e.Handle != t.Outer) continue;
                 // 顶层面域 OwnHandle == Handle，Inner 传真实句柄或 0 都应命中
-                if (t.Inner == 0 || e.OwnHandle == t.Inner || e.OwnHandle == t.Outer) return 56;
+                if (t.Inner == 0 || e.OwnHandle == t.Inner || e.OwnHandle == t.Outer) return DimAlphaList;
             }
         }
         if (_pickScopeOuter != 0)
         {
-            if (e.Handle != _pickScopeOuter) return 30;
+            if (e.Handle != _pickScopeOuter) return DimAlphaOutOfScope;
             if (_pickScopeOwns == null) return 0;
-            return _pickScopeOwns.Contains(e.OwnHandle != 0 ? e.OwnHandle : e.Handle) ? 0 : 30;
+            return _pickScopeOwns.Contains(e.OwnHandle != 0 ? e.OwnHandle : e.Handle) ? 0 : DimAlphaOutOfScope;
         }
         return 0;
     }
@@ -1447,6 +1455,13 @@ public class DrawingView : Control
         private readonly OverlayLayer? _skeleton;
         private readonly SKColor _bg;
 
+        /// <summary>
+        /// 本帧是否存在需要按实体改透明度的图元（淡化名单 / 拾取作用域 / 作用域本体）。
+        /// 为真时不能走批次：批次把同层同色路径合并成一次 <c>DrawPath</c>，批内改不了
+        /// 单个实体的 alpha。开一次后整帧逐实体绘制，代价从 O(批数) 回到 O(可见实体数)。
+        /// </summary>
+        private readonly bool _hasDim;
+
         public CadDrawOperation(DrawingView owner, Rect bounds, DisplayList list, float zoom, SKPoint offset,
                                 HashSet<string> hidden, float minTextPx, float minTextBarPx, float minEntityPx,
                                 OverlayLayer? overlay, OverlayLayer? skeleton)
@@ -1463,6 +1478,9 @@ public class DrawingView : Control
             _minEntityPx = minEntityPx;
             _overlay = overlay;
             _skeleton = skeleton;
+            _hasDim = owner._dimmedSnapshot.Length > 0
+                      || owner._pickScopeOuter != 0
+                      || owner._scopeBodyOuter != 0;
             // 绘制操作的生命周期由 Avalonia 管理，而 UI 线程随时可能 SetDisplay 换图。
             // 持有一份引用（在 Dispose 中归还），保证绘制期间几何不会被提前释放。
             list.AddRef();
@@ -1542,7 +1560,7 @@ public class DrawingView : Control
             long tMark = diag ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             long tBucket = 0, tText = 0, tPoint = 0, tSelect = 0;
 
-            if (baked is not null && ShouldUseBaked(baked, worldRect))
+            if (!_hasDim && baked is not null && ShouldUseBaked(baked, worldRect))
             {
                 // ---- 批次路径：DrawPath 次数 = 批次数，且按 LOD 整档跳过亚像素几何 ----
                 canvas.Save();
@@ -1573,67 +1591,6 @@ public class DrawingView : Control
                 DrawPointMarks(canvas, visible, worldRect, h);
                 DrawTextStrokes(canvas, stroke, visible, worldRect, worldToScreen, hairline);
                 if (diag) { long n = System.Diagnostics.Stopwatch.GetTimestamp(); tPoint = n - tMark; tMark = n; }
-            }
-
-            // ---- 淡化 pass：在位面域打标签时，面域本体只当背景 ----
-            // 先用背景色沿轮廓覆盖一遍（抹掉原线），再以低不透明度重描。
-            // 不能走真正的 per-entity alpha：批次把同层同色路径合并成一次 DrawPath，
-            // 单个实体的透明度在批里改不了。覆盖只作用于面域自己那条线（hairline 量级），
-            // 被它压住的其它图元最多损失一条细线，观感上与"整体淡化"一致。
-            var dimmed = _owner._dimmedSnapshot;
-            if (dimmed.Length > 0 || _owner._pickScopeOuter != 0 || _owner._scopeBodyOuter != 0)
-            {
-                using var dimCover = new SKPaint
-                {
-                    IsAntialias = Antialias,
-                    Style = SKPaintStyle.Stroke,
-                    Color = _bg,
-                    StrokeWidth = hairline * 3,
-                };
-                using var dimDraw = new SKPaint
-                {
-                    IsAntialias = Antialias,
-                    Style = SKPaintStyle.Stroke,
-                    StrokeWidth = hairline,
-                };
-                canvas.Save();
-                canvas.Concat(worldToScreen);
-                foreach (var e in _list.Index.Query(worldRect))
-                {
-                    var body = _owner.IsScopeBody(e);
-                    var dimAlpha = body ? 0 : _owner.DimAlphaOf(e);
-                    if (!body && dimAlpha == 0) continue;
-                    if (_owner._hiddenSnapshot.Count > 0 && _owner._hiddenSnapshot.Contains(e.Layer)) continue;
-                    if (body)
-                    {
-                        // 作用域本体：描边交给正常 pass 按原色画（不覆盖、不重描）。
-                        // 只有填充要压 —— 原色填充会把面域糊成实心块，盖住里面的环。
-                        if (e.FillPath is { } bodyFill)
-                        {
-                            dimCover.Style = SKPaintStyle.Fill;
-                            canvas.DrawPath(bodyFill, dimCover);
-                            dimCover.Style = SKPaintStyle.Stroke;
-                            dimDraw.Style = SKPaintStyle.Fill;
-                            dimDraw.Color = new SKColor(e.ColorArgb).WithAlpha(ScopeBodyFillAlpha);
-                            canvas.DrawPath(bodyFill, dimDraw);
-                            dimDraw.Style = SKPaintStyle.Stroke;
-                        }
-                        continue;
-                    }
-                    if (e.FillPath is { } dimFill)
-                    {
-                        dimCover.Style = SKPaintStyle.Fill;
-                        canvas.DrawPath(dimFill, dimCover);
-                        dimCover.Style = SKPaintStyle.Stroke;
-                    }
-                    if (e.Path is { } dimPath)
-                    {
-                        canvas.DrawPath(dimPath, dimCover);
-                        dimDraw.Color = new SKColor(e.ColorArgb).WithAlpha((byte)dimAlpha);
-                        canvas.DrawPath(dimPath, dimDraw);
-                    }
-                }
-                canvas.Restore();
             }
 
             // ---- 选中高亮 pass：叠加在最上层，不走 LOD（选中了就要看得见）----
@@ -1839,6 +1796,18 @@ public class DrawingView : Control
             }
         }
 
+        /// <summary>
+        /// 该实体的淡化不透明度（0 = 按原色）。没有淡化集时恒 0，省掉逐实体的两次判断。
+        /// </summary>
+        private int DimOf(CadEntity e) => _hasDim ? _owner.DimAlphaOf(e) : 0;
+
+        /// <summary>
+        /// 给颜色套不透明度。<c>0</c> 与 <c>255</c> 原样返回 —— 0 在这里是「不淡化」，
+        /// 不是「全透明」；直接写进 ARGB 会把实体整条抹掉。
+        /// </summary>
+        private static uint WithAlpha(uint color, int alpha)
+            => alpha <= 0 || alpha >= 255 ? color : ((color & 0x00FFFFFFu) | ((uint)alpha << 24));
+
         private void DrawStrokeEntities(SKCanvas canvas, SKPaint stroke, SKPaint fill,
                                         IEnumerable<CadEntity> visible, float hairline)
         {
@@ -1849,10 +1818,14 @@ public class DrawingView : Control
                 if (_hidden.Contains(ent.Layer)) continue;
                 // SHX 文字笔画由 DrawTextStrokes 单独画（这里再画一次就重了）
                 if (ent.TextStrokes) continue;
+                var dim = DimOf(ent);
+                // 作用域本体的填充要压（原色填充会把面域糊成实心块、盖住里面的环），
+                // 描边保持原色 —— 它就是可编辑范围的骨架。
+                int fillDim = _owner.IsScopeBody(ent) ? ScopeBodyFillAlpha : dim;
                 if (ent.Path is not null)
                 {
                     if (!PassesEntityLod(ent.Bounds)) continue;
-                    stroke.Color = new SKColor(ResolveColor(ent.ColorArgb));
+                    stroke.Color = new SKColor(WithAlpha(ResolveColor(ent.ColorArgb), dim));
                     float w = lw ? LineWidthWorld(ent.LineWeightMm100) : hairline;
                     stroke.StrokeWidth = w;
                     stroke.PathEffect = _owner.DashEffectOf(ent.DashPattern, _zoom);
@@ -1862,7 +1835,7 @@ public class DrawingView : Control
                 {
                     DiagFillSeen++;
                     if (!PassesEntityLod(ent.Bounds)) { DiagFillLodSkip++; continue; }
-                    fill.Color = new SKColor(ResolveColor(ent.ColorArgb));
+                    fill.Color = new SKColor(WithAlpha(ResolveColor(ent.ColorArgb), fillDim));
                     DrawClipped(canvas, ent.FillPath, fill, ent.ClipPath);
                     DiagFillDrawn++;
                 }
@@ -1914,7 +1887,7 @@ public class DrawingView : Control
                 if (!ent.TextStrokes || ent.Path is null) continue;
                 if (_hidden.Contains(ent.Layer)) continue;
                 if (!ent.Bounds.IntersectsWith(worldRect)) continue;
-                stroke.Color = new SKColor(ResolveColor(ent.ColorArgb));
+                stroke.Color = new SKColor(WithAlpha(ResolveColor(ent.ColorArgb), DimOf(ent)));
                 DrawClipped(canvas, ent.Path, stroke, ent.ClipPath);
             }
             canvas.Restore();
@@ -1968,7 +1941,7 @@ public class DrawingView : Control
                     mk.Position.Y < worldRect.Top - pad || mk.Position.Y > worldRect.Bottom + pad) continue;
 
                 var c = new SKPoint(mk.Position.X * _zoom + _offset.X, -mk.Position.Y * _zoom + _offset.Y);
-                uint color = ResolveColor(ent.ColorArgb);
+                uint color = WithAlpha(ResolveColor(ent.ColorArgb), DimOf(ent));
 
                 if (baseShape == 0)
                 {
@@ -2052,7 +2025,8 @@ public class DrawingView : Control
                 if (ent.Text is null) continue;
                 if (hasHidden && _hidden.Contains(ent.Layer)) continue;
                 if (!ent.Bounds.IntersectsWith(worldRect)) continue;
-                DrawText(canvas, paint, ent.Text, ResolveColor(ent.ColorArgb), ent.ClipPath);
+                DrawText(canvas, paint, ent.Text,
+                         WithAlpha(ResolveColor(ent.ColorArgb), DimOf(ent)), ent.ClipPath);
             }
         }
 
