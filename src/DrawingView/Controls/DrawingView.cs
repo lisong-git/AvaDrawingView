@@ -134,7 +134,7 @@ public class DrawingView : Control
     private IReadOnlyList<CadEntity> _selectedSnapshot = Array.Empty<CadEntity>();
 
     /// <summary>
-    /// 上一次单击是否抬升到了<b>整个块引用</b>（非 0 = 该 INSERT 的句柄）。
+    /// 选中集里代表「整个块引用」的那些组（累加语义下可以同时选中多个块）。
     ///
     /// <para>显示层把块展平了：块内每个图元都是独立 <see cref="CadEntity"/>，
     /// <see cref="CadEntity.Handle"/> 指向最外层 INSERT，<see cref="CadEntity.OwnHandle"/>
@@ -142,21 +142,29 @@ public class DrawingView : Control
     /// "选中了同一 Handle 的全部条目"，这个量本身无法从集合反推（框选也可能恰好框全），
     /// 必须显式记下来给宿主上报目标用。</para>
     /// </summary>
-    private ulong _blockScopeHandle;
-    private ulong _blockScopeInner;
+    private readonly List<BlockLift> _blockScopes = new();
+
+    /// <summary>选中集里的整块组（每项 = 一个块实例的身份与成员）。</summary>
+    public IReadOnlyList<BlockLift> BlockScopes => _blockScopes;
 
     /// <summary>
-    /// 当前选中是否代表「整个块引用」；非 0 时宿主应把它当成一个整块目标
-    /// （<c>OwnHandle = 0</c>），不要按选中条目逐条上报，否则一次单击会派生出
-    /// "块内每个图元各一个目标"。见 <see cref="SelectAt"/> 的抬升分支。
+    /// 只选中了一个整块时返回它的外层句柄，否则 0（多块 / 无块都要看
+    /// <see cref="BlockScopes"/>，单值表达不了）。
     /// </summary>
-    public ulong BlockScopeHandle => _blockScopeHandle;
+    public ulong BlockScopeHandle => _blockScopes.Count == 1 ? _blockScopes[0].Outer : 0;
 
     /// <summary>
     /// 抬升到的块实例自身句柄：<c>0</c> = 最外层块引用（整块），非 0 = 块内嵌套块实例。
     /// 显示层是扁平的，嵌套 INSERT 没有几何条目，所以"选了哪个嵌套块"也只能这样带出来。
     /// </summary>
-    public ulong BlockScopeInner => _blockScopeInner;
+    public ulong BlockScopeInner => _blockScopes.Count == 1 ? _blockScopes[0].Inner : 0;
+
+    // ---------- 循环穿透（Ctrl+单击，AutoCAD 无命令状态） ----------
+    // 同一位置连续 Ctrl+单击时在重叠候选间轮换；光标挪开就重新从最近的那个开始。
+    private SKPoint _cycleAnchor;
+    private List<CadEntity>? _cycleCandidates;
+    private int _cycleIndex = -1;
+    private CadEntity? _cyclePicked;
 
     /// <summary>
     /// 块抬升决策（宿主提供）：给定命中的显示层图元，返回要一起选中的条目与块实例身份
@@ -480,6 +488,7 @@ public class DrawingView : Control
     {
         ClearSubPick();
         ResetBlockScope();
+        ResetCycle();
         _selectedSnapshot = entities.ToArray();
         SelectionChanged?.Invoke(this, EventArgs.Empty);
         InvalidateVisual();
@@ -490,6 +499,7 @@ public class DrawingView : Control
     {
         ClearSubPick();
         ResetBlockScope();
+        ResetCycle();
         if (_selectedSnapshot.Count == 0) return;
         _selectedSnapshot = Array.Empty<CadEntity>();
         SelectionChanged?.Invoke(this, EventArgs.Empty);
@@ -497,26 +507,110 @@ public class DrawingView : Control
     }
 
     /// <summary>
+    /// 同一位置的全部命中，按距离由近到远（Ctrl+单击循环穿透用）。顺序必须稳定：
+    /// 等距时按 (Handle, OwnHandle)，再靠 LINQ 的稳定排序保留 R 树遍历序 ——
+    /// 否则连续两次 Ctrl+单击会跳到同一个对象上，循环看起来"卡住"。
+    /// </summary>
+    public IReadOnlyList<CadEntity> HitTestAll(SKPoint screenPoint, float tolerancePx = 5f,
+                                               bool includeDimmed = false)
+    {
+        if (_display is null) return Array.Empty<CadEntity>();
+        var world = Viewport.ScreenToWorld(screenPoint);
+        float tolWorld = tolerancePx / MathF.Max(Viewport.Zoom, 1e-6f);
+        var rect = SKRect.Create(world.X - tolWorld, world.Y - tolWorld, tolWorld * 2, tolWorld * 2);
+
+        var found = new List<(CadEntity E, double D)>();
+        foreach (var e in _display.Index.Query(rect))
+        {
+            if (_hidden.Count > 0 && _hidden.Contains(e.Layer)) continue;
+            if (!includeDimmed && (IsDimmedEntity(e) || IsScopeBody(e))) continue;
+            if (!e.Bounds.IntersectsWith(rect)) continue;
+            var d = DistanceToEntity(e, world, tolWorld);
+            if (d <= tolWorld) found.Add((e, d));
+        }
+        return found.OrderBy(t => t.D)
+                    .ThenBy(t => t.E.Handle)
+                    .ThenBy(t => t.E.OwnHandle)
+                    .Select(t => t.E)
+                    .ToList();
+    }
+
+    /// <summary>
+    /// Ctrl+单击 · 循环穿透重叠对象：同一位置连按时逐个换到下一个候选，
+    /// 换掉的只是「上一次循环选中的那个」，选择集里其它目标不受影响。
+    /// 光标挪开 4px 以上或候选集合变了就重新从最近的那个开始。
+    /// </summary>
+    private void CyclePick(SKPoint screen)
+    {
+        var sameSpot = _cycleCandidates is { Count: > 0 }
+                       && MathF.Abs(screen.X - _cycleAnchor.X) <= 4f
+                       && MathF.Abs(screen.Y - _cycleAnchor.Y) <= 4f;
+        if (!sameSpot)
+        {
+            _cycleCandidates = HitTestAll(screen).ToList();
+            _cycleIndex = -1;
+            _cycleAnchor = screen;
+            _cyclePicked = null;
+        }
+        var cands = _cycleCandidates;
+        if (cands is not { Count: > 0 })
+        {
+            if (!sameSpot) ClearSelection();
+            return;
+        }
+        _cycleIndex = (_cycleIndex + 1) % cands.Count;
+        var pick = cands[_cycleIndex];
+        if (_cyclePicked is { } prev && !ReferenceEquals(prev, pick))
+            RemoveFromSelection(new[] { prev });
+        _cyclePicked = pick;
+        AddToSelection(new[] { pick });
+    }
+
+    private void ResetCycle()
+    {
+        _cycleCandidates = null;
+        _cycleIndex = -1;
+        _cyclePicked = null;
+    }
+
+    /// <summary>
     /// 按世界坐标执行一次「单击选中」，路径与鼠标左键点击完全相同
     /// （命中测试 → 淡化 / 拾取作用域过滤 → 二级拾取 → 块抬升 → <see cref="SelectionChanged"/>）。
     /// 供自检与诊断脚本驱动：验证点击链路不必去合成指针事件与屏幕坐标。
+    /// <paramref name="ctrl"/> / <paramref name="shift"/> 与真实按键同义（见 <see cref="SelectAt"/>）。
     /// 返回点击后的选中条目数。
     /// </summary>
-    public int SelectAtWorld(SKPoint world, bool subRequested = false, bool additive = false)
+    public int SelectAtWorld(SKPoint world, bool ctrl = false, bool shift = false)
     {
         if (_display is null) return 0;
         var screen = Viewport.WorldToScreen(world);
-        SelectAt(new Point(screen.X, screen.Y), subRequested, additive);
+        SelectAt(new Point(screen.X, screen.Y), ctrl, shift);
         return _selectedSnapshot.Count;
     }
 
-    /// <summary>单选切换（点击命中调用）。<paramref name="additive"/> = Shift：只往选择集里加，不切换。</summary>
-    private void SelectAt(Point p, bool subRequested, bool additive)
+    /// <summary>
+    /// 单击选择，AutoCAD 语义：
+    /// 无修饰键 = <b>累加</b>到选择集（再点已选对象 = 保持，不取消）；
+    /// <c>Shift</c> = 从选择集<b>移除</b>；<c>Ctrl</c> 在普通浏览 = 循环穿透重叠对象、
+    /// 在打标签作用域内 = 子图元入口；点空白 = 清空选择集（Shift 点空白不动）。
+    /// </summary>
+    private void SelectAt(Point p, bool ctrl, bool shift)
     {
         // 残留作用域先落地：否则这一下点击会被它拦成「作用域外不可拾取」，
         // 用户看到的就是"点了没反应"
         DropPickScopeIfStale();
         var screen = new SKPoint((float)p.X, (float)p.Y);
+        var inScope = _pickScopeOuter != 0;
+
+        // Ctrl+单击 · 普通浏览 = 循环穿透（AutoCAD 无命令状态的选择循环）。
+        // 打标签作用域内 Ctrl 是「子图元」入口，所以只在作用域外走这条。
+        if (ctrl && !inScope)
+        {
+            CyclePick(screen);
+            return;
+        }
+        ResetCycle();
+
         var hit = HitTest(screen);
         if (hit is null)
         {
@@ -532,19 +626,21 @@ public class DrawingView : Control
                     var spick = SubEntityResolver(soft, sw, stol);
                     if (spick != null)
                     {
-                        if (additive) AddSubPick(spick);
-                        else if (subRequested) ToggleSubPick(spick);
-                        else SetSubPicks(new[] { spick });
+                        if (shift) RemoveSubPick(spick);
+                        else AddSubPick(spick);
                         return;
                     }
                 }
             }
+            // Shift 点空白：没有可移除的对象，选择集也不该被清（AutoCAD 只认「点空白」本身）
+            if (shift) return;
             ClearSelection();
             return;
         }
-        var current = _selectedSnapshot;
-        var wantSub = subRequested || (current.Count == 1 && ReferenceEquals(current[0], hit))
-                      || (SubPickOnScopeClick && _pickScopeOuter != 0 && hit.Handle == _pickScopeOuter);
+        // 子图元入口只认两种：作用域内 Ctrl，和作用域内「单击即选子对象」（面域 / 多段线）。
+        // 以前还有一条「再点一次已选对象」，与 AutoCAD「单击已选对象 = 保持」冲突，已去掉。
+        var wantSub = (ctrl && inScope)
+                      || (SubPickOnScopeClick && inScope && hit.Handle == _pickScopeOuter);
         if (SubEntityResolver != null && wantSub)
         {
             var world = Viewport.ScreenToWorld(new SKPoint((float)p.X, (float)p.Y));
@@ -552,50 +648,41 @@ public class DrawingView : Control
             var pick = SubEntityResolver(hit, world, tol);
             if (pick != null)
             {
-                // Ctrl+点 = 切换：已选中的子图元再次 Ctrl+点取消，未选的加入（可与框选混用）
-                // Shift+点 = 只增：重复点同一条保持不变，绝不把已有的挤掉
+                // 子图元同样累加（AutoCAD 子对象选择也是累加），Shift 摘掉这一条
                 ResetBlockScope();          // 进了子图元层级，不再是"整块"
-                if (additive) AddSubPick(pick);
-                else if (subRequested) ToggleSubPick(pick);
-                else SetSubPicks(new[] { pick });
+                if (shift) RemoveSubPick(pick);
+                else AddSubPick(pick);
                 return;
             }
         }
         // 作用域本体不可作为整体选中：点环内空白由子图元解析接管（上面那段），
         // 解析不出子图元 = 落在无效区域（比如有洞的面域内部），什么都不选。
         if (IsScopeBody(hit)) return;
-        // 最小实现：单击命中 = 单选（重复点击已选实体保持选中）
-        if (current.Count == 1 && ReferenceEquals(current[0], hit)) return;
-        ClearSubPick();
         // 块内图元：显示层把块展平了，INSERT 自身没有几何条目，所以"点块"只能表现为
-        // "选中同一 Handle 的全部条目"。抬升后记下句柄（集合本身表达不了这个语义：
+        // "选中同一 Handle 的全部条目"。抬升后记下块身份（集合本身表达不了这个语义：
         // 框选也可能恰好框全），宿主据此上报整块目标；要标块内具体图元走右键子图元菜单。
-        if (SelectWholeBlockOnClick && !subRequested && !additive
-            && hit.OwnHandle != 0 && hit.OwnHandle != hit.Handle)
+        if (SelectWholeBlockOnClick && hit.OwnHandle != 0 && hit.OwnHandle != hit.Handle)
         {
             var lift = BlockLiftResolver?.Invoke(hit) ?? DefaultBlockLift(hit);
             if (lift is { Members.Count: > 0 } spec)
             {
-                if (_blockScopeHandle == spec.Outer && _blockScopeInner == spec.Inner
-                    && current.Count > 0
-                    && current.All(e => e.Handle == spec.Outer))
-                    return;     // 已经是这个块了，别重建选中集（会闪一下）
-                // 不走 SetSelection：它会先发 SelectionChanged，那时粒度还是 0，
-                // 宿主按旧口径上报会退化成"块内每个图元一个目标"。
-                ClearSubPick();
-                _blockScopeHandle = spec.Outer;
-                _blockScopeInner = spec.Inner;
-                _selectedSnapshot = spec.Members;
-                SelectionChanged?.Invoke(this, EventArgs.Empty);
-                InvalidateVisual();
+                if (shift)
+                {
+                    // Shift+点块 = 整个块移出选择集（块只能整进整出，没有"少选一个成员"）
+                    RemoveFromSelection(spec.Members);
+                    return;
+                }
+                AddBlockScope(spec);
                 return;
             }
             // Members 空 = 宿主判定不抬升（在位编辑块里点到的是作用域块的直接子元素）→ 走单选
         }
-        ResetBlockScope();
-        _selectedSnapshot = new[] { hit };
-        SelectionChanged?.Invoke(this, EventArgs.Empty);
-        InvalidateVisual();
+        if (shift)
+        {
+            RemoveFromSelection(new[] { hit });
+            return;
+        }
+        AddToSelection(new[] { hit });
     }
 
     /// <summary>默认抬升：同一 <c>Handle</c> 的全部条目，粒度 = 最外层块引用。</summary>
@@ -612,8 +699,65 @@ public class DrawingView : Control
 
     private void ResetBlockScope()
     {
-        _blockScopeHandle = 0;
-        _blockScopeInner = 0;
+        if (_blockScopes.Count == 0) return;
+        _blockScopes.Clear();
+    }
+
+    /// <summary>
+    /// 把「整块」并进选择集：同一个块再次点击 = 保持（AutoCAD 不会因为再点一次就取消），
+    /// 不同块各自成组 —— 宿主按 <see cref="BlockScopes"/> 上报多个块目标。
+    /// </summary>
+    private void AddBlockScope(BlockLift spec)
+    {
+        foreach (var s in _blockScopes)
+            if (s.Outer == spec.Outer && s.Inner == spec.Inner)
+                return;     // 已经是这个块了，别重建选中集（会闪一下）
+        ClearSubPick();
+        _blockScopes.Add(spec);
+        var before = _selectedSnapshot.Count;
+        AddToSelection(spec.Members);
+        // 成员本来就在选中集里（先框选整块再点它）时粒度变了，也得让宿主重新上报
+        if (_selectedSnapshot.Count == before)
+            SelectionChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// AutoCAD 累加语义：把命中项加入选择集；已在集合里的保持原样（不取消）。
+    /// 真正有变化时才清二级拾取 —— 重复点同一对象是「保持」，不该顺手把选好的边清掉。
+    /// </summary>
+    private void AddToSelection(IReadOnlyList<CadEntity> entities)
+    {
+        if (entities.Count == 0) return;
+        var next = new List<CadEntity>(_selectedSnapshot);
+        var changed = false;
+        foreach (var e in entities)
+        {
+            if (e is null) continue;
+            if (next.Exists(x => ReferenceEquals(x, e))) continue;
+            next.Add(e);
+            changed = true;
+        }
+        if (!changed) return;
+        ClearSubPick();
+        _selectedSnapshot = next.ToArray();
+        SelectionChanged?.Invoke(this, EventArgs.Empty);
+        InvalidateVisual();
+    }
+
+    /// <summary>
+    /// AutoCAD Shift 语义：从选择集移除。块作用域只代表「整块」，任一成员被移走就不再成立。
+    /// </summary>
+    private void RemoveFromSelection(IReadOnlyList<CadEntity> entities)
+    {
+        if (entities.Count == 0 || _selectedSnapshot.Count == 0) return;
+        var next = _selectedSnapshot.Where(e => !entities.Any(x => ReferenceEquals(x, e))).ToArray();
+        if (next.Length == _selectedSnapshot.Count) return;
+        for (var i = _blockScopes.Count - 1; i >= 0; i--)
+            if (entities.Any(x => x.Handle == _blockScopes[i].Outer))
+                _blockScopes.RemoveAt(i);
+        _selectedSnapshot = next;
+        SelectionChanged?.Invoke(this, EventArgs.Empty);
+        InvalidateVisual();
     }
 
     private void SetSubPicks(IReadOnlyList<SubEntityPick> picks)
@@ -633,35 +777,42 @@ public class DrawingView : Control
         SubEntitiesPicked?.Invoke(this, CurrentSubPicks);
     }
 
-    /// <summary>Ctrl+点切换：按 (Handle, OwnHandle, SubPath) 识别，已在集合中则移除，否则追加。</summary>
-    private void ToggleSubPick(SubEntityPick pick)
+    /// <summary>单击 / Ctrl+点追加一条子图元（AutoCAD 子对象选择同样累加）。</summary>
+    private void AddSubPick(SubEntityPick pick) => AddSubEntityPicks(new[] { pick });
+
+    /// <summary>Shift+点移除：按 (Handle, OwnHandle, SubPath) 摘掉这一条，其余保持不变。</summary>
+    private void RemoveSubPick(SubEntityPick pick) => RemoveSubEntityPicks(new[] { pick });
+
+    /// <summary>
+    /// Shift+框选移除：从当前子图元拾取里摘掉给定集合。传进来但本来就没被选中的那些
+    /// 是高亮几何的唯一持有者，要自己放掉；已在集合里的随旧叠加层释放一并回收。
+    /// </summary>
+    public void RemoveSubEntityPicks(IReadOnlyList<SubEntityPick> picks)
     {
+        if (picks == null || picks.Count == 0) return;
+        var live = new bool[picks.Count];
         var next = new List<SubEntityPick>();
-        bool removed = false;
         if (_subPicks is { Count: > 0 })
         {
             foreach (var q in _subPicks)
             {
-                if (SameSubPick(q, pick))
+                var hitIdx = -1;
+                for (var i = 0; i < picks.Count; i++)
                 {
-                    removed = true;   // 直接丢弃：其几何随旧叠加层延迟释放一并回收
-                    continue;
+                    if (picks[i] != null && SameSubPick(q, picks[i])) { hitIdx = i; break; }
                 }
+                if (hitIdx >= 0) { live[hitIdx] = true; continue; }
                 next.Add(ClonePick(q));
             }
         }
-        if (!removed)
-            next.Add(pick);
+        if (!Array.Exists(live, x => x)) return;    // 一条都不在集合里：什么都没变
+        for (var i = 0; i < picks.Count; i++)
+            if (!live[i] && picks[i] != null) DisposePick(picks[i]);
         SetSubPicks(next);
     }
 
     /// <summary>
-    /// Shift+点追加：已在集合中的同一子图元保持原位（不取消），其余全部保留。
-    /// </summary>
-    private void AddSubPick(SubEntityPick pick) => AddSubEntityPicks(new[] { pick });
-
-    /// <summary>
-    /// 程序化追加二级拾取（与 Shift+点同一条合成规则）：按 (Handle, OwnHandle, SubPath)
+    /// 程序化追加二级拾取（与单击 / Ctrl+点同一条合成规则）：按 (Handle, OwnHandle, SubPath)
     /// 去重，已存在的不再重复加入、也不移除。空集合 / 全部重复时不改动现有拾取。
     /// </summary>
     public void AddSubEntityPicks(IReadOnlyList<SubEntityPick> picks)
@@ -765,8 +916,9 @@ public class DrawingView : Control
     private void SelectInBand()
     {
         var bs = _bandStart!.Value;
+        // Shift = 移除（AutoCAD），不是追加：追加是默认行为，不需要修饰键
         SelectInRect(WorldRectOf(bs, _bandCurrent), window: _bandCurrent.X >= bs.X,
-                     additive: _modsAtPress.HasFlag(KeyModifiers.Shift));
+                     additive: false, remove: _modsAtPress.HasFlag(KeyModifiers.Shift));
     }
 
     /// <summary>屏幕两角 → 世界矩形（Y 轴翻转后取包围盒）。</summary>
@@ -782,10 +934,11 @@ public class DrawingView : Control
     /// <summary>
     /// 框选入口（世界矩形）。子图元模式下先问 <see cref="SubEntitiesInRectResolver"/>
     /// —— 空结果 = 清空选择的子图元与实体；否则走普通整实体框选。
-    /// <paramref name="additive"/> = Shift：追加到已选子图元，不替换。
-    /// 返回本次选中的目标数（子图元模式下是子图元数，否则是实体数）。
+    /// <paramref name="additive"/> 追加 / <paramref name="remove"/>（Shift）移除，
+    /// 都为 false 时替换整个选择集 —— 与单击同一套 AutoCAD 语义。
+    /// 返回本次命中的目标数（子图元模式下是子图元数，否则是实体数）。
     /// </summary>
-    public int SelectInRect(SKRect worldRect, bool window, bool additive = false)
+    public int SelectInRect(SKRect worldRect, bool window, bool additive = false, bool remove = false)
     {
         // 与单击同一条口径：残留作用域会把这些图元全判成"作用域外"，
         // 框选于是只剩作用域那个块里的条目可选
@@ -795,18 +948,26 @@ public class DrawingView : Control
             var picks = SubEntitiesInRectResolver(worldRect, window);
             if (picks is not { Count: > 0 })
             {
+                // Shift 框到空白：没有可移除的，已有拾取不该被清
+                if (remove) return 0;
                 SetSubPicks(Array.Empty<SubEntityPick>());
                 ClearSelection();
                 return 0;
             }
-            if (additive) AddSubEntityPicks(picks);
+            if (remove) RemoveSubEntityPicks(picks);
+            else if (additive) AddSubEntityPicks(picks);
             else SetSubPicks(picks);
             return picks.Count;
         }
-        return SelectByRectangle(worldRect, window);
+        return SelectByRectangle(worldRect, window, additive, remove);
     }
 
-    public int SelectByRectangle(SKRect worldRect, bool window)
+    /// <summary>
+    /// 矩形框选整实体（AutoCAD 的「窗选 / 窗交」）。<paramref name="window"/> = 左→右（完全包含），
+    /// false = 右→左（接触即选）。<paramref name="additive"/> / <paramref name="remove"/> 见
+    /// <see cref="SelectInRect"/>。返回命中的条目数（不是改动后的选择集大小）。
+    /// </summary>
+    public int SelectByRectangle(SKRect worldRect, bool window, bool additive = false, bool remove = false)
     {
         if (_display is null) return 0;
         var hits = new List<CadEntity>();
@@ -817,7 +978,9 @@ public class DrawingView : Control
             bool hit = window ? worldRect.Contains(e.Bounds) : worldRect.IntersectsWith(e.Bounds);
             if (hit) hits.Add(e);
         }
-        SetSelection(hits);
+        if (remove) RemoveFromSelection(hits);
+        else if (additive) AddToSelection(hits);
+        else SetSelection(hits);
         return hits.Count;
     }
 
@@ -1192,8 +1355,8 @@ public class DrawingView : Control
         // 命中测试会一直跳过它，用户只会说拾取坏了。
         _scopeBodyOuter = 0;
         _scopeBodyInner = 0;
-        _blockScopeHandle = 0;
-        _blockScopeInner = 0;
+        _blockScopes.Clear();
+        ResetCycle();
         ClearSubPickCore();
         SetScopeSkeleton(null);
         // 粒度开关也必须跟着图走：留着上张图的「单击即选子图元 / 框选按子图元」，
@@ -1421,7 +1584,7 @@ public class DrawingView : Control
             {
                 var ctrl = _modsAtPress.HasFlag(KeyModifiers.Control);
                 var shift = _modsAtPress.HasFlag(KeyModifiers.Shift);
-                SelectAt(p, ctrl || shift, shift);
+                SelectAt(p, ctrl, shift);
             }
             else if (_modsAtPress.HasFlag(KeyModifiers.Control) && !SubPickOnBand
                      && SubEntitiesInRectResolver != null
