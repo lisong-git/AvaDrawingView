@@ -63,6 +63,41 @@ public sealed class DisplayList : IDisposable
         => id >= 1 && id <= Instances.Count && Instances[id - 1].Id == id ? Instances[id - 1] : null;
 
     /// <summary>
+    /// 实例所在的**最外层**实例（= 直接挂在模型空间的那个 INSERT）。模型空间直属（0）返回 0。
+    /// <para>AutoCAD 单击块内图元选中的是这条链的**最外层引用**（整块），不是最内层 —— 只有进了
+    /// 在位编辑（我们这边是子图元作用域）才一层一层往下选。</para>
+    /// </summary>
+    public int RootInstanceOf(int instanceId)
+    {
+        var root = 0;
+        for (int guard = 0; guard <= MaxInstanceDepth; guard++)
+        {
+            var inst = GetInstance(instanceId);
+            if (inst is null) return root;
+            root = inst.Id;
+            if (inst.Parent == 0) return root;
+            instanceId = inst.Parent;
+        }
+        return root;
+    }
+
+    /// <summary>
+    /// <paramref name="instanceId"/> 这条链上、直属于 <paramref name="ancestorId"/> 的那一层实例
+    /// （在位编辑里「下一层」就是它）。命中就在该层或链断开时返回 0。
+    /// </summary>
+    public int DirectChildOf(int instanceId, int ancestorId)
+    {
+        for (int guard = 0; guard <= MaxInstanceDepth && instanceId > 0; guard++)
+        {
+            var inst = GetInstance(instanceId);
+            if (inst is null) return 0;
+            if (inst.Parent == ancestorId) return inst.Id;
+            instanceId = inst.Parent;
+        }
+        return 0;
+    }
+
+    /// <summary>
     /// <paramref name="instanceId"/> 是否等于 <paramref name="ancestorId"/> 或是它的后代。
     /// <paramref name="ancestorId"/> 为 0（模型空间）时恒 true；未指派的 -1 按 0 处理。
     /// </summary>

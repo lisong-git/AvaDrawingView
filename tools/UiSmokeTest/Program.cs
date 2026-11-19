@@ -517,6 +517,30 @@ int Run(string[] argv)
           $"句柄链解析到孪生副本 #3（得到 #{resolved}）");
     Check(!instList.TryResolveChain(new ulong[] { 0x5D6, 0x999 }, out _), "坏链解析失败而不是乱指");
 
+    // 单击抬升粒度 = AutoCAD：
+    //   模型空间点块内图元 → 选**最外层**块引用（带 XCLIP 时高亮的是整个裁剪框）；
+    //   进了作用域（在位编辑）→ 只抬到**直属于当前作用域**的那一层，一次一层。
+    view.SetPickScopeByInstance(0);
+    view.ClearSelection();
+    int rootLift = view.SelectAtWorld(new SKPoint(250, 20));
+    Check(rootLift == 4, $"无作用域点块内图元抬到最外层引用（{rootLift} 条，期望全部 4 条）");
+    Check(view.BlockScopes.Count == 1 && view.BlockScopes[0].InstanceId == 1,
+          $"最外层实例身份（{view.BlockScopes.Count} 组，InstanceId={view.BlockScopes.FirstOrDefault().InstanceId}）");
+
+    view.ClearSelection();
+    view.SetPickScopeByInstance(1);
+    int twinLift = view.SelectAtWorld(new SKPoint(250, 20));
+    Check(twinLift == 2, $"进作用域后点 #2 的图元抬到下一层 #2（{twinLift} 条，期望 #2+#4）");
+    Check(view.BlockScopes.Count == 1 && view.BlockScopes[0].InstanceId == 2,
+          $"抬升记下的实例身份（{view.BlockScopes.Count} 组，InstanceId={view.BlockScopes.FirstOrDefault().InstanceId}）");
+
+    view.ClearSelection();
+    int twinBLift = view.SelectAtWorld(new SKPoint(450, 20));
+    Check(twinBLift == 1, $"孪生副本 #3 只抬升自己（{twinBLift} 条，同 OwnHandle 的 #2 不该进来）");
+    Check(view.BlockScopes.Count == 1 && view.BlockScopes[0].InstanceId == 3,
+          $"#3 的实例身份未被 #2 顶替（InstanceId={view.BlockScopes.FirstOrDefault().InstanceId}）");
+
+    view.ClearSelection();
     view.SetPickScopeByInstance(2);
     Check(view.PickScopeInstance == 2 && view.HasPickScope, $"按实例限定作用域（#{view.PickScopeInstance}）");
     Check(!view.IsDimmedEntity(twinAE) && !view.IsDimmedEntity(boltE),
@@ -525,17 +549,15 @@ int Run(string[] argv)
           "作用域外：孪生副本 #3 与顶层 #1 的图元被淡化");
 
     view.ClearSelection();
-    int twinLift = view.SelectAtWorld(new SKPoint(250, 20));
-    Check(twinLift == 2, $"点 #2 里的图元抬升到该实例（{twinLift} 条，期望 #2+#4）");
-    Check(view.BlockScopes.Count == 1 && view.BlockScopes[0].InstanceId == 2,
-          $"抬升记下的实例身份（{view.BlockScopes.Count} 组，InstanceId={view.BlockScopes.FirstOrDefault().InstanceId}）");
+    int boltLift = view.SelectAtWorld(new SKPoint(250, 80));
+    Check(boltLift == 1, $"#2 作用域里点螺栓抬到 #4（{boltLift} 条）");
+    Check(view.BlockScopes.Count == 1 && view.BlockScopes[0].InstanceId == 4,
+          $"螺栓实例身份（InstanceId={view.BlockScopes.FirstOrDefault().InstanceId}，期望 #4）");
 
     view.ClearSelection();
-    view.SetPickScope(0, null);
-    int twinBLift = view.SelectAtWorld(new SKPoint(450, 20));
-    Check(twinBLift == 1, $"孪生副本 #3 只抬升自己（{twinBLift} 条，同 OwnHandle 的 #2 不该进来）");
-    Check(view.BlockScopes.Count == 1 && view.BlockScopes[0].InstanceId == 3,
-          $"#3 的实例身份未被 #2 顶替（InstanceId={view.BlockScopes.FirstOrDefault().InstanceId}）");
+    int directLift = view.SelectAtWorld(new SKPoint(250, 20));
+    Check(directLift == 1 && view.BlockScopes.Count == 0,
+          $"作用域块的直属图元不抬升（选中 {directLift} 条，块组 {view.BlockScopes.Count}）");
 
     view.ClearSelection();
     view.SetScopeBodyByInstance(3, 0x202);

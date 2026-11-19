@@ -874,7 +874,7 @@ public class DrawingView : Control
         // 解析不出子图元 = 落在无效区域（比如有洞的面域内部），什么都不选。
         if (IsScopeBody(hit)) return;
         // 块内图元：显示层把块展平了，INSERT 自身没有几何条目，所以"点块"只能表现为
-        // "选中同一 Handle 的全部条目"。抬升后记下块身份（集合本身表达不了这个语义：
+        // "选中那一层块引用的全部条目"。抬升后记下块身份（集合本身表达不了这个语义：
         // 框选也可能恰好框全），宿主据此上报整块目标；要标块内具体图元走右键子图元菜单。
         if (SelectWholeBlockOnClick && hit.OwnHandle != 0 && hit.OwnHandle != hit.Handle)
         {
@@ -901,31 +901,42 @@ public class DrawingView : Control
     }
 
     /// <summary>
-    /// 默认抬升：**最内层块实例**（AutoCAD 口径 —— 点块内图元，选中的是那个块本身，
-    /// 不是它被放在哪个更大的容器里）。
+    /// 默认抬升：**当前层**的块引用 —— 没有作用域时是链上的最外层（AutoCAD 在模型空间点块内
+    /// 图元，选中的是整个块引用，带 XCLIP 时高亮的就是那个裁剪框）；有作用域时是**直属于该作用域**
+    /// 的那一层（在位编辑里一次只选下一层，要更深就再进一层）。
     ///
-    /// <para>按 <c>Handle</c> 收集等于抬到最外层：整张图都在一个顶层 INSERT 里时
-    /// （<c>Handle</c> 全是那个 INSERT 的句柄），点任何图元都变成选中整图。</para>
+    /// <para>只按 <c>Handle</c> 收集等于永远抬到最外层：整张图都在一个顶层 INSERT 里时
+    /// （<c>Handle</c> 全是那个 INSERT 的句柄），作用域里点任何图元都会变成选中整图。</para>
     /// </summary>
     private BlockLift DefaultBlockLift(CadEntity hit)
     {
         if (_display is null) return BlockLift.None;
 
-        var subtree = CollectInstanceSubtree(hit.InstanceId);
-        if (subtree is { Count: > 0 })
+        if (_pickScopeInstance != 0)
         {
-            var instMembers = new List<CadEntity>();
-            foreach (var e in _display.Entities)
-                if (subtree.Contains(e.InstanceId)) instMembers.Add(e);
-            if (instMembers.Count > 0)
-                return new BlockLift(hit.Handle, 0, instMembers, hit.InstanceId);
+            // 作用域块的直属图元（链上没有"下一层"）= 不抬升
+            var child = _display.DirectChildOf(hit.InstanceId, _pickScopeInstance);
+            return child > 0 ? LiftToInstance(hit, child) : BlockLift.None;
         }
+
+        var root = _display.RootInstanceOf(hit.InstanceId);
+        if (root > 0) return LiftToInstance(hit, root);
 
         var blockHits = new List<CadEntity>();
         foreach (var e in _display.Entities)
             if (e.Handle == hit.Handle) blockHits.Add(e);
         return blockHits.Count > 0
             ? new BlockLift(hit.Handle, 0, blockHits)
+            : BlockLift.None;
+    }
+
+    private BlockLift LiftToInstance(CadEntity hit, int instanceId)
+    {
+        var members = new List<CadEntity>();
+        foreach (var e in _display!.Entities)
+            if (_display.IsUnder(e.InstanceId, instanceId)) members.Add(e);
+        return members.Count > 0
+            ? new BlockLift(hit.Handle, 0, members, instanceId)
             : BlockLift.None;
     }
 
