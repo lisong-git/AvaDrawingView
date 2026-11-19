@@ -1616,6 +1616,9 @@ public class DrawingView : Control
         // 叠加高亮同样按图存在：其几何是上一张图的世界坐标，留着只会画到错误的位置
         ClearOverlay();
 
+        // 悬停预览的实例号也属于上一张图
+        _hoverFrameInstances = null;
+
         _pendingFit = display is not null;
 
         // 线型路径效果按图缓存（间隔是世界单位，随画布矩阵缩放），换图即失效
@@ -1836,8 +1839,74 @@ public class DrawingView : Control
                 e.Handled = true;
             }
         }
+        else
+        {
+            UpdateHoverClipFrames(p);
+        }
         base.OnPointerMoved(e);
     }
+
+    /// <summary>
+    /// 悬停预览：光标压到带裁剪的块引用上时，临时描出它那条裁剪框（AutoCAD 在
+    /// <c>XCLIPFRAME=0</c> 的图纸里就是这样——平时不画框，指过去才闪一下）。
+    ///
+    /// <para>**只在悬停目标变化时重绘**：全画面重绘约几十毫秒，跟着 pointer move 每帧重画会卡死。
+    /// 所以这里做的是"命中 → 算框所属实例 → 变了才 InvalidateVisual"，移动期间绝大多数帧是空转。</para>
+    /// </summary>
+    private void UpdateHoverClipFrames(Avalonia.Point p)
+    {
+        if (!_showClipFrames || _display is null || _display.ClipFrameMode != 0
+            || _display.ClipFrames.Count == 0)
+        {
+            if (_hoverFrameInstances is null) return;
+            _hoverFrameInstances = null;
+            InvalidateVisual();
+            return;
+        }
+
+        var hit = HitTest(new SKPoint((float)p.X, (float)p.Y));
+        HashSet<int>? next = null;
+        if (hit is not null)
+        {
+            next = new HashSet<int>();
+            // 祖先链：光标在图元深处时，真正"被裁剪"的是上面某一层块引用
+            var id = hit.InstanceId;
+            for (int depth = 0; depth <= DisplayList.MaxInstanceDepth && id > 0; depth++)
+            {
+                if (!next.Add(id)) break;
+                id = _display.GetInstance(id)?.Parent ?? 0;
+            }
+            next.IntersectWith(FrameInstanceIds());
+            if (next.Count == 0) next = null;
+        }
+
+        if (_hoverFrameInstances is null ? next is null : (next is not null && _hoverFrameInstances.SetEquals(next)))
+            return;
+        _hoverFrameInstances = next;
+        InvalidateVisual();
+    }
+
+    /// <summary>自检用：把光标"移到"屏幕某点，返回悬停框是否发生变化（内部走真实的命中 + 去重逻辑）。</summary>
+    public bool HoverAtForTest(SKPoint screenPoint)
+    {
+        var before = _hoverFrameInstances is null ? null : new HashSet<int>(_hoverFrameInstances);
+        UpdateHoverClipFrames(new Avalonia.Point(screenPoint.X, screenPoint.Y));
+        if (before is null) return _hoverFrameInstances is not null;
+        return _hoverFrameInstances is null || !before.SetEquals(_hoverFrameInstances);
+    }
+
+    /// <summary>自检用：按世界坐标悬停（内部换算成屏幕点，避免自检自己搞错坐标口径）。</summary>
+    public bool HoverWorldForTest(SKPoint world)
+        => HoverAtForTest(Viewport.WorldToScreen(world));
+
+    private IEnumerable<int> FrameInstanceIds()
+    {
+        var seen = new HashSet<int>();
+        foreach (var f in _display!.ClipFrames)
+            if (seen.Add(f.InstanceId)) yield return f.InstanceId;
+    }
+
+    private HashSet<int>? _hoverFrameInstances;
 
     protected override void OnPointerReleased(PointerReleasedEventArgs e)
     {
@@ -1880,6 +1949,16 @@ public class DrawingView : Control
         _panStart = null;
         e.Pointer.Capture(null);
         base.OnPointerReleased(e);
+    }
+
+    protected override void OnPointerExited(PointerEventArgs e)
+    {
+        if (_hoverFrameInstances is not null)
+        {
+            _hoverFrameInstances = null;
+            InvalidateVisual();
+        }
+        base.OnPointerExited(e);
     }
 
     // ---------- 渲染 ----------
@@ -2107,6 +2186,11 @@ public class DrawingView : Control
             if (_owner.ShowClipFrames && _list.ClipFrameMode != 0 && _list.ClipFrames.Count > 0)
                 DrawClipFrames(canvas, worldToScreen, _list.ClipFrames, worldRect, hairline);
 
+            // 悬停预览：头变量 0（平时不显示框）的图纸，光标压到带裁剪的引用上时临时描一下，
+            // 免得"内容被裁掉一半"看着莫名其妙。
+            if (_owner.ShowClipFrames && _list.ClipFrameMode == 0 && _owner._hoverFrameInstances is { Count: > 0 } hovered)
+                DrawClipFrames(canvas, worldToScreen, _list.ClipFrames, worldRect, hairline, hovered, hover: true);
+
             // ---- 选中高亮 pass：叠加在最上层，不走 LOD（选中了就要看得见）----
             // AutoCAD 默认样式：蓝色 glow（宽半透明外圈 + 实线内芯），
             // 实心填充用半透明蓝罩（与 AutoCAD 的选中半透明着色一致）。
@@ -2258,12 +2342,13 @@ public class DrawingView : Control
         /// <summary>
         /// 画裁剪边界线（XCLIP 边框）。底图态：1px、紫灰、常数透明度 —— 它不随内容淡化/选中变化：
         /// 界线一旦被淡化就看不出"内容被裁到哪儿"，那正是它存在的意义。
-        /// <para><paramref name="onlyInstances"/> 非空时只画这些实例的框，并改用选中高亮样式
-        /// （AutoCAD 选中带 XCLIP 的引用时，那条框跟着一起亮）；空集合表示什么都不画。</para>
+        /// <para><paramref name="onlyInstances"/> 非空时只画这些实例的框，并改用高亮样式
+        /// （AutoCAD 选中带 XCLIP 的引用时，那条框跟着一起亮）；空集合表示什么都不画。
+        /// <paramref name="hover"/> = 悬停预览用的轻量样式（亮一点、不外发光）。</para>
         /// </summary>
         private void DrawClipFrames(SKCanvas canvas, SKMatrix worldToScreen,
                                     IReadOnlyList<ClipFrame> frames, SKRect worldRect, float hairline,
-                                    HashSet<int>? onlyInstances = null)
+                                    HashSet<int>? onlyInstances = null, bool hover = false)
         {
             bool highlight = onlyInstances != null;
             if (highlight && onlyInstances!.Count == 0) return;
@@ -2271,10 +2356,12 @@ public class DrawingView : Control
             {
                 IsAntialias = Antialias,
                 Style = SKPaintStyle.Stroke,
-                Color = highlight ? new SKColor(0, 120, 215) : ClipFrameColor,
-                StrokeWidth = highlight ? hairline * 2 : hairline,
+                Color = hover ? new SKColor(200, 170, 235)
+                      : highlight ? new SKColor(0, 120, 215)
+                      : ClipFrameColor,
+                StrokeWidth = highlight ? hairline * 2 : hairline * (hover ? 1.5f : 1f),
             };
-            using var frameGlow = highlight ? new SKPaint
+            using var frameGlow = highlight && !hover ? new SKPaint
             {
                 IsAntialias = Antialias,
                 Style = SKPaintStyle.Stroke,

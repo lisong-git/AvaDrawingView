@@ -708,6 +708,26 @@ int Run(string[] argv)
         Check(PixelDiff(clearedSel, noSelWithFrame) < 60,
               $"取消选中后高亮的框消失（差 {PixelDiff(clearedSel, noSelWithFrame)} 像素）");
 
+        // 悬停预览：光标压到带裁剪的引用上 → 描出框；移到空白处 → 消失。
+        // 只有"悬停目标变了"才重绘，所以这里顺带验了去重（同一位置再指一次不该有变化）。
+        bool movedInto = view.HoverWorldForTest(new SKPoint(50, 20));
+        var hovScreen = view.Viewport.WorldToScreen(new SKPoint(50, 20));
+        window.CaptureRenderedFrame();
+        window.CaptureRenderedFrame();
+        var hovered = window.CaptureRenderedFrame();
+        Check(movedInto && PixelDiff(hovered, noSelWithFrame) > 200,
+              $"悬停到带裁剪的引用上时描出它的框（changed={movedInto} {PixelDiff(hovered, noSelWithFrame)} 像素 at {hovScreen}）");
+
+        bool movedAgain = view.HoverAtForTest(hovScreen);
+        Check(!movedAgain, "悬停目标没变就不重绘（同一位置再指一次）");
+
+        bool movedOut = view.HoverAtForTest(new SKPoint(hovScreen.X + 400, hovScreen.Y + 300));
+        window.CaptureRenderedFrame();
+        window.CaptureRenderedFrame();
+        var afterHover = window.CaptureRenderedFrame();
+        Check(movedOut && PixelDiff(afterHover, noSelWithFrame) < 60,
+              $"移开光标后悬停框消失（差 {PixelDiff(afterHover, noSelWithFrame)} 像素）");
+
         view.ClearSelection();
         int framePick = view.SelectAtWorld(new SKPoint(clipRect.Right, clipRect.Bottom));
         Check(framePick == 0 && view.SelectedEntities.Count == 0,
