@@ -634,6 +634,80 @@ int Run(string[] argv)
         int modeDiff = PixelDiff(modeTwo, modeZero);
         Check(modeDiff > 200, $"头变量 XCLIPFRAME=0 时不画边框（与 =2 差 {modeDiff} 像素）");
 
+        // 选中块引用时框跟着高亮（AutoCAD：选中带 XCLIP 的引用，那条框一起亮），
+        // 即使头变量是 0；取消选中就回到"没有框"。判据仍用像素差：两份数据只差 ClipFrames。
+        var quietNoFrame = new DisplayList
+        {
+            Entities = new[] { bodyE },
+            Index = SpatialIndex.Build(new[] { bodyE }),
+            LayerNames = new[] { "0" },
+            ClipFrameMode = 0,
+            Extents = clipRect,
+            CoreExtents = clipRect,
+        };
+        bodyE.InstanceId = 1;
+        var quietWithFrame = new DisplayList
+        {
+            Entities = new[] { bodyE },
+            Index = SpatialIndex.Build(new[] { bodyE }),
+            LayerNames = new[] { "0" },
+            Instances = new[]
+            {
+                new InsertInstance { Id = 1, Parent = 0, InsertHandle = 0x700, BlockName = "b" },
+            },
+            ClipFrames = new[]
+            {
+                new ClipFrame { Handle = 0x700, Path = framePath, Bounds = clipRect, InstanceId = 1 },
+            },
+            ClipFrameMode = 0,
+            Extents = clipRect,
+            CoreExtents = clipRect,
+        };
+        view.SetDisplay(quietNoFrame);
+        view.FitToContent();
+        window.CaptureRenderedFrame();
+        window.CaptureRenderedFrame();
+        var noSelNoFrame = window.CaptureRenderedFrame();
+
+        view.SetDisplay(quietWithFrame);
+        view.FitToContent();
+        window.CaptureRenderedFrame();
+        window.CaptureRenderedFrame();
+        var noSelWithFrame = window.CaptureRenderedFrame();
+        Check(PixelDiff(noSelWithFrame, noSelNoFrame) < 60,
+              $"未选中时 mode=0 的图一条框都不画（差 {PixelDiff(noSelWithFrame, noSelNoFrame)} 像素）");
+
+        // 选中块（无框数据）→ 基准帧
+        view.SetDisplay(quietNoFrame);
+        view.FitToContent();
+        window.CaptureRenderedFrame();
+        window.CaptureRenderedFrame();
+        view.ClearSelection();
+        view.SelectAtWorld(new SKPoint(50, 20));
+        window.CaptureRenderedFrame();
+        window.CaptureRenderedFrame();
+        var selNoFrame = window.CaptureRenderedFrame();
+
+        // 同一选择，换成带框数据 → 多出来的像素就是那条高亮的框
+        view.SetDisplay(quietWithFrame);
+        view.FitToContent();
+        window.CaptureRenderedFrame();
+        window.CaptureRenderedFrame();
+        view.ClearSelection();
+        view.SelectAtWorld(new SKPoint(50, 20));
+        window.CaptureRenderedFrame();
+        window.CaptureRenderedFrame();
+        var selWithFrame = window.CaptureRenderedFrame();
+        int hiliteDiff = PixelDiff(selWithFrame, selNoFrame);
+        Check(hiliteDiff > 200, $"选中块时它的裁剪框一起高亮（{hiliteDiff} 像素）");
+
+        view.ClearSelection();
+        window.CaptureRenderedFrame();
+        window.CaptureRenderedFrame();
+        var clearedSel = window.CaptureRenderedFrame();
+        Check(PixelDiff(clearedSel, noSelWithFrame) < 60,
+              $"取消选中后高亮的框消失（差 {PixelDiff(clearedSel, noSelWithFrame)} 像素）");
+
         view.ClearSelection();
         int framePick = view.SelectAtWorld(new SKPoint(clipRect.Right, clipRect.Bottom));
         Check(framePick == 0 && view.SelectedEntities.Count == 0,

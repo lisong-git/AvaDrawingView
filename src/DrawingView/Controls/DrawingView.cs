@@ -2164,6 +2164,15 @@ public class DrawingView : Control
                     }
                 }
                 canvas.Restore();
+
+                // 选中的块引用：它的裁剪框一起高亮（AutoCAD 选中带 XCLIP 的引用时框也亮）。
+                // 头变量为 0（默认不显示框）的图纸在这里也能看见框 —— 只在选中期间。
+                if (_owner.ShowClipFrames && _list.ClipFrames.Count > 0)
+                {
+                    var lit = CollectSelectedInstances(selected);
+                    if (lit.Count > 0)
+                        DrawClipFrames(canvas, worldToScreen, _list.ClipFrames, worldRect, hairline, lit);
+                }
             }
 
             // ---- 作用域骨架 pass：可选子对象的弱色底图（在二级拾取高亮之下）----
@@ -2247,27 +2256,63 @@ public class DrawingView : Control
         }
 
         /// <summary>
-        /// 画裁剪边界线（XCLIP 边框）。1px、紫灰、常数透明度 —— 它不随内容淡化/选中变化：
+        /// 画裁剪边界线（XCLIP 边框）。底图态：1px、紫灰、常数透明度 —— 它不随内容淡化/选中变化：
         /// 界线一旦被淡化就看不出"内容被裁到哪儿"，那正是它存在的意义。
+        /// <para><paramref name="onlyInstances"/> 非空时只画这些实例的框，并改用选中高亮样式
+        /// （AutoCAD 选中带 XCLIP 的引用时，那条框跟着一起亮）；空集合表示什么都不画。</para>
         /// </summary>
         private void DrawClipFrames(SKCanvas canvas, SKMatrix worldToScreen,
-                                    IReadOnlyList<ClipFrame> frames, SKRect worldRect, float hairline)
+                                    IReadOnlyList<ClipFrame> frames, SKRect worldRect, float hairline,
+                                    HashSet<int>? onlyInstances = null)
         {
+            bool highlight = onlyInstances != null;
+            if (highlight && onlyInstances!.Count == 0) return;
             using var frameStroke = new SKPaint
             {
                 IsAntialias = Antialias,
                 Style = SKPaintStyle.Stroke,
-                Color = ClipFrameColor,
-                StrokeWidth = hairline,
+                Color = highlight ? new SKColor(0, 120, 215) : ClipFrameColor,
+                StrokeWidth = highlight ? hairline * 2 : hairline,
             };
+            using var frameGlow = highlight ? new SKPaint
+            {
+                IsAntialias = Antialias,
+                Style = SKPaintStyle.Stroke,
+                Color = new SKColor(0, 120, 215, 80),
+                StrokeWidth = hairline * 6,
+            } : null;
             canvas.Save();
             canvas.Concat(worldToScreen);
             foreach (var frame in frames)
             {
+                if (onlyInstances != null && !onlyInstances.Contains(frame.InstanceId)) continue;
                 if (frame.Path is null || !TouchesViewport(frame.Path, worldRect)) continue;
+                if (frameGlow != null) canvas.DrawPath(frame.Path, frameGlow);
                 canvas.DrawPath(frame.Path, frameStroke);
             }
             canvas.Restore();
+        }
+
+        /// <summary>
+        /// 当前选中涉及的块实例（含祖先链）：选中一个块引用时，它自己的裁剪框要跟着高亮；
+        /// 选中的是块内图元时，所属各层块的框也一起亮（AutoCAD 里选中的本来就是那些块引用）。
+        /// </summary>
+        private HashSet<int> CollectSelectedInstances(IReadOnlyList<CadEntity> selected)
+        {
+            var lit = new HashSet<int>();
+            if (_list is null) return lit;
+            foreach (var spec in _owner._blockScopes)
+                if (spec.InstanceId > 0) lit.Add(spec.InstanceId);
+            foreach (var e in selected)
+            {
+                var id = e.InstanceId;
+                for (int depth = 0; depth <= DisplayList.MaxInstanceDepth && id > 0; depth++)
+                {
+                    if (!lit.Add(id)) break;
+                    id = _list.GetInstance(id)?.Parent ?? 0;
+                }
+            }
+            return lit;
         }
 
         /// <summary>

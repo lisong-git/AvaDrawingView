@@ -906,6 +906,9 @@ public sealed class GeometryConverter
         bool prevSpatialIsRect = _spatialClipIsRect;
         bool clipChanged = false;
         int entityStart = _entities.Count;
+        // 本实体登记了几条裁剪边框的起点：INSERT 的实例 Id 要到 ConvertInsert 里才分配，
+        // 那时回来把这条框的 InstanceId 补上（选中高亮要按实例认框）。
+        int frameMark = _clipFrames.Count;
         if (SpatialClipEnabled && (parent.IsIdentity || ClipInBlock) &&
             TryGetSpatialClip(e, parent, out var clipPath, out var clipBounds, out var clipIsRect,
                              out var frameKnown))
@@ -1000,7 +1003,7 @@ public sealed class GeometryConverter
                     AttributeDrawn++;
                     break;
                 case TextEntity t: AddText(t, parent, color); break;
-                case Insert ins: ConvertInsert(ins, parent, depth, inheritedColor); break;
+                case Insert ins: ConvertInsert(ins, parent, depth, inheritedColor, frameMark); break;
                 case Viewport vp:
                     // 图框常被做成块，视口就藏在块里：记下「视口坐标系→图纸」的矩阵，
                     // 布局收尾时统一展开。视口本身不画边框（同顶层视口）。
@@ -1612,7 +1615,8 @@ public sealed class GeometryConverter
     /// 即 INSERT 自身的解析颜色。原实现直接把 BYBLOCK 当白色，导致块内线条在白底上被
     /// 翻成黑色（本应跟随插入颜色）。</para>
     /// </summary>
-    private void ConvertInsert(Insert ins, in SKMatrix parent, int depth, uint? inheritedColor)
+    private void ConvertInsert(Insert ins, in SKMatrix parent, int depth, uint? inheritedColor,
+                               int frameMark = -1)
     {
         if (ins.Block is null) { DroppedNoBlock++; Skipped++; return; }
         if (depth >= MaxInsertDepth) { DroppedByDepth++; Skipped++; return; }
@@ -1641,6 +1645,11 @@ public sealed class GeometryConverter
         int prevInstance = _currentInstance;
         _inheritedLineWeight = blockWeight;
         _currentInstance = AddInstance(ins.Handle, ins.Block.Name);
+        // 本条 INSERT 自己的裁剪边框补上实例身份（此刻 _clipFrames 里多出来的只有它自己那条，
+        // 子实体的框要等下面展开时才登记）
+        if (frameMark >= 0)
+            for (int i = frameMark; i < _clipFrames.Count; i++)
+                _clipFrames[i].InstanceId = _currentInstance;
         try
         {
             for (int r = 0; r < rows; r++)

@@ -20,6 +20,13 @@ public sealed class ClipFrame
     /// <summary>带裁剪的那个块引用的句柄（同一个块被插多次时每处一条）。</summary>
     public required ulong Handle { get; init; }
 
+    /// <summary>
+    /// 带裁剪的那个块**实例**（0 = 解析不出 / 模型空间直属）。
+    /// <para>句柄区分不了同定义多副本，也区分不了块定义里那条 INSERT 被展开的每一次 ——
+    /// 选中高亮要「只亮这一处框」就得按实例认。</para>
+    /// </summary>
+    public int InstanceId { get; set; }
+
     /// <summary>边界线（世界坐标，闭合）。所有权随 <see cref="DisplayList.ClipPaths"/> 一起释放。</summary>
     public required SKPath Path { get; init; }
 
