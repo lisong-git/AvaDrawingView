@@ -90,10 +90,16 @@ public static class CadDocumentLoader
                              + $"（PDMODE={converter.PointDisplayMode}, PDSIZE={converter.PointDisplaySize:G4}）"
                              + (converter.PointMarksHidden > 0 ? $"，PDMODE=1 不画 {converter.PointMarksHidden} 个" : ""));
 
+        // 一个句柄会展开成多条显示条目（INSERT 的子实体、块内同定义多份）。这里必须取
+        // **并集**：只记首条会让「整块」标注的框变成某条子实体的包围盒 —— 实测某张横剖图
+        // 一个 50×50 的方块、两条零高度的横线，跟整块范围毫无关系。
         var handleBounds = new Dictionary<ulong, SKRect>();
         foreach (var ent in entities)
         {
-            if (ent.Handle != 0 && !handleBounds.ContainsKey(ent.Handle))
+            if (ent.Handle == 0) continue;
+            if (handleBounds.TryGetValue(ent.Handle, out var acc))
+                handleBounds[ent.Handle] = SKRect.Union(acc, ent.Bounds);
+            else
                 handleBounds.Add(ent.Handle, ent.Bounds);
         }
 

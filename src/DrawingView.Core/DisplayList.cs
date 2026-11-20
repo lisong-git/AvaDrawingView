@@ -28,7 +28,10 @@ public sealed class DisplayList : IDisposable
     public required SpatialIndex Index { get; init; }
     public required IReadOnlyList<string> LayerNames { get; init; }
 
-    /// <summary>句柄 → 首个命中实体的世界包围盒（用于标注 zoom-to-handle；句柄 0 不收录）。</summary>
+    /// <summary>
+    /// 句柄 → 该句柄**全部显示条目的并集**包围盒（整块 / 整实体范围，用于标注框与 zoom-to-handle；
+    /// 句柄 0 不收录）。只取首条会得到某条子实体的框 —— 块内子实体顺序一变框就跟着变。
+    /// </summary>
     public IReadOnlyDictionary<ulong, SKRect> HandleBounds { get; init; } = new Dictionary<ulong, SKRect>();
 
     /// <summary>
