@@ -107,6 +107,14 @@ public sealed class CadEntity
 
     /// <summary>转换期「尚未指派」标记（不对外出现，见 <see cref="InstanceId"/>）。</summary>
     public const int PendingInstance = -1;
+
+    /// <summary>
+    /// 来自图纸标注类实体（TEXT / MTEXT / DIMENSION / LEADER / ATTRIB）的显示单元，
+    /// 含块内展开出来的那些。由 <c>GeometryConverter</c> 在转换期回填；
+    /// 拾取层可用它把标注排除在选择之外（<c>CadViewControl.SkipAnnotationPick</c>）。
+    /// </summary>
+    public bool IsAnnotation { get; set; }
+
     /// <summary>描边几何（世界坐标），与 FillPath 互斥使用。</summary>
     public SKPath? Path { get; init; }
     /// <summary>填充几何（世界坐标），如 SOLID。</summary>

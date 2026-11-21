@@ -533,7 +533,7 @@ public sealed class GeometryConverter
             {
                 // 大图解析后仍有十几万实体要转换，必须让取消能真正中断（原来只在阶段之间检查）
                 if ((++n % CancellationCheckInterval) == 0) ct.ThrowIfCancellationRequested();
-                if (options?.SkipRootAnnotations == true && IsRootAnnotation(e)) { Skipped++; continue; }
+                if (options?.SkipRootAnnotations == true && IsAnnotationEntity(e)) { Skipped++; continue; }
                 ConvertEntity(e, SKMatrix.Identity, 0, inheritedColor: null);
             }
         }
@@ -622,7 +622,7 @@ public sealed class GeometryConverter
                 // 视口自身不画边框：AutoCAD 里视口边框属于非打印的 Defpoints 语义，
                 // 打印/出图看不到；画出来反而在图纸四周多出一圈不该有的矩形。
                 if (e is Viewport vp) { if (vp.Id != 1) _viewports.Add((vp, SKMatrix.Identity)); continue; }
-                if (options?.SkipRootAnnotations == true && IsRootAnnotation(e)) { Skipped++; continue; }
+                if (options?.SkipRootAnnotations == true && IsAnnotationEntity(e)) { Skipped++; continue; }
                 ConvertEntity(e, SKMatrix.Identity, 0, inheritedColor: null);
             }
         }
@@ -854,7 +854,8 @@ public sealed class GeometryConverter
                 yield return e;
     }
 
-    private static bool IsRootAnnotation(Entity e)
+    /// <summary>图纸标注类实体（含块属性 ATTRIB —— 它是 TextEntity 子类）。</summary>
+    private static bool IsAnnotationEntity(Entity e)
         => e is Dimension || e is Leader || e is TextEntity || e is MText;
 
     /// <param name="inheritedColor">
@@ -1032,6 +1033,10 @@ public sealed class GeometryConverter
             ApplyScopeClip(entityStart);
             // 身份只填「还没有人认领」的：块内子实体已由内层 ConvertEntity 写成自己的实例
             ApplyInstance(entityStart);
+            // 标注类实体连同它派生出的条目（尺寸的线/箭头/文字）一起打标，拾取层据此跳过
+            if (IsAnnotationEntity(e))
+                for (int i = entityStart; i < _entities.Count; i++)
+                    _entities[i].IsAnnotation = true;
 
             _currentHandle = prevHandle;
             _currentOwnHandle = prevOwnHandle;

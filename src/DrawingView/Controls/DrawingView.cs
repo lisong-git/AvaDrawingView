@@ -202,6 +202,13 @@ public class DrawingView : Control
     public bool SelectWholeBlockOnClick { get; set; } = true;
 
     /// <summary>
+    /// 拾取时跳过图纸自带的标注类图元（文字 / 尺寸 / 引线 / 块属性）。默认关；
+    /// 打标签文档打开它 —— 那里的文字与尺寸是图面内容，不该被当成待标注特征选中。
+    /// 只影响选择（单击 / 框选 / Ctrl 循环），不影响绘制与已有标注的高亮。
+    /// </summary>
+    public bool SkipAnnotationPick { get; set; }
+
+    /// <summary>
     /// 叠加高亮层（世界坐标临时几何）。与选中集合同一套交付方式：整个引用替换，
     /// 渲染线程只读快照，不做部分更新。
     /// </summary>
@@ -634,6 +641,7 @@ public class DrawingView : Control
         foreach (var e in candidates)
         {
             if (_hidden.Count > 0 && _hidden.Contains(e.Layer)) continue;
+            if (SkipAnnotationPick && e.IsAnnotation) continue;
             // 作用域本体：看得见但不可作为整体拾取（点它要落到环 / 边）
             if (!includeDimmed && (IsDimmedEntity(e) || IsScopeBody(e))) continue;
             if (!e.Bounds.IntersectsWith(rect)) continue;
@@ -738,6 +746,7 @@ public class DrawingView : Control
         foreach (var e in _display.Index.Query(rect))
         {
             if (_hidden.Count > 0 && _hidden.Contains(e.Layer)) continue;
+            if (SkipAnnotationPick && e.IsAnnotation) continue;
             if (!includeDimmed && (IsDimmedEntity(e) || IsScopeBody(e))) continue;
             if (!e.Bounds.IntersectsWith(rect)) continue;
             var d = DistanceToEntity(e, world, tolWorld);
@@ -1220,6 +1229,7 @@ public class DrawingView : Control
         foreach (var e in _display.Index.Query(worldRect))
         {
             if (_hidden.Count > 0 && _hidden.Contains(e.Layer)) continue;
+            if (SkipAnnotationPick && e.IsAnnotation) continue;
             if (IsDimmedEntity(e)) continue;      // 框选同样跳过淡化的面域本体
             if (!RectPick.EntityHit(e, worldRect, window)) continue;
             hits.Add(e);
